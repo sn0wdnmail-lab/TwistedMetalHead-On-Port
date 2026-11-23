@@ -1,5 +1,5 @@
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
-index ea00016..8fb7dea 100644
+index ea00016..4a72584 100644
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
 @@ -132,6 +132,8 @@ static bool write_mask_is_16bit_channel_slice(uint32_t psm, uint32_t color_mask)
@@ -11,7 +11,138 @@ index ea00016..8fb7dea 100644
  	ParallelGS::RenderPass rp = {};
  
  	if (render_pass.primitive_count)
-@@ -4268,6 +4270,7 @@ void GSInterface::flush()
+@@ -1799,6 +1801,29 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 		if (info.info.arrayed && is_palette_format(psm) && desc.clamp.desc.has_region_repeat())
+ 			info.info.flags |= TEX_INFO_FORCE_SAMPLE_MAPPING;
+ 
++		// [ps2x] Texture replacement: same texture, sampled from the replacement image instead.
++		// Coordinates stay in the GS texture's own texels, so sizes / region / bias describe it.
++		if (texture_replacement.image && !info.info.arrayed &&
++		    uint32_t(desc.tex0.desc.TBP0) == texture_replacement.tbp0 &&
++		    uint32_t(desc.tex0.desc.TBW) == texture_replacement.tbw &&
++		    uint32_t(desc.tex0.desc.PSM) == texture_replacement.psm &&
++		    uint32_t(desc.tex0.desc.TW) == texture_replacement.tw &&
++		    uint32_t(desc.tex0.desc.TH) == texture_replacement.th &&
++		    desc.rect.x == 0 && desc.rect.y == 0 && desc.rect.levels == 1 &&
++		    desc.rect.width == (1u << texture_replacement.tw) && desc.rect.height == (1u << texture_replacement.th))
++		{
++			info.view = &texture_replacement.image->get_view();
++			info.info.sizes.z = 1.0f / float(desc.rect.width);
++			info.info.sizes.w = 1.0f / float(desc.rect.height);
++			if (uint32_t(desc.clamp.desc.WMS) == CLAMPBits::CLAMP)
++				info.info.region.z = float(desc.rect.width) - 1.0f;
++			if (uint32_t(desc.clamp.desc.WMT) == CLAMPBits::CLAMP)
++				info.info.region.w = float(desc.rect.height) - 1.0f;
++			info.info.bias = vec2(0.0f);
++			info.replacement_levels = texture_replacement.levels;
++			info.replacement_scale = texture_replacement.scale;
++		}
++
+ 		render_pass.tex_infos.push_back(info);
+ 		render_pass.tex0_infos.push_back(ctx.tex0.desc);
+ 		render_pass.held_images.push_back(std::move(image));
+@@ -1811,6 +1836,87 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+ 	return texture_index;
+ }
+ 
++bool GSInterface::set_texture_replacement(const TextureReplacement &replacement)
++{
++	texture_replacement = {};
++	if (replacement.levels.empty() || !replacement.width || !replacement.height || replacement.tw > 10 || replacement.th > 10)
++		return false;
++	uint32_t gs_width = 1u << replacement.tw;
++	if (replacement.width < gs_width || replacement.width % gs_width != 0)
++		return false;
++	auto image = renderer.create_replacement_image(replacement.width, replacement.height, replacement.levels);
++	if (!image)
++		return false;
++	texture_replacement.tbp0 = replacement.tbp0;
++	texture_replacement.tbw = replacement.tbw;
++	texture_replacement.psm = replacement.psm;
++	texture_replacement.tw = replacement.tw;
++	texture_replacement.th = replacement.th;
++	texture_replacement.cbp = replacement.cbp;
++	// The shader keeps the mip level in 3 bits (0-7).
++	texture_replacement.levels = std::min<uint32_t>(uint32_t(replacement.levels.size()), 1u << TEX_MAX_MIP_LEVEL_BITS);
++	texture_replacement.scale = float(replacement.width) / float(gs_width);
++	texture_replacement.image = std::move(image);
++	return true;
++}
++
++// The replacement image has a mip chain; the GS texture usually has none (fixed LOD 0), so each
++// primitive gets a fixed LOD here: the level where about one or two replacement texels land on
++// each output pixel (bilinear within the level).
++void GSInterface::apply_replacement_lod(PrimitiveAttribute &prim_attr, const VertexPosition *pos,
++                                        const VertexAttribute *attr, uint32_t count, const TextureInfo &info) const
++{
++	const auto &prim = registers.prim;
++	const auto &ctx = registers.ctx[prim.desc.CTXT];
++	float tex_w = float(1u << std::min<uint32_t>(ctx.tex0.desc.TW, 10u));
++	float tex_h = float(1u << std::min<uint32_t>(ctx.tex0.desc.TH, 10u));
++	float u_lo = 1e30f, u_hi = -1e30f, v_lo = 1e30f, v_hi = -1e30f;
++	float x_lo = 1e30f, x_hi = -1e30f, y_lo = 1e30f, y_hi = -1e30f;
++	uint32_t n = std::max<uint32_t>(2u, std::min<uint32_t>(count, 3u));
++	for (uint32_t i = 0; i < n; i++)
++	{
++		float u, v;
++		if (prim.desc.FST)
++		{
++			u = float(attr[i].uv.x) * (1.0f / 16.0f);
++			v = float(attr[i].uv.y) * (1.0f / 16.0f);
++		}
++		else
++		{
++			float q = attr[i].q != 0.0f ? attr[i].q : 1.0f;
++			u = attr[i].st.x / q * tex_w;
++			v = attr[i].st.y / q * tex_h;
++		}
++		float x = float(pos[i].pos.x) * (1.0f / float(1 << PGS_SUBPIXEL_BITS));
++		float y = float(pos[i].pos.y) * (1.0f / float(1 << PGS_SUBPIXEL_BITS));
++		u_lo = std::min(u_lo, u); u_hi = std::max(u_hi, u);
++		v_lo = std::min(v_lo, v); v_hi = std::max(v_hi, v);
++		x_lo = std::min(x_lo, x); x_hi = std::max(x_hi, x);
++		y_lo = std::min(y_lo, y); y_hi = std::max(y_hi, y);
++	}
++	float dx = (x_hi - x_lo) * float(1u << sampling_rate_x_log2);
++	float dy = (y_hi - y_lo) * float(1u << sampling_rate_y_log2);
++	float ratio = 0.0f;
++	if (dx > 0.0f)
++		ratio = std::max(ratio, (u_hi - u_lo) * info.replacement_scale / dx);
++	if (dy > 0.0f)
++		ratio = std::max(ratio, (v_hi - v_lo) * info.replacement_scale / dy);
++	uint32_t lod = 0;
++	while (lod + 1 < info.replacement_levels && ratio >= 2.0f)
++	{
++		ratio *= 0.5f;
++		lod++;
++	}
++	uint32_t max_level = info.replacement_levels - 1;
++	prim_attr.tex &= ~(((1u << TEX_MAX_MIP_LEVEL_BITS) - 1u) << TEX_MAX_MIP_LEVEL_OFFSET);
++	prim_attr.tex &= ~uint32_t(TEX_SAMPLER_MIPMAP_LINEAR_BIT);
++	prim_attr.tex |= (max_level << TEX_MAX_MIP_LEVEL_OFFSET) | TEX_SAMPLER_MIN_LINEAR_BIT;
++	prim_attr.tex2 &= ~(((1u << TEX2_K_BITS) - 1u) << TEX2_K_OFFSET);
++	prim_attr.tex2 &= ~(((1u << TEX2_L_BITS) - 1u) << TEX2_L_OFFSET);
++	prim_attr.tex2 |= (1u << TEX2_FIXED_LOD_OFFSET) | ((lod << 4) << TEX2_K_OFFSET);
++	g_flush_counters[FlushCounterReplacedDraws].fetch_add(1, std::memory_order_relaxed);
++}
++
+ void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb)
+ {
+ 	if (!get_and_clear_dirty_flag(STATE_DIRTY_PRIM_TEMPLATE_BIT))
+@@ -2687,6 +2793,12 @@ void GSInterface::drawing_kick_append()
+ 	PrimitiveAttribute prim_attr;
+ 	prim_attr.tex = prim_state.tex;
+ 	prim_attr.tex2 = prim_state.tex2;
++	if (prim.desc.TME)
++	{
++		uint32_t tex_index = prim_attr.tex & ((1u << TEX_TEXTURE_INDEX_BITS) - 1u);
++		if (tex_index < render_pass.tex_infos.size() && render_pass.tex_infos[tex_index].replacement_levels != 0)
++			apply_replacement_lod(prim_attr, pos, attr, num_vertices, render_pass.tex_infos[tex_index]);
++	}
+ 	prim_attr.state = prim_state.state;
+ 	prim_attr.fbmsk = ctx.frame.desc.FBMSK;
+ 	prim_attr.fogcol = registers.fogcol.words[0];
+@@ -4268,6 +4380,7 @@ void GSInterface::flush()
  {
  	flush_pending_transfer(true);
  	uint64_t value = tracker.mark_submission_timeline();
@@ -20,10 +151,10 @@ index ea00016..8fb7dea 100644
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
 diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
-index 9f05da8..22afe59 100644
+index 9f05da8..d37c8c4 100644
 --- a/gs/gs_interface.hpp
 +++ b/gs/gs_interface.hpp
-@@ -251,6 +251,14 @@ public:
+@@ -251,11 +251,31 @@ public:
  class GSInterface final
  {
  public:
@@ -38,8 +169,42 @@ index 9f05da8..22afe59 100644
  	GSInterface();
  	bool init(Vulkan::Device *device, const GSOptions &options);
  	void reset_context_state();
+ 
+ 	void set_super_sampling_rate(SuperSampling super_sampling, bool ordered_grid, bool super_sampled_textures);
++
++	// [ps2x] Texture replacement. Draws that sample the GS texture described here (TEX0 fields;
++	// the CLUT is not compared: descriptors here keep the palette apart) sample `levels` instead: an RGBA8 picture `scale` times the GS texture's size with its mip
++	// chain, stored the way the GS keeps colours (alpha 0x80 = opaque). Each primitive uses the mip
++	// level that fits how large it is drawn, so small text stays smooth and large text sharp.
++	struct TextureReplacement
++	{
++		uint32_t tbp0 = 0, tbw = 0, psm = 0, tw = 0, th = 0, cbp = 0;
++		uint32_t width = 0, height = 0;
++		std::vector<std::vector<uint32_t>> levels; // level 0 = width x height, then halves
++	};
++	bool set_texture_replacement(const TextureReplacement &replacement);
+ 	void set_debug_mode(const DebugMode &mode);
+ 	void set_hacks(const Hacks &hacks);
+ 
+@@ -521,6 +541,16 @@ private:
+ 
+ 	uint32_t drawing_kick_update_texture(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb);
+ 
++	struct
++	{
++		uint32_t tbp0 = 0, tbw = 0, psm = 0, tw = 0, th = 0, cbp = 0;
++		uint32_t levels = 0;
++		float scale = 1.0f;
++		Vulkan::ImageHandle image;
++	} texture_replacement;
++	void apply_replacement_lod(PrimitiveAttribute &prim_attr, const VertexPosition *pos, const VertexAttribute *attr,
++	                           uint32_t count, const TextureInfo &info) const;
++
+ 	struct PrimitiveTemplate
+ 	{
+ 		uint32_t state, tex, tex2;
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
-index dbe032d..615dfa7 100644
+index dbe032d..8a48702 100644
 --- a/gs/gs_renderer.cpp
 +++ b/gs/gs_renderer.cpp
 @@ -4,6 +4,9 @@
@@ -184,7 +349,35 @@ index dbe032d..615dfa7 100644
  	auto copy_img = device->create_image(info);
  	device->set_name(*copy_img, "Sharp Backbuffer");
  
-@@ -3393,6 +3455,8 @@ void GSRenderer::move_image_handles_to_slab()
+@@ -1353,6 +1415,27 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
+ 	return copy_img;
+ }
+ 
++Vulkan::ImageHandle GSRenderer::create_replacement_image(uint32_t width, uint32_t height,
++                                                         const std::vector<std::vector<uint32_t>> &levels)
++{
++	if (!device || levels.empty() || !width || !height)
++		return {};
++	auto info = Vulkan::ImageCreateInfo::immutable_2d_image(width, height, VK_FORMAT_R8G8B8A8_UNORM);
++	info.levels = uint32_t(levels.size());
++	std::vector<Vulkan::ImageInitialData> initial(levels.size());
++	for (size_t i = 0; i < levels.size(); i++)
++	{
++		uint32_t w = std::max<uint32_t>(1u, width >> i), h = std::max<uint32_t>(1u, height >> i);
++		if (levels[i].size() < size_t(w) * h)
++			return {};
++		initial[i].data = levels[i].data();
++	}
++	auto img = device->create_image(info, initial.data());
++	if (img)
++		device->set_name(*img, "Replacement texture");
++	return img;
++}
++
+ Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &desc)
+ {
+ 	if (!device)
+@@ -3393,6 +3476,8 @@ void GSRenderer::move_image_handles_to_slab()
  
  	if (total_image_slab_size > image_slab_high_water_mark)
  	{
@@ -193,7 +386,7 @@ index dbe032d..615dfa7 100644
  #ifdef PARALLEL_GS_DEBUG
  		LOGW("New high watermark for image slab: %llu MiB.\n",
  		     static_cast<unsigned long long>(total_image_slab_size / (1024 * 1024)));
-@@ -4648,6 +4712,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+@@ -4648,6 +4733,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
  				image_info.width *= 2;
  				image_info.height *= 2;
  			}
@@ -201,7 +394,7 @@ index dbe032d..615dfa7 100644
  			circuit1 = device->create_image(image_info);
  			sample_crtc_circuit(cmd, *circuit1, priv.dispfb1, rect, super_samples, promoted1);
  			device->set_name(*circuit1, "Circuit1");
-@@ -4706,6 +4771,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+@@ -4706,6 +4792,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
  				image_info.width *= 2;
  				image_info.height *= 2;
  			}
@@ -209,7 +402,7 @@ index dbe032d..615dfa7 100644
  			circuit2 = device->create_image(image_info);
  			sample_crtc_circuit(cmd, *circuit2, priv.dispfb2, rect, super_samples, promoted2);
  			device->set_name(*circuit2, "Circuit2");
-@@ -4857,6 +4923,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+@@ -4857,6 +4944,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
  		image_info.height--;
  	}
  
@@ -217,7 +410,7 @@ index dbe032d..615dfa7 100644
  	auto merged = device->create_image(image_info);
  
  	device->set_name(*merged, "Merged field");
-@@ -5159,6 +5226,7 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd,
+@@ -5159,6 +5247,7 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd,
  	image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
  	image_info.misc |= Vulkan::IMAGE_MISC_MUTABLE_SRGB_BIT;
  
@@ -226,10 +419,10 @@ index dbe032d..615dfa7 100644
  	device->set_name(*deinterlaced, "Deinterlaced");
  
 diff --git a/gs/gs_renderer.hpp b/gs/gs_renderer.hpp
-index d9acc50..acb3a13 100644
+index d9acc50..be14252 100644
 --- a/gs/gs_renderer.hpp
 +++ b/gs/gs_renderer.hpp
-@@ -20,6 +20,25 @@
+@@ -20,6 +20,26 @@
  
  namespace ParallelGS
  {
@@ -244,6 +437,7 @@ index d9acc50..acb3a13 100644
 +	FlushCounterPressureImages,
 +	FlushCounterPressureOther,
 +	FlushCounterPrimitives,      // primitives handed to the GPU by flush_submit
++	FlushCounterReplacedDraws,   // [ps2x] primitives drawn from a replacement texture
 +	FlushCounterReasonBase,      // + FlushReason: render-pass flushes by reason (7 reasons)
 +	FlushCounterCount = FlushCounterReasonBase + 7
 +};
@@ -255,7 +449,27 @@ index d9acc50..acb3a13 100644
  struct ScanoutResult
  {
  	Vulkan::ImageHandle image;
-@@ -294,6 +313,7 @@ public:
+@@ -169,6 +189,10 @@ struct TextureInfo
+ {
+ 	const Vulkan::ImageView *view;
+ 	TexInfo info;
++	// [ps2x] texture replacement (C++ only, not uploaded): mip levels of the replacement image
++	// (0 = not replaced) and how many of its texels span one texel of the GS texture.
++	uint32_t replacement_levels = 0;
++	float replacement_scale = 1.0f;
+ };
+ 
+ struct RenderPass
+@@ -263,6 +287,8 @@ public:
+ 	void rewind_clut_instance(uint32_t index);
+ 
+ 	Vulkan::ImageHandle create_cached_texture(const TextureDescriptor &desc);
++	// [ps2x] An immutable RGBA8 image with the given mip levels (level 0 = width x height), for texture replacement.
++	Vulkan::ImageHandle create_replacement_image(uint32_t width, uint32_t height, const std::vector<std::vector<uint32_t>> &levels);
+ 	// Should always be called after create_cached_texture().
+ 	// We'll be able to do some last minute modifications to the upload descriptor
+ 	// depending on the page tracker state, e.g. to enable shadow copy strategy.
+@@ -294,6 +320,7 @@ public:
  
  	// Submit to GPU and signal when done.
  	void flush_submit(uint64_t timeline);
@@ -263,7 +477,7 @@ index d9acc50..acb3a13 100644
  
  	// Wait until timeline reaches value. After waiting, it may be safe to read from host VRAM.
  	void wait_timeline(uint64_t value);
-@@ -545,6 +565,12 @@ private:
+@@ -545,6 +572,12 @@ private:
  	void drain_compilation_tasks_nonblock();
  	void kick_compilation_tasks();
  	std::atomic_bool compilation_tasks_active;

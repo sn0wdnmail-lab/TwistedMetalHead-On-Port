@@ -17,6 +17,7 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_perf.h"
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_texture_replace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -455,6 +456,31 @@ namespace ps2gpu
                                                          ? static_cast<uint32_t>(ps2settings::get().gpuFlushPrimitives)
                                                          : 65536u);
         setFeedBatching(ps2settings::get().gpuFeedBatch != 0);
+        // Replacement textures (textures\font_atlas.png): the renderer samples them instead of the
+        // game's own, picking the mip level that fits each letter's size on screen.
+        {
+            std::vector<std::string> notes;
+            std::vector<ps2texrep::Replacement> replacements = ps2texrep::loadAll(notes);
+            for (const std::string &note : notes)
+                ps2perf::graphicsNote(" Replacement textures: %s", note.c_str());
+            for (ps2texrep::Replacement &r : replacements)
+            {
+                ParallelGS::GSInterface::TextureReplacement t;
+                t.tbp0 = r.tbp0;
+                t.tbw = r.tbw;
+                t.psm = r.psm;
+                t.tw = r.tw;
+                t.th = r.th;
+                t.cbp = r.cbp;
+                t.width = r.width;
+                t.height = r.height;
+                const size_t levels = r.levels.size();
+                t.levels = std::move(r.levels);
+                const bool ok = s.iface.set_texture_replacement(t);
+                ps2perf::graphicsNote(" Replacement texture \"%s\": %s (%u x %u, %zu mip levels) %s", r.name.c_str(), r.path.c_str(), r.width, r.height,
+                                      levels, ok ? "in use" : "could not be used");
+            }
+        }
         s.superSampling = static_cast<uint32_t>(gsOptions.super_sampling);
         g_currentSuperSampling.store(s.superSampling);
 
@@ -949,6 +975,8 @@ namespace ps2gpu
                 ParallelGS::take_flush_counters(fc, ParallelGS::FlushCounterCount);
                 auto per = [span](uint64_t v) { return static_cast<double>(v) / span; };
                 const int rb = ParallelGS::FlushCounterReasonBase;
+                if (fc[ParallelGS::FlushCounterReplacedDraws] != 0)
+                    ps2perf::graphicsNote("           replacement textures: %.0f draws/s", per(fc[ParallelGS::FlushCounterReplacedDraws]));
                 ps2perf::graphicsNote("           paraLLEl-GS: %.0f primitives/s, %.0f flushes/s -> %.0f GPU queue submits/s | work-queued flushes %.0f/s (primitives %.0f, passes %.0f, images %.0f, other %.0f) | "
                                       "render passes ended by: FB change %.0f, overflow %.0f, texture hazard %.0f, copy hazard %.0f, submission %.0f, pressure %.0f, CPU access %.0f /s",
                                       per(fc[ParallelGS::FlushCounterPrimitives]), per(fc[ParallelGS::FlushCounterSubmitCalls]), per(fc[ParallelGS::FlushCounterQueueSubmits]), per(fc[ParallelGS::FlushCounterPressure]),

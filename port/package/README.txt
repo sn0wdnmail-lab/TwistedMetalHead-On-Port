@@ -54,6 +54,14 @@ Video (F2 > Video) - all of it changes straight away, no restart needed
   Internal resolution  How sharp the GPU draws the game: 1x (640 x 448), 2x or
                        4x. Auto picks 2x for up to 1080p and 4x above.
 
+Sharper font (Vulkan renderer)
+  A picture named font_atlas.png in a "textures" folder next to TMHO.exe
+  replaces the game's font, so the text can be sharper than the game's own
+  512 x 512 one. It is the same 16 x 16 grid of letters, upright, at 2, 4, 8
+  or 16 times the size (2048 x 2048 is plenty, even at 4K). Every piece of
+  text in the game is drawn from it. Remove the file to get the game's own
+  font back. Graphicslogs.txt notes whether it was used.
+
 Camera (F2 > Game)
   Field of view        How wide the battle camera sees (the game's own view is
                        65 degrees at 4:3, 81 at 16:9).
