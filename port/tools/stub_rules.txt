@@ -1,0 +1,39 @@
+# Runtime bindings the analyzer proposes but Head-On needs its own code for.
+# "-Name" keeps the game's own code; "handler@0xADDRESS" adds a binding.
+
+# InitThread: the game's libkernl version creates the kernel top thread and raises the main
+# thread to priority 1; 989snd's start routine creates its tick thread at (main priority - 1)
+# and fails when the main thread is still at the runtime's priority 0.
+-InitThread
+
+# libgraph / libdma: the runtime's handlers use their own sceGsLoadImage layout and build
+# packets in a guest heap that starts right after the ELF, which is where Head-On keeps its own
+# heap and the main thread's stack (sceGsExecLoadImage overwrote saved return addresses).
+# The game's own libgraph/libdma code drives the emulated DMA and GS registers instead.
+-sceGsResetGraph
+-sceGsSetDefDispEnv
+-sceGsPutDispEnv
+-sceGsSetDefDrawEnv
+-sceGsSetDefClear
+-sceGsPutDrawEnv
+-sceGsSetDefLoadImage
+-sceGsSetDefStoreImage
+-sceGsExecLoadImage
+-sceGsExecStoreImage
+-sceGsSetDefDrawEnv2
+-sceGszbufaddr
+-sceGifPkCloseGifTag
+-sceGifPkAddGsAD
+-sceDmaGetChan
+-sceDmaReset
+-sceDmaPutEnv
+-sceDmaGetEnv
+-sceDmaSend
+-sceDmaSendN
+-sceDmaSendI
+-sceDmaRecv
+-sceDmaRecvN
+-sceDmaRecvI
+-sceDmaSync
+-sceDmaWatch
+-sceDmaPause

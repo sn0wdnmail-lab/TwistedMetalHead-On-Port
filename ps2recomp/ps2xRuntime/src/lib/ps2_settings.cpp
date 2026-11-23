@@ -1,0 +1,1393 @@
+// In-game settings drawer (F2), after the chosen design concept: a dark side drawer with
+// Video / Audio / Game / UI tabs, an accent colour the player picks, and keyboard, controller
+// and mouse control. Settings persist in settings.ini next to the executable's working directory.
+
+#include "runtime/ps2_settings.h"
+#include "tmho_game.h"
+#include "ps2_movie_state.h"
+#include "runtime/gs/gs_gpu_renderer.h"
+#include "runtime/ps2_perf.h"
+#include "runtime/ps2_launcher.h"
+
+#include "raylib.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// raylib's own GLFW (linked into libraylib): chaining its callbacks catches presses that are
+// released again before the next frame - touchpad taps, very short key presses.
+extern "C"
+{
+    typedef struct GLFWwindow GLFWwindow;
+    typedef void (*GLFWmousebuttonfun)(GLFWwindow *, int, int, int);
+    typedef void (*GLFWkeyfun)(GLFWwindow *, int, int, int, int);
+    GLFWwindow *glfwGetCurrentContext(void);
+    GLFWmousebuttonfun glfwSetMouseButtonCallback(GLFWwindow *window, GLFWmousebuttonfun callback);
+    GLFWkeyfun glfwSetKeyCallback(GLFWwindow *window, GLFWkeyfun callback);
+    typedef struct GLFWmonitor GLFWmonitor;
+    typedef struct GLFWvidmode
+    {
+        int width, height, redBits, greenBits, blueBits, refreshRate;
+    } GLFWvidmode;
+    GLFWmonitor **glfwGetMonitors(int *count);
+    const GLFWvidmode *glfwGetVideoModes(GLFWmonitor *monitor, int *count);
+}
+
+namespace ps2settings
+{
+    namespace
+    {
+        // ---- quick taps (see above)
+        GLFWmousebuttonfun g_raylibMouseButton = nullptr;
+        GLFWkeyfun g_raylibKey = nullptr;
+        bool g_tapClick = false;          // left button went down since the last frame
+        bool g_clickThisFrame = false;    // latched once per frame in update()
+        bool g_tapKeys[512] = {};         // keys that went down since the last frame
+        bool g_keysThisFrame[512] = {};
+
+        void onMouseButton(GLFWwindow *window, int button, int action, int mods)
+        {
+            if (button == 0 && action == 1)
+                g_tapClick = true;
+            if (g_raylibMouseButton)
+                g_raylibMouseButton(window, button, action, mods);
+        }
+
+        void onKey(GLFWwindow *window, int key, int scancode, int action, int mods)
+        {
+            if (action == 1 && key >= 0 && key < 512)
+                g_tapKeys[key] = true;
+            if (g_raylibKey)
+                g_raylibKey(window, key, scancode, action, mods);
+        }
+
+        void installTapCapture()
+        {
+            static bool installed = false;
+            if (installed)
+                return;
+            GLFWwindow *window = glfwGetCurrentContext();
+            if (!window)
+                return;
+            installed = true;
+            g_raylibMouseButton = glfwSetMouseButtonCallback(window, onMouseButton);
+            g_raylibKey = glfwSetKeyCallback(window, onKey);
+        }
+
+        // Once per frame: what was pressed since the previous frame.
+        void latchTaps()
+        {
+            g_clickThisFrame = g_tapClick || IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+            g_tapClick = false;
+            for (int k = 0; k < 512; ++k)
+            {
+                g_keysThisFrame[k] = g_tapKeys[k];
+                g_tapKeys[k] = false;
+            }
+        }
+
+        Settings g_settings;
+        std::atomic<bool> g_menuOpen{false};
+        std::atomic<bool> g_paused{false};
+        std::string g_iniPath = "settings.ini";
+        bool g_gpuActive = false;
+        bool g_gpuAvailable = false;
+        std::string g_gpuDevice;
+        std::string g_rendererHelp = "Vulkan draws the game on your graphics card; Software uses the CPU. Applies on the next start.";
+        std::string g_setupNote;
+
+        struct WindowSize
+        {
+            int width;
+            int height;
+            const char *label;
+        };
+        // Window sizes of older settings files (window_size=<index>).
+        const WindowSize kWindowSizes[] = {
+            {640, 480, "640 x 480"},   {960, 720, "960 x 720"},   {1280, 960, "1280 x 960"},   {1280, 720, "1280 x 720"},
+            {1600, 900, "1600 x 900"}, {1920, 1080, "1920 x 1080"}, {2560, 1440, "2560 x 1440"}, {3840, 2160, "3840 x 2160"},
+        };
+        constexpr int kWindowSizeCount = static_cast<int>(sizeof(kWindowSizes) / sizeof(kWindowSizes[0]));
+
+        // Resolutions offered per aspect ratio, from the PS2's 480 lines up to 4K.
+        struct Resolution
+        {
+            int width;
+            int height;
+            const char *tag;
+        };
+        const Resolution kResolutions43[] = {
+            {640, 480, "480p, 1x"}, {960, 720, "720p, 1.5x"}, {1280, 960, "960p, 2x"},
+            {1440, 1080, "1080p"}, {1920, 1440, "1440p, 3x"}, {2880, 2160, "4K"},
+        };
+        const Resolution kResolutions169[] = {
+            {854, 480, "480p"}, {1280, 720, "720p"}, {1600, 900, "900p"},
+            {1920, 1080, "1080p"}, {2560, 1440, "1440p"}, {3840, 2160, "4K"},
+        };
+
+        struct Swatch
+        {
+            uint32_t rgb;
+            const char *name;
+        };
+        const Swatch kSwatches[] = {
+            {0x4C8DFFu, "Blue"}, {0x22C3C3u, "Teal"}, {0x2BD67Bu, "Green"}, {0xF2B705u, "Yellow"},
+            {0xFF7A1Au, "Orange"}, {0xFF4D4Du, "Red"}, {0xFF5FA8u, "Pink"}, {0x9B7BFFu, "Purple"},
+        };
+        constexpr int kSwatchCount = 8;
+
+        // ---------------------------------------------------------------- persistence
+        void save()
+        {
+            std::ofstream out(g_iniPath, std::ios::trunc);
+            if (!out)
+                return;
+            const Settings &s = g_settings;
+            out << "# Twisted Metal: Head-On PC port settings (F2 in game)\n";
+            out << "window_mode=" << s.windowMode << "\n";
+            out << "# res_width/res_height: window size (windowed), display mode (fullscreen) or picture size (borderless); 0 = monitor\n";
+            out << "res_width=" << s.resWidth << "\n";
+            out << "res_height=" << s.resHeight << "\n";
+            out << "aspect=" << s.aspect << "\n";
+            out << "filter=" << s.filter << "\n";
+            out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
+            out << "show_fps=" << (s.showFps ? 1 : 0) << "\n";
+            out << "record_frames=" << (s.recordFrames ? 1 : 0) << "\n";
+            out << "fov=" << s.fovDegrees << "\n";
+            out << "camera_distance=" << s.cameraDistance << "\n";
+            out << "master_volume=" << s.masterVolume << "\n";
+            out << "mute_unfocused=" << (s.muteUnfocused ? 1 : 0) << "\n";
+            out << "pause_in_menu=" << (s.pauseInMenu ? 1 : 0) << "\n";
+            out << "accent=" << s.accentIndex << "\n";
+            char hex[16];
+            std::snprintf(hex, sizeof(hex), "%06X", s.accentCustom & 0xFFFFFFu);
+            out << "accent_custom=" << hex << "\n";
+            out << "menu_opacity=" << s.menuOpacity << "\n";
+            out << "menu_side=" << s.menuSide << "\n";
+            out << "# renderer: 0 = Vulkan GPU, 1 = software (CPU). Takes effect on the next start.\n";
+            out << "renderer=" << s.renderer << "\n";
+            out << "# internal_res (GPU renderer): 0 = Auto (from the output size), 1 = 1x (640x448), 2 = 2x (1280x896), 3 = 4x (2560x1792)\n";
+            out << "internal_res=" << s.internalScale << "\n";
+            out << "# vu1_thread (GPU renderer): 1 = VIF1 and VU1 microcode run on their own CPU core, 0 = on the game thread. Next start.\n";
+            out << "vu1_thread=" << (s.vu1Thread ? 1 : 0) << "\n";
+        }
+
+        void load()
+        {
+            std::ifstream in(g_iniPath);
+            if (!in)
+                return;
+            std::string line;
+            Settings &s = g_settings;
+            while (std::getline(in, line))
+            {
+                if (line.empty() || line[0] == '#')
+                    continue;
+                const size_t eq = line.find('=');
+                if (eq == std::string::npos)
+                    continue;
+                const std::string key = line.substr(0, eq);
+                const std::string value = line.substr(eq + 1);
+                const int number = std::atoi(value.c_str());
+                if (key == "window_mode") s.windowMode = std::clamp(number, 0, 2);
+                else if (key == "window_size")
+                {
+                    // Older files: a window size index; becomes the resolution unless one is set.
+                    s.windowSize = std::clamp(number, 0, kWindowSizeCount - 1);
+                    if (s.resWidth == 0 && s.resHeight == 0)
+                    {
+                        s.resWidth = kWindowSizes[s.windowSize].width;
+                        s.resHeight = kWindowSizes[s.windowSize].height;
+                    }
+                }
+                else if (key == "res_width") s.resWidth = std::clamp(number, 0, 7680);
+                else if (key == "res_height") s.resHeight = std::clamp(number, 0, 4320);
+                else if (key == "aspect") s.aspect = std::clamp(number, 0, 2);
+                else if (key == "filter") s.filter = std::clamp(number, 0, 1);
+                else if (key == "vsync") s.vsync = number != 0;
+                else if (key == "show_fps") s.showFps = number != 0;
+                else if (key == "record_frames") s.recordFrames = number != 0;
+                else if (key == "fov") s.fovDegrees = number <= 0 ? 0 : std::clamp(number, 50, 120);
+                else if (key == "camera_distance") s.cameraDistance = std::clamp(number, 50, 200);
+                else if (key == "master_volume") s.masterVolume = std::clamp(number, 0, 100);
+                else if (key == "mute_unfocused") s.muteUnfocused = number != 0;
+                else if (key == "pause_in_menu") s.pauseInMenu = number != 0;
+                else if (key == "accent") s.accentIndex = std::clamp(number, 0, kSwatchCount);
+                else if (key == "accent_custom") s.accentCustom = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 16)) & 0xFFFFFFu;
+                else if (key == "menu_opacity") s.menuOpacity = std::clamp(number, 60, 100);
+                else if (key == "menu_side") s.menuSide = std::clamp(number, 0, 1);
+                else if (key == "renderer") s.renderer = std::clamp(number, 0, 1);
+                else if (key == "internal_resolution") s.internalScale = number <= 0 ? 0 : std::clamp(number + 1, 2, 3); // older files
+                else if (key == "internal_res") s.internalScale = std::clamp(number, 0, 3);
+                else if (key == "vu1_thread") s.vu1Thread = number != 0;
+            }
+        }
+
+        // ---------------------------------------------------------------- applying
+        int g_appliedWindowMode = 0;
+        int g_appliedAspectForWindow = -1;
+        bool g_appliedVsync = false;
+        int g_appliedFilter = -1;
+        Texture2D *g_frameTexture = nullptr;
+
+        void centerWindow(int width, int height)
+        {
+            const int monitor = GetCurrentMonitor();
+            const int mw = GetMonitorWidth(monitor);
+            const int mh = GetMonitorHeight(monitor);
+            const Vector2 origin = GetMonitorPosition(monitor);
+            SetWindowPosition(static_cast<int>(origin.x) + std::max(0, (mw - width) / 2),
+                              static_cast<int>(origin.y) + std::max(0, (mh - height) / 2));
+        }
+
+        bool isWideFamily(int width, int height)
+        {
+            return height > 0 && static_cast<float>(width) / static_cast<float>(height) > 1.5f;
+        }
+
+        // The window size for windowed mode: the chosen resolution, else a default that suits the
+        // aspect ratio; never larger than the monitor.
+        void windowedSize(int &width, int &height)
+        {
+            const Settings &s = g_settings;
+            width = s.resWidth;
+            height = s.resHeight;
+            if (width <= 0 || height <= 0)
+            {
+                width = s.aspect == 1 ? 1280 : 1280;
+                height = s.aspect == 1 ? 720 : 960;
+            }
+            const int monitor = GetCurrentMonitor();
+            const int mw = GetMonitorWidth(monitor);
+            const int mh = GetMonitorHeight(monitor);
+            if (mw > 0 && mh > 0 && (width > mw || height > mh))
+            {
+                const float scale = std::min(static_cast<float>(mw) / width, static_cast<float>(mh) / height);
+                width = static_cast<int>(width * scale);
+                height = static_cast<int>(height * scale);
+            }
+        }
+
+        int g_appliedResWidth = -1;
+        int g_appliedResHeight = -1;
+
+        void applyWindowMode()
+        {
+            const Settings &s = g_settings;
+            if (s.windowMode == g_appliedWindowMode && s.resWidth == g_appliedResWidth && s.resHeight == g_appliedResHeight &&
+                (s.windowMode != 0 || s.aspect == g_appliedAspectForWindow))
+                return;
+            const bool modeChanged = s.windowMode != g_appliedWindowMode;
+            // Borderless only changes the picture size when the resolution changes; no mode switch.
+            if (!modeChanged && s.windowMode == 1)
+            {
+                g_appliedResWidth = s.resWidth;
+                g_appliedResHeight = s.resHeight;
+                return;
+            }
+            const int monitor = GetCurrentMonitor();
+            const int fullWidth = s.resWidth > 0 ? s.resWidth : GetMonitorWidth(monitor);
+            const int fullHeight = s.resHeight > 0 ? s.resHeight : GetMonitorHeight(monitor);
+            // Already full screen and only the resolution changed: one display mode change.
+            if (!modeChanged && s.windowMode == 2 && IsWindowFullscreen())
+            {
+                SetWindowSize(fullWidth, fullHeight);
+                g_appliedResWidth = s.resWidth;
+                g_appliedResHeight = s.resHeight;
+                return;
+            }
+            // Leave the current mode first.
+            if (IsWindowFullscreen())
+                ToggleFullscreen();
+            if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
+                ToggleBorderlessWindowed();
+            if (IsWindowState(FLAG_WINDOW_UNDECORATED))
+                ClearWindowState(FLAG_WINDOW_UNDECORATED); // set below for full screen
+            if (s.windowMode == 0)
+            {
+                int width = 0, height = 0;
+                windowedSize(width, height);
+                SetWindowSize(width, height);
+                centerWindow(width, height);
+            }
+            else if (s.windowMode == 1)
+            {
+                ToggleBorderlessWindowed();
+            }
+            else
+            {
+                // Exclusive full screen uses the window size as the display mode. Windows keeps a
+                // window with a title bar smaller than the screen (1920 x 1080 came out 1920 x 1060,
+                // leaving a strip below the picture), so the title bar goes first.
+                SetWindowState(FLAG_WINDOW_UNDECORATED);
+                SetWindowSize(fullWidth, fullHeight);
+                ToggleFullscreen();
+            }
+            g_appliedWindowMode = s.windowMode;
+            g_appliedResWidth = s.resWidth;
+            g_appliedResHeight = s.resHeight;
+            g_appliedAspectForWindow = s.aspect;
+        }
+
+        // Internal resolution: what the GPU renderer draws at. Auto follows the output height.
+        void applyInternalResolution()
+        {
+            if (!g_gpuAvailable || g_settings.renderer != 0)
+                return;
+            int width = 0, height = 0;
+            pictureTargetSize(GetScreenWidth(), GetScreenHeight(), width, height);
+            const uint32_t rate = superSamplingFor(g_settings.internalScale, height);
+            static uint32_t requested = 0u;
+            if (rate != requested)
+            {
+                requested = rate;
+                ps2gpu::requestSuperSampling(rate);
+            }
+        }
+
+        // A resolution entry list for the Resolution row: label and size (0 x 0 = monitor).
+        struct ResolutionChoice
+        {
+            int width;
+            int height;
+            std::string label;
+        };
+
+        std::vector<ResolutionChoice> resolutionChoices()
+        {
+            const Settings &s = g_settings;
+            std::vector<ResolutionChoice> list;
+            const int monitor = GetCurrentMonitor();
+            const int mw = GetMonitorWidth(monitor);
+            const int mh = GetMonitorHeight(monitor);
+            char text[64];
+            auto add = [&](int width, int height, const char *tag)
+            {
+                for (const ResolutionChoice &existing : list)
+                    if (existing.width == width && existing.height == height)
+                        return;
+                if (tag && *tag)
+                    std::snprintf(text, sizeof(text), "%d x %d  (%s)", width, height, tag);
+                else
+                    std::snprintf(text, sizeof(text), "%d x %d", width, height);
+                list.push_back({width, height, text});
+            };
+            if (s.windowMode != 0)
+            {
+                std::snprintf(text, sizeof(text), "Monitor  (%d x %d)", mw, mh);
+                list.push_back({0, 0, text});
+            }
+            if (s.windowMode == 2)
+            {
+                // Exclusive full screen: the display modes the monitor offers.
+                int monitorCount = 0;
+                GLFWmonitor **monitors = glfwGetMonitors(&monitorCount);
+                if (monitors && monitor >= 0 && monitor < monitorCount)
+                {
+                    int modeCount = 0;
+                    const GLFWvidmode *modes = glfwGetVideoModes(monitors[monitor], &modeCount);
+                    std::vector<std::pair<int, int>> sizes;
+                    for (int i = 0; i < modeCount; ++i)
+                        if (modes[i].width >= 640 && modes[i].height >= 480)
+                            sizes.emplace_back(modes[i].width, modes[i].height);
+                    std::sort(sizes.begin(), sizes.end(), [](auto a, auto b) { return a.first * a.second < b.first * b.second; });
+                    for (const auto &size : sizes)
+                        add(size.first, size.second, size.second == 480 ? "480p" : size.second == 720 ? "720p" : size.second == 1080 ? "1080p"
+                                                    : size.second == 1440 ? "1440p" : size.second == 2160 ? "4K" : "");
+                }
+                return list;
+            }
+            const bool wantWide = s.aspect == 1;
+            const bool both = s.aspect == 2;
+            if (!wantWide || both)
+                for (const Resolution &r : kResolutions43)
+                    if (s.windowMode == 1 || ((mw <= 0 || r.width <= mw) && (mh <= 0 || r.height <= mh)))
+                        add(r.width, r.height, r.tag);
+            if (wantWide || both)
+                for (const Resolution &r : kResolutions169)
+                    if (s.windowMode == 1 || ((mw <= 0 || r.width <= mw) && (mh <= 0 || r.height <= mh)))
+                        add(r.width, r.height, r.tag);
+            return list;
+        }
+
+        // After the aspect ratio changes in windowed mode: the same-height size of the new shape.
+        void matchWindowToAspect()
+        {
+            Settings &s = g_settings;
+            if (s.windowMode != 0 || s.aspect == 2)
+                return;
+            int width = 0, height = 0;
+            windowedSize(width, height);
+            const bool wide = s.aspect == 1;
+            if (isWideFamily(width, height) == wide)
+                return;
+            const Resolution *best = nullptr;
+            const Resolution *family = wide ? kResolutions169 : kResolutions43;
+            const int monitor = GetCurrentMonitor();
+            for (int i = 0; i < 6; ++i)
+            {
+                const Resolution &r = family[i];
+                if (r.width > GetMonitorWidth(monitor) || r.height > GetMonitorHeight(monitor))
+                    continue;
+                if (!best || std::abs(r.height - height) < std::abs(best->height - height))
+                    best = &r;
+            }
+            if (best)
+            {
+                s.resWidth = best->width;
+                s.resHeight = best->height;
+            }
+        }
+
+        void applyVsync()
+        {
+            if (g_settings.vsync == g_appliedVsync)
+                return;
+            if (g_settings.vsync)
+                SetWindowState(FLAG_VSYNC_HINT);
+            else
+                ClearWindowState(FLAG_VSYNC_HINT);
+            g_appliedVsync = g_settings.vsync;
+        }
+
+        void applyFilter()
+        {
+            // The GPU renderer recreates the texture when the picture size changes: re-apply then.
+            static unsigned appliedTexture = 0u;
+            if (!g_frameTexture || g_frameTexture->id == 0 ||
+                (g_settings.filter == g_appliedFilter && g_frameTexture->id == appliedTexture))
+                return;
+            SetTextureFilter(*g_frameTexture, g_settings.filter ? TEXTURE_FILTER_BILINEAR : TEXTURE_FILTER_POINT);
+            g_appliedFilter = g_settings.filter;
+            appliedTexture = g_frameTexture->id;
+        }
+
+        void applyVolume()
+        {
+            const bool muted = g_settings.muteUnfocused && !IsWindowFocused();
+            static float applied = -1.0f;
+            const float volume = muted ? 0.0f : static_cast<float>(g_settings.masterVolume) / 100.0f;
+            if (volume != applied)
+            {
+                SetMasterVolume(volume);
+                applied = volume;
+            }
+        }
+
+        // ---------------------------------------------------------------- look
+        Font g_font{};
+        Font g_fontBold{};
+        bool g_fontsLoaded = false;
+
+        void loadFonts()
+        {
+            if (g_fontsLoaded)
+                return;
+            g_fontsLoaded = true;
+            std::vector<int> codepoints;
+            for (int c = 32; c < 127; ++c)
+                codepoints.push_back(c);
+            for (int c : {0x00B0, 0x00B7, 0x00D7, 0x2022, 0x2039, 0x203A, 0x2190, 0x2191, 0x2192, 0x2193, 0x2014})
+                codepoints.push_back(c);
+            const char *regular[] = {"C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"};
+            const char *bold[] = {"C:/Windows/Fonts/segoeuib.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"};
+            for (const char *path : regular)
+            {
+                if (FileExists(path))
+                {
+                    g_font = LoadFontEx(path, 48, codepoints.data(), static_cast<int>(codepoints.size()));
+                    break;
+                }
+            }
+            for (const char *path : bold)
+            {
+                if (FileExists(path))
+                {
+                    g_fontBold = LoadFontEx(path, 48, codepoints.data(), static_cast<int>(codepoints.size()));
+                    break;
+                }
+            }
+            if (g_font.texture.id == 0)
+                g_font = GetFontDefault();
+            if (g_fontBold.texture.id == 0)
+                g_fontBold = g_font;
+            SetTextureFilter(g_font.texture, TEXTURE_FILTER_BILINEAR);
+            SetTextureFilter(g_fontBold.texture, TEXTURE_FILTER_BILINEAR);
+        }
+
+        Color rgb(uint32_t value, unsigned char alpha = 255)
+        {
+            return Color{static_cast<unsigned char>((value >> 16) & 0xFF), static_cast<unsigned char>((value >> 8) & 0xFF),
+                         static_cast<unsigned char>(value & 0xFF), alpha};
+        }
+
+        uint32_t accentRgb()
+        {
+            const Settings &s = g_settings;
+            return s.accentIndex < kSwatchCount ? kSwatches[s.accentIndex].rgb : (s.accentCustom & 0xFFFFFFu);
+        }
+
+        // Dark or white text on top of the accent colour, by luminance.
+        Color inkFor(uint32_t value)
+        {
+            const float r = static_cast<float>((value >> 16) & 0xFF) / 255.0f;
+            const float g = static_cast<float>((value >> 8) & 0xFF) / 255.0f;
+            const float b = static_cast<float>(value & 0xFF) / 255.0f;
+            const float luminance = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+            return luminance > 0.55f ? rgb(0x0E1116) : WHITE;
+        }
+
+        void text(const char *value, float x, float y, float size, Color color, bool bold = false)
+        {
+            DrawTextEx(bold ? g_fontBold : g_font, value, Vector2{std::round(x), std::round(y)}, size, size * 0.02f, color);
+        }
+
+        float textWidth(const char *value, float size, bool bold = false)
+        {
+            return MeasureTextEx(bold ? g_fontBold : g_font, value, size, size * 0.02f).x;
+        }
+
+        // ---------------------------------------------------------------- rows
+        enum class RowKind
+        {
+            Choice,
+            Toggle,
+            Slider,
+            Swatches,
+            HexColor,
+            Action,
+        };
+
+        struct Row
+        {
+            const char *label;
+            const char *help;
+            RowKind kind;
+            std::function<int()> getValue;            // Choice/Slider/Swatches: current value
+            std::function<void(int)> setValue;        // apply a new value
+            std::vector<std::string> choices;         // Choice
+            int minimum = 0;
+            int maximum = 100;
+            int step = 1;
+            const char *suffix = "";
+            std::function<bool()> enabled = [] { return true; };
+            const char *disabledNote = "";
+            const char *actionLabel = "Reset"; // Action: the button's text
+        };
+
+        int g_tab = 0;
+        int g_focus = 0;
+        double g_quitArmedUntil = 0.0;          // "Quit game" pressed once: a second press before this quits
+        std::atomic<bool> g_quitRequested{false};
+        bool g_editingHex = false;
+        std::string g_hexBuffer;
+        bool g_draggingSlider = false;
+
+        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "UI"};
+
+        std::vector<Row> buildRows(int tab)
+        {
+            Settings &s = g_settings;
+            std::vector<Row> rows;
+            auto changed = [] { save(); };
+            if (tab == 0)
+            {
+                Row mode{"Display mode", "Windowed, borderless full screen, or exclusive full screen.", RowKind::Choice,
+                         [&s] { return s.windowMode; }, [&s, changed](int v) { s.windowMode = v; s.resWidth = 0; s.resHeight = 0; changed(); },
+                         {"Windowed", "Borderless", "Fullscreen"}};
+                rows.push_back(mode);
+                const std::vector<ResolutionChoice> choices = resolutionChoices();
+                std::vector<std::string> labels;
+                int current = -1;
+                for (size_t i = 0; i < choices.size(); ++i)
+                {
+                    labels.push_back(choices[i].label);
+                    if (choices[i].width == s.resWidth && choices[i].height == s.resHeight)
+                        current = static_cast<int>(i);
+                }
+                if (current < 0 && s.windowMode == 0)
+                {
+                    // The window's own size (an older setting or one the monitor cannot fit).
+                    int width = 0, height = 0;
+                    windowedSize(width, height);
+                    for (size_t i = 0; i < choices.size(); ++i)
+                        if (choices[i].width == width && choices[i].height == height)
+                            current = static_cast<int>(i);
+                    if (current < 0)
+                    {
+                        char text[48];
+                        std::snprintf(text, sizeof(text), "%d x %d", width, height);
+                        labels.insert(labels.begin(), text);
+                        current = 0;
+                    }
+                }
+                const char *resolutionHelp = s.windowMode == 0 ? "Size of the game window. Changes straight away."
+                                             : s.windowMode == 1 ? "The size the picture is drawn at, then scaled to fill the screen. Monitor draws at the screen's own size."
+                                                                 : "The display mode used in full screen. Monitor keeps the screen's own mode.";
+                const int offset = static_cast<int>(labels.size() - choices.size());
+                Row resolution{"Resolution", resolutionHelp, RowKind::Choice, [current] { return std::max(current, 0); },
+                               [&s, changed, choices, offset](int v)
+                               {
+                                   const int index = v - offset;
+                                   if (index < 0 || index >= static_cast<int>(choices.size()))
+                                       return;
+                                   s.resWidth = choices[static_cast<size_t>(index)].width;
+                                   s.resHeight = choices[static_cast<size_t>(index)].height;
+                                   changed();
+                               },
+                               labels};
+                rows.push_back(resolution);
+                Row aspect{"Aspect ratio", "4:3 is the original picture. 16:9 is true widescreen: the game's cameras see more to each side and the HUD and text keep their shape (movies stay 4:3). Stretch fills the screen with the 4:3 picture.", RowKind::Choice,
+                           [&s] { return s.aspect; },
+                           [&s, changed](int v)
+                           {
+                               s.aspect = v;
+                               matchWindowToAspect();
+                               changed();
+                               tmho::settingsChanged();
+                           },
+                           {"4:3", "16:9", "Stretch"}};
+                rows.push_back(aspect);
+                Row internal{"Internal resolution", "How sharp the GPU draws the game. Auto picks from the resolution: 1x (640 x 448) up to 540 lines, 2x (1280 x 896) up to 1080p, 4x (2560 x 1792) above. Changes straight away.",
+                             RowKind::Choice, [&s] { return s.internalScale; }, [&s, changed](int v) { s.internalScale = v; changed(); },
+                             {"Auto", "1x  (640 x 448)", "2x  (1280 x 896)", "4x  (2560 x 1792)"}};
+                internal.enabled = [&s] { return g_gpuAvailable && s.renderer == 0; };
+                internal.disabledNote = "Vulkan renderer only";
+                rows.push_back(internal);
+                Row filter{"Scaling", "Sharp keeps the pixels crisp; Smooth blends them when the picture is enlarged.", RowKind::Choice,
+                           [&s] { return s.filter; }, [&s, changed](int v) { s.filter = v; changed(); },
+                           {"Sharp", "Smooth"}};
+                rows.push_back(filter);
+                Row vsync{"V-Sync", "Waits for the monitor's refresh to avoid tearing.", RowKind::Toggle,
+                          [&s] { return s.vsync ? 1 : 0; }, [&s, changed](int v) { s.vsync = v != 0; changed(); }};
+                rows.push_back(vsync);
+                Row renderer{"Renderer", g_rendererHelp.c_str(), RowKind::Choice,
+                             [&s] { return s.renderer; }, [&s, changed](int v) { s.renderer = v; changed(); },
+                             {"Vulkan (GPU)", "Software (CPU)"}};
+                renderer.enabled = [] { return g_gpuAvailable; };
+                renderer.disabledNote = "This build has no Vulkan renderer";
+                rows.push_back(renderer);
+                Row rate{"Frame rate", "The game draws 60 frames per second. 120 fps needs generated in-between frames, which are not available yet; game speed never changes.",
+                         RowKind::Choice, [] { return 0; }, [](int) {}, {"60 fps", "120 fps"}};
+                rate.enabled = [] { return false; };
+                rate.disabledNote = "Not available yet";
+                rows.push_back(rate);
+            }
+            else if (tab == 1)
+            {
+                Row volume{"Master volume", "Volume of everything the game plays.", RowKind::Slider,
+                           [&s] { return s.masterVolume; }, [&s, changed](int v) { s.masterVolume = v; changed(); }};
+                volume.minimum = 0;
+                volume.maximum = 100;
+                volume.step = 5;
+                volume.suffix = "%";
+                rows.push_back(volume);
+                Row mute{"Mute in background", "Silences the game while its window is not focused.", RowKind::Toggle,
+                         [&s] { return s.muteUnfocused ? 1 : 0; }, [&s, changed](int v) { s.muteUnfocused = v != 0; changed(); }};
+                rows.push_back(mute);
+                for (const char *name : {"Music volume", "Effects volume", "Movie volume"})
+                {
+                    Row part{name, "Separate volumes need the per-voice mixer, which is being built.", RowKind::Slider,
+                             [] { return 100; }, [](int) {}};
+                    part.suffix = "%";
+                    part.enabled = [] { return false; };
+                    part.disabledNote = "Coming soon";
+                    rows.push_back(part);
+                }
+            }
+            else if (tab == 2)
+            {
+                Row pause{"Pause in this menu", "Stops the game while the settings drawer is open.", RowKind::Toggle,
+                          [&s] { return s.pauseInMenu ? 1 : 0; }, [&s, changed](int v) { s.pauseInMenu = v != 0; changed(); }};
+                rows.push_back(pause);
+                Row fps{"FPS counter", "Shows the game's frame rate (new pictures per second) in the corner, with the window's frame rate and the game speed.", RowKind::Toggle,
+                        [&s] { return s.showFps ? 1 : 0; }, [&s, changed](int v) { s.showFps = v != 0; changed(); }};
+                rows.push_back(fps);
+                Row record{"Record screenshots", "Saves a picture of the game every half second in Logs\\frames, for bug reports. About 6 MB a minute; pictures older than 10 minutes are deleted.",
+                           RowKind::Toggle, [&s] { return s.recordFrames ? 1 : 0; }, [&s, changed](int v) { s.recordFrames = v != 0; changed(); }};
+                rows.push_back(record);
+                Row vu1{"VU1 thread", "Runs the PS2's 3D math unit (VU1) and the graphics feed on their own CPU core, so busy scenes stay at full speed. Applies on the next start.",
+                        RowKind::Toggle, [&s] { return s.vu1Thread ? 1 : 0; }, [&s, changed](int v) { s.vu1Thread = v != 0; changed(); }};
+                rows.push_back(vu1);
+                Row setup{"Game disc", g_setupNote.empty() ? "Opens the game setup screen (choose another disc, build again) the next time you start TMHO.exe."
+                                                           : g_setupNote.c_str(),
+                          RowKind::Action, [] { return 0; }, [](int)
+                          {
+                              ps2launcher::requestSetupAtNextStart();
+                              g_setupNote = "The setup screen will open the next time you start TMHO.exe.";
+                          }};
+                setup.actionLabel = "Setup";
+                rows.push_back(setup);
+                Row fov{"Field of view", "How wide the battle camera sees, across the picture. The game's own view is 65\xC2\xB0 at 4:3 and 81\xC2\xB0 at 16:9.",
+                        RowKind::Slider,
+                        [&s] { return s.fovDegrees > 0 ? s.fovDegrees : static_cast<int>(std::lround(tmho::defaultHorizontalFov())); },
+                        [&s, changed](int v)
+                        {
+                            const int gameDefault = static_cast<int>(std::lround(tmho::defaultHorizontalFov()));
+                            s.fovDegrees = v == gameDefault ? 0 : v;
+                            changed();
+                            tmho::settingsChanged();
+                        }};
+                fov.minimum = 50;
+                fov.maximum = 120;
+                fov.suffix = "\xC2\xB0";
+                rows.push_back(fov);
+                Row distance{"Camera distance", "How far the chase camera sits behind your car: 100% is the game's own, lower is closer, higher is further back. Changes straight away.",
+                             RowKind::Slider, [&s] { return s.cameraDistance; }, [&s, changed](int v) { s.cameraDistance = v; changed(); }};
+                distance.minimum = 50;
+                distance.maximum = 200;
+                distance.step = 5;
+                distance.suffix = "%";
+                rows.push_back(distance);
+                // Quits without the window's close button (full screen has none). Two presses, so
+                // a stray Enter does not end a match.
+                const bool armed = GetTime() < g_quitArmedUntil;
+                Row quit{"Quit game", armed ? "Press Quit again to close the game." : "Closes the game. Progress not saved in the game is lost.",
+                         RowKind::Action, [] { return 0; }, [](int)
+                         {
+                             if (GetTime() < g_quitArmedUntil)
+                                 g_quitRequested.store(true, std::memory_order_relaxed);
+                             else
+                                 g_quitArmedUntil = GetTime() + 3.0;
+                         }};
+                quit.actionLabel = armed ? "Quit now" : "Quit";
+                rows.push_back(quit);
+            }
+            else
+            {
+                Row accent{"Accent color", "Colour of highlights in this menu.", RowKind::Swatches,
+                           [&s] { return s.accentIndex; }, [&s, changed](int v) { s.accentIndex = v; changed(); }};
+                accent.minimum = 0;
+                accent.maximum = kSwatchCount;
+                rows.push_back(accent);
+                Row hex{"Custom color", "Press Enter and type a hex colour, like FF7A1A.", RowKind::HexColor,
+                        [&s] { return static_cast<int>(s.accentCustom); }, [&s, changed](int v) { s.accentCustom = static_cast<uint32_t>(v) & 0xFFFFFFu; s.accentIndex = kSwatchCount; changed(); }};
+                rows.push_back(hex);
+                Row opacity{"Menu opacity", "How much of the game shows through this drawer.", RowKind::Slider,
+                            [&s] { return s.menuOpacity; }, [&s, changed](int v) { s.menuOpacity = v; changed(); }};
+                opacity.minimum = 60;
+                opacity.maximum = 100;
+                opacity.step = 5;
+                opacity.suffix = "%";
+                rows.push_back(opacity);
+                Row side{"Drawer side", "Which edge of the screen this drawer opens from.", RowKind::Choice,
+                         [&s] { return s.menuSide; }, [&s, changed](int v) { s.menuSide = v; changed(); }, {"Left", "Right"}};
+                rows.push_back(side);
+                Row reset{"Reset all settings", "Puts every setting back to its default.", RowKind::Action,
+                          [] { return 0; }, [&s, changed](int) { s = Settings{}; changed(); }};
+                rows.push_back(reset);
+            }
+            return rows;
+        }
+
+        void stepRow(const Row &row, int direction)
+        {
+            if (!row.enabled())
+                return;
+            const int value = row.getValue();
+            switch (row.kind)
+            {
+            case RowKind::Choice:
+            {
+                const int count = static_cast<int>(row.choices.size());
+                row.setValue((value + direction + count) % count);
+                break;
+            }
+            case RowKind::Toggle:
+                row.setValue(value ? 0 : 1);
+                break;
+            case RowKind::Slider:
+                row.setValue(std::clamp(value + direction * row.step, row.minimum, row.maximum));
+                break;
+            case RowKind::Swatches:
+                row.setValue((value + direction + (row.maximum + 1)) % (row.maximum + 1));
+                break;
+            default:
+                break;
+            }
+        }
+
+        void activateRow(const Row &row)
+        {
+            if (!row.enabled())
+                return;
+            if (row.kind == RowKind::Toggle)
+                row.setValue(row.getValue() ? 0 : 1);
+            else if (row.kind == RowKind::Action)
+                row.setValue(1);
+            else if (row.kind == RowKind::HexColor)
+            {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "%06X", static_cast<unsigned>(row.getValue()) & 0xFFFFFFu);
+                g_hexBuffer = hex;
+                g_editingHex = true;
+            }
+            else
+                stepRow(row, +1);
+        }
+
+        // ---------------------------------------------------------------- layout
+        struct Layout
+        {
+            float scale;
+            Rectangle drawer;
+            float rowTop;
+            float rowHeight;
+            float padding;
+            float tabTop;
+            float tabHeight;
+        };
+
+        Layout computeLayout()
+        {
+            Layout l{};
+            const float sw = static_cast<float>(GetScreenWidth());
+            const float sh = static_cast<float>(GetScreenHeight());
+            l.scale = std::clamp(sh / 720.0f, 0.6f, 3.0f);
+            const float width = std::min(sw * 0.62f, 460.0f * l.scale);
+            l.drawer = Rectangle{g_settings.menuSide == 0 ? 0.0f : sw - width, 0.0f, width, sh};
+            l.padding = 24.0f * l.scale;
+            l.tabTop = 76.0f * l.scale;
+            l.tabHeight = 40.0f * l.scale;
+            l.rowTop = l.tabTop + l.tabHeight + 18.0f * l.scale;
+            l.rowHeight = 50.0f * l.scale;
+            return l;
+        }
+
+        Rectangle rowRect(const Layout &l, int index)
+        {
+            return Rectangle{l.drawer.x + 10.0f * l.scale, l.rowTop + static_cast<float>(index) * l.rowHeight,
+                             l.drawer.width - 20.0f * l.scale, l.rowHeight - 6.0f * l.scale};
+        }
+
+        Rectangle tabRect(const Layout &l, int index)
+        {
+            const float width = (l.drawer.width - 2.0f * l.padding) / 4.0f;
+            return Rectangle{l.drawer.x + l.padding + width * static_cast<float>(index), l.tabTop, width, l.tabHeight};
+        }
+
+        // Value area of a row (right part), for mouse hits.
+        Rectangle valueRect(const Layout &l, const Rectangle &row)
+        {
+            const float width = std::min(row.width * 0.52f, 220.0f * l.scale);
+            return Rectangle{row.x + row.width - width - 12.0f * l.scale, row.y, width, row.height};
+        }
+
+        // ---------------------------------------------------------------- input
+        // Pressed this frame (also when it was let go again before the frame), no auto-repeat.
+        bool keyTap(int key)
+        {
+            return IsKeyPressed(key) || (key >= 0 && key < 512 && g_keysThisFrame[key]);
+        }
+
+        // keyTap, or held down long enough to auto-repeat (moving through lists, sliders).
+        bool keyPressed(int key)
+        {
+            return keyTap(key) || IsKeyPressedRepeat(key);
+        }
+
+        bool padPressed(int button)
+        {
+            for (int pad = 0; pad < 4; ++pad)
+                if (IsGamepadAvailable(pad) && IsGamepadButtonPressed(pad, button))
+                    return true;
+            return false;
+        }
+
+        void handleMenuInput()
+        {
+            const Layout layout = computeLayout();
+            std::vector<Row> rows = buildRows(g_tab);
+            g_focus = std::clamp(g_focus, 0, static_cast<int>(rows.size()) - 1);
+
+            if (g_editingHex)
+            {
+                for (int c = GetCharPressed(); c != 0; c = GetCharPressed())
+                {
+                    if (std::isxdigit(c) && g_hexBuffer.size() < 6)
+                        g_hexBuffer.push_back(static_cast<char>(std::toupper(c)));
+                }
+                if (keyPressed(KEY_BACKSPACE) && !g_hexBuffer.empty())
+                    g_hexBuffer.pop_back();
+                if (keyTap(KEY_ENTER) || keyTap(KEY_KP_ENTER))
+                {
+                    if (g_hexBuffer.size() == 6)
+                        rows[static_cast<size_t>(g_focus)].setValue(static_cast<int>(std::strtoul(g_hexBuffer.c_str(), nullptr, 16)));
+                    g_editingHex = false;
+                }
+                if (keyTap(KEY_ESCAPE))
+                    g_editingHex = false;
+                return;
+            }
+
+            // Tabs: Q/E, Tab, controller shoulder buttons.
+            int tabDelta = 0;
+            if (keyTap(KEY_Q) || padPressed(GAMEPAD_BUTTON_LEFT_TRIGGER_1))
+                tabDelta = -1;
+            if (keyTap(KEY_E) || keyTap(KEY_TAB) || padPressed(GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+                tabDelta = +1;
+            if (tabDelta != 0)
+            {
+                g_tab = (g_tab + tabDelta + 4) % 4;
+                g_focus = 0;
+                return;
+            }
+
+            if (keyPressed(KEY_UP) || keyPressed(KEY_W) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_UP))
+                g_focus = (g_focus - 1 + static_cast<int>(rows.size())) % static_cast<int>(rows.size());
+            if (keyPressed(KEY_DOWN) || keyPressed(KEY_S) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_DOWN))
+                g_focus = (g_focus + 1) % static_cast<int>(rows.size());
+            Row &focused = rows[static_cast<size_t>(g_focus)];
+            if (keyPressed(KEY_LEFT) || keyPressed(KEY_A) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_LEFT))
+                stepRow(focused, -1);
+            if (keyPressed(KEY_RIGHT) || keyPressed(KEY_D) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_RIGHT))
+                stepRow(focused, +1);
+            if (keyTap(KEY_ENTER) || keyTap(KEY_SPACE) || keyTap(KEY_X) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+                activateRow(focused);
+
+            // Mouse.
+            const Vector2 mouse = GetMousePosition();
+            if (g_clickThisFrame)
+            {
+                for (int t = 0; t < 4; ++t)
+                {
+                    if (CheckCollisionPointRec(mouse, tabRect(layout, t)))
+                    {
+                        g_tab = t;
+                        g_focus = 0;
+                        return;
+                    }
+                }
+                for (size_t i = 0; i < rows.size(); ++i)
+                {
+                    const Rectangle r = rowRect(layout, static_cast<int>(i));
+                    if (!CheckCollisionPointRec(mouse, r))
+                        continue;
+                    g_focus = static_cast<int>(i);
+                    const Row &row = rows[i];
+                    const Rectangle value = valueRect(layout, r);
+                    if (row.kind == RowKind::Slider && CheckCollisionPointRec(mouse, value))
+                        g_draggingSlider = row.enabled();
+                    else if (row.kind == RowKind::Swatches && CheckCollisionPointRec(mouse, value))
+                    {
+                        const float cell = value.width / static_cast<float>(kSwatchCount + 1);
+                        const int index = std::clamp(static_cast<int>((mouse.x - value.x) / cell), 0, kSwatchCount);
+                        if (row.enabled())
+                            row.setValue(index);
+                    }
+                    else if (row.kind == RowKind::Choice && CheckCollisionPointRec(mouse, value))
+                        stepRow(row, mouse.x < value.x + value.width * 0.5f ? -1 : +1);
+                    else
+                        activateRow(row);
+                    break;
+                }
+            }
+            if (g_draggingSlider)
+            {
+                if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+                    g_draggingSlider = false;
+                else
+                {
+                    const Row &row = rows[static_cast<size_t>(g_focus)];
+                    if (row.kind == RowKind::Slider)
+                    {
+                        const Rectangle value = valueRect(layout, rowRect(layout, g_focus));
+                        const float trackX = value.x;
+                        const float trackW = value.width - 52.0f * layout.scale;
+                        const float t = std::clamp((mouse.x - trackX) / std::max(1.0f, trackW), 0.0f, 1.0f);
+                        int v = row.minimum + static_cast<int>(std::lround(t * static_cast<float>(row.maximum - row.minimum) / static_cast<float>(row.step))) * row.step;
+                        v = std::clamp(v, row.minimum, row.maximum);
+                        if (v != row.getValue())
+                            row.setValue(v);
+                    }
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- drawing
+        void drawFpsOverlay(double)
+        {
+            // The big number is what the player sees: new pictures from the game per second. The
+            // window can redraw the same picture at 60 while the game itself stalls.
+            const ps2perf::LiveStats live = ps2perf::liveStats();
+            if (live.windowFps < 0.0)
+                return; // no game running yet (the setup screen)
+            const float scale = std::clamp(static_cast<float>(GetScreenHeight()) / 720.0f, 0.6f, 3.0f);
+            char big[32];
+            if (live.gameFps < 0.0)
+                std::snprintf(big, sizeof(big), "-- FPS");
+            else if (live.gameFps < 9.95)
+                std::snprintf(big, sizeof(big), "%.1f FPS", live.gameFps);
+            else
+                std::snprintf(big, sizeof(big), "%.0f FPS", live.gameFps);
+            char small[64];
+            if (live.paused)
+                std::snprintf(small, sizeof(small), "game  \xC2\xB7  paused (F2 menu)");
+            else if (live.speedPercent >= 0.0)
+                std::snprintf(small, sizeof(small), "game  \xC2\xB7  window %.0f  \xC2\xB7  speed %.0f%%", live.windowFps,
+                              std::min(live.speedPercent, 999.0));
+            else
+                std::snprintf(small, sizeof(small), "game  \xC2\xB7  window %.0f", live.windowFps);
+
+            const Color value = live.paused || live.gameFps < 0.0 ? Color{200, 206, 214, 255}
+                                : live.gameFps >= 50.0         ? Color{110, 231, 140, 255}
+                                : live.gameFps >= 25.0         ? Color{250, 204, 21, 255}
+                                                               : Color{248, 113, 113, 255};
+            const float bigSize = 22.0f * scale;
+            const float smallSize = 12.0f * scale;
+            const float pad = 12.0f * scale;
+            const float width = std::max(textWidth(big, bigSize, true), textWidth(small, smallSize, false)) + 2.0f * pad + 4.0f * scale;
+            const float height = bigSize + smallSize + 16.0f * scale;
+            const Rectangle box{static_cast<float>(GetScreenWidth()) - width - 12.0f * scale, 12.0f * scale, width, height};
+            DrawRectangleRounded(box, 0.25f, 8, Color{14, 17, 22, 210});
+            DrawRectangle(static_cast<int>(box.x), static_cast<int>(box.y + 7.0f * scale), static_cast<int>(3.0f * scale),
+                          static_cast<int>(box.height - 14.0f * scale), rgb(accentRgb()));
+            text(big, box.x + pad + 2.0f * scale, box.y + 6.0f * scale, bigSize, value, true);
+            text(small, box.x + pad + 2.0f * scale, box.y + 8.0f * scale + bigSize, smallSize, Color{170, 178, 190, 255}, false);
+        }
+
+        void drawDrawer()
+        {
+            const Layout l = computeLayout();
+            const float s = l.scale;
+            const uint32_t accent = accentRgb();
+            const Color accentColor = rgb(accent);
+            const unsigned char panelAlpha = static_cast<unsigned char>(std::clamp(g_settings.menuOpacity, 60, 100) * 255 / 100);
+
+            // Dim the game, then the drawer.
+            DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{0, 0, 0, 90});
+            DrawRectangleRec(l.drawer, Color{14, 17, 22, panelAlpha});
+            const float edgeX = g_settings.menuSide == 0 ? l.drawer.x + l.drawer.width - 1.0f : l.drawer.x;
+            DrawRectangle(static_cast<int>(edgeX), 0, 1, static_cast<int>(l.drawer.height), Color{255, 255, 255, 30});
+
+            // Header.
+            DrawRectangle(static_cast<int>(l.drawer.x + l.padding), static_cast<int>(28.0f * s), static_cast<int>(4.0f * s),
+                          static_cast<int>(28.0f * s), accentColor);
+            text("SETTINGS", l.drawer.x + l.padding + 14.0f * s, 26.0f * s, 28.0f * s, WHITE, true);
+            const char *hint = "F2";
+            const float hintSize = 14.0f * s;
+            const float hintW = textWidth(hint, hintSize, true) + 14.0f * s;
+            const Rectangle hintBox{l.drawer.x + l.drawer.width - l.padding - hintW, 31.0f * s, hintW, 22.0f * s};
+            DrawRectangleRoundedLinesEx(hintBox, 0.3f, 6, 1.0f, Color{255, 255, 255, 70});
+            text(hint, hintBox.x + 7.0f * s, hintBox.y + (hintBox.height - hintSize) * 0.5f, hintSize, Color{180, 188, 200, 255}, true);
+
+            // Tabs.
+            for (int t = 0; t < 4; ++t)
+            {
+                const Rectangle r = tabRect(l, t);
+                const bool active = t == g_tab;
+                const float size = 15.0f * s;
+                const float w = textWidth(kTabs[t], size, true);
+                text(kTabs[t], r.x + (r.width - w) * 0.5f, r.y + (r.height - size) * 0.5f - 2.0f * s, size,
+                     active ? WHITE : Color{138, 147, 163, 255}, true);
+                if (active)
+                    DrawRectangle(static_cast<int>(r.x + 10.0f * s), static_cast<int>(r.y + r.height - 3.0f * s),
+                                  static_cast<int>(r.width - 20.0f * s), static_cast<int>(3.0f * s), accentColor);
+            }
+            DrawRectangle(static_cast<int>(l.drawer.x + l.padding), static_cast<int>(l.tabTop + l.tabHeight),
+                          static_cast<int>(l.drawer.width - 2.0f * l.padding), 1, Color{255, 255, 255, 28});
+
+            // Rows.
+            const std::vector<Row> rows = buildRows(g_tab);
+            for (size_t i = 0; i < rows.size(); ++i)
+            {
+                const Row &row = rows[i];
+                const Rectangle r = rowRect(l, static_cast<int>(i));
+                const bool focused = static_cast<int>(i) == g_focus;
+                const bool enabled = row.enabled();
+                if (focused)
+                {
+                    DrawRectangleRounded(r, 0.18f, 6, rgb(accent, 40));
+                    DrawRectangle(static_cast<int>(r.x), static_cast<int>(r.y + 8.0f * s), static_cast<int>(3.0f * s),
+                                  static_cast<int>(r.height - 16.0f * s), accentColor);
+                }
+                const Color labelColor = enabled ? Color{230, 233, 239, 255} : Color{110, 117, 130, 255};
+                const float labelSize = 17.0f * s;
+                const float labelY = enabled || !row.disabledNote[0] ? r.y + (r.height - labelSize) * 0.5f : r.y + 6.0f * s;
+                text(row.label, r.x + 16.0f * s, labelY, labelSize, labelColor);
+                if (!enabled && row.disabledNote[0])
+                    text(row.disabledNote, r.x + 16.0f * s, labelY + labelSize + 1.0f * s, 12.5f * s, Color{120, 128, 142, 255});
+
+                const Rectangle value = valueRect(l, r);
+                const Color valueColor = enabled ? WHITE : Color{110, 117, 130, 255};
+                const float valueSize = 16.0f * s;
+                const float centerY = r.y + r.height * 0.5f;
+                switch (row.kind)
+                {
+                case RowKind::Choice:
+                {
+                    const std::string &label = row.choices[static_cast<size_t>(std::clamp(row.getValue(), 0, static_cast<int>(row.choices.size()) - 1))];
+                    const float w = textWidth(label.c_str(), valueSize, true);
+                    text(label.c_str(), value.x + (value.width - w) * 0.5f, centerY - valueSize * 0.5f, valueSize, valueColor, true);
+                    const Color arrow = enabled ? (focused ? accentColor : Color{150, 158, 172, 255}) : Color{80, 86, 98, 255};
+                    const float a = 6.0f * s;
+                    DrawTriangle(Vector2{value.x + a, centerY}, Vector2{value.x + 2.0f * a, centerY + a}, Vector2{value.x + 2.0f * a, centerY - a}, arrow);
+                    const float rx = value.x + value.width;
+                    DrawTriangle(Vector2{rx - a, centerY}, Vector2{rx - 2.0f * a, centerY - a}, Vector2{rx - 2.0f * a, centerY + a}, arrow);
+                    break;
+                }
+                case RowKind::Toggle:
+                {
+                    const bool on = row.getValue() != 0;
+                    const Rectangle pill{value.x + value.width - 46.0f * s, centerY - 12.0f * s, 46.0f * s, 24.0f * s};
+                    DrawRectangleRounded(pill, 1.0f, 12, on ? accentColor : Color{58, 64, 76, 255});
+                    const float knobX = on ? pill.x + pill.width - 12.0f * s : pill.x + 12.0f * s;
+                    DrawCircleV(Vector2{knobX, centerY}, 9.0f * s, on ? inkFor(accent) : Color{200, 205, 214, 255});
+                    const char *state = on ? "On" : "Off";
+                    text(state, pill.x - textWidth(state, valueSize) - 10.0f * s, centerY - valueSize * 0.5f, valueSize, valueColor);
+                    break;
+                }
+                case RowKind::Slider:
+                {
+                    const int v = row.getValue();
+                    const float trackW = value.width - 52.0f * s;
+                    const Rectangle track{value.x, centerY - 3.0f * s, trackW, 6.0f * s};
+                    DrawRectangleRounded(track, 1.0f, 6, Color{58, 64, 76, 255});
+                    const float t = row.maximum > row.minimum ? static_cast<float>(v - row.minimum) / static_cast<float>(row.maximum - row.minimum) : 0.0f;
+                    DrawRectangleRounded(Rectangle{track.x, track.y, std::max(track.height, track.width * t), track.height}, 1.0f, 6,
+                                         enabled ? accentColor : Color{80, 86, 98, 255});
+                    DrawCircleV(Vector2{track.x + track.width * t, centerY}, 8.0f * s, enabled ? WHITE : Color{120, 126, 138, 255});
+                    char number[24];
+                    std::snprintf(number, sizeof(number), "%d%s", v, row.suffix);
+                    const float w = textWidth(number, valueSize, true);
+                    text(number, value.x + value.width - w, centerY - valueSize * 0.5f, valueSize, valueColor, true);
+                    break;
+                }
+                case RowKind::Swatches:
+                {
+                    const float cell = value.width / static_cast<float>(kSwatchCount + 1);
+                    const float radius = std::min(cell * 0.36f, 11.0f * s);
+                    for (int k = 0; k <= kSwatchCount; ++k)
+                    {
+                        const Vector2 c{value.x + cell * (static_cast<float>(k) + 0.5f), centerY};
+                        const uint32_t color = k < kSwatchCount ? kSwatches[k].rgb : g_settings.accentCustom;
+                        DrawCircleV(c, radius, rgb(color));
+                        if (k == kSwatchCount)
+                            text("+", c.x - radius * 0.42f, c.y - radius * 0.95f, radius * 1.8f, inkFor(color), true);
+                        if (k == g_settings.accentIndex)
+                            DrawRing(c, radius + 2.0f * s, radius + 4.5f * s, 0.0f, 360.0f, 32, WHITE);
+                    }
+                    break;
+                }
+                case RowKind::HexColor:
+                {
+                    char hex[16];
+                    if (g_editingHex && focused)
+                        std::snprintf(hex, sizeof(hex), "#%s_", g_hexBuffer.c_str());
+                    else
+                        std::snprintf(hex, sizeof(hex), "#%06X", static_cast<unsigned>(g_settings.accentCustom) & 0xFFFFFFu);
+                    const Rectangle box{value.x + value.width - 120.0f * s, centerY - 14.0f * s, 120.0f * s, 28.0f * s};
+                    DrawRectangleRounded(box, 0.3f, 6, Color{30, 35, 44, 255});
+                    DrawRectangleRoundedLinesEx(box, 0.3f, 6, 1.0f, g_editingHex && focused ? accentColor : Color{255, 255, 255, 50});
+                    DrawCircleV(Vector2{box.x + 14.0f * s, centerY}, 6.0f * s, rgb(g_settings.accentCustom));
+                    text(hex, box.x + 28.0f * s, centerY - valueSize * 0.5f, valueSize, WHITE, true);
+                    break;
+                }
+                case RowKind::Action:
+                {
+                    const char *label = row.actionLabel;
+                    const float w = textWidth(label, valueSize, true) + 28.0f * s;
+                    const Rectangle button{value.x + value.width - w, centerY - 14.0f * s, w, 28.0f * s};
+                    DrawRectangleRounded(button, 0.4f, 6, focused ? accentColor : Color{48, 54, 66, 255});
+                    text(label, button.x + 14.0f * s, centerY - valueSize * 0.5f, valueSize, focused ? inkFor(accent) : WHITE, true);
+                    break;
+                }
+                }
+            }
+
+            // Help text for the focused row.
+            if (!rows.empty())
+            {
+                const Row &row = rows[static_cast<size_t>(std::clamp(g_focus, 0, static_cast<int>(rows.size()) - 1))];
+                const float y = l.rowTop + static_cast<float>(rows.size()) * l.rowHeight + 10.0f * s;
+                // Wrap the help line to the drawer width.
+                const float size = 14.0f * s;
+                const float maxWidth = l.drawer.width - 2.0f * l.padding;
+                std::istringstream words(row.help);
+                std::string word, line;
+                float lineY = y;
+                while (words >> word)
+                {
+                    const std::string candidate = line.empty() ? word : line + " " + word;
+                    if (textWidth(candidate.c_str(), size) > maxWidth && !line.empty())
+                    {
+                        text(line.c_str(), l.drawer.x + l.padding, lineY, size, Color{150, 158, 172, 255});
+                        lineY += size * 1.35f;
+                        line = word;
+                    }
+                    else
+                        line = candidate;
+                }
+                if (!line.empty())
+                    text(line.c_str(), l.drawer.x + l.padding, lineY, size, Color{150, 158, 172, 255});
+            }
+
+            // Footer.
+            const float footerY = l.drawer.height - 44.0f * s;
+            DrawRectangle(static_cast<int>(l.drawer.x + l.padding), static_cast<int>(footerY - 10.0f * s),
+                          static_cast<int>(l.drawer.width - 2.0f * l.padding), 1, Color{255, 255, 255, 28});
+            const char *footer = g_editingHex ? "Type 6 hex digits   Enter OK   Esc Cancel"
+                                              : "\xE2\x86\x91\xE2\x86\x93 Select   \xE2\x86\x90\xE2\x86\x92 Change   Q/E Tab   F2 Close";
+            text(footer, l.drawer.x + l.padding, footerY + 4.0f * s, 14.0f * s, Color{138, 147, 163, 255});
+        }
+    }
+
+    namespace ui
+    {
+        void ensureFonts() { loadFonts(); }
+        void text(const char *value, float x, float y, float size, Color color, bool bold)
+        {
+            ps2settings::text(value, x, y, size, color, bold);
+        }
+        float textWidth(const char *value, float size, bool bold) { return ps2settings::textWidth(value, size, bold); }
+        Color rgb(uint32_t value, unsigned char alpha) { return ps2settings::rgb(value, alpha); }
+        uint32_t accent() { return accentRgb(); }
+        Color inkFor(uint32_t value) { return ps2settings::inkFor(value); }
+        bool clicked() { return g_clickThisFrame; }
+        bool keyTapped(int key) { return ps2settings::keyTap(key); }
+        bool keyRepeat(int key) { return ps2settings::keyPressed(key); }
+    }
+
+    Settings &get()
+    {
+        return g_settings;
+    }
+
+    bool quitRequested() noexcept
+    {
+        return g_quitRequested.load(std::memory_order_relaxed);
+    }
+
+    bool menuOpen() noexcept
+    {
+        return g_menuOpen.load(std::memory_order_relaxed);
+    }
+
+    bool emulationPaused() noexcept
+    {
+        return g_paused.load(std::memory_order_relaxed);
+    }
+
+    void loadEarly(const char *iniPath)
+    {
+        if (iniPath && *iniPath)
+            g_iniPath = iniPath;
+        load();
+    }
+
+    void setRendererStatus(bool gpuActive, bool gpuAvailable, const char *deviceName)
+    {
+        g_gpuActive = gpuActive;
+        g_gpuAvailable = gpuAvailable;
+        g_gpuDevice = deviceName ? deviceName : "";
+        g_rendererHelp = "Vulkan draws the game on your graphics card; Software uses the CPU. Applies on the next start. Now: ";
+        g_rendererHelp += gpuActive ? ("Vulkan on " + g_gpuDevice) : std::string("Software (CPU)");
+        g_rendererHelp += ".";
+    }
+
+    void initialize(const char *iniPath)
+    {
+        if (iniPath && *iniPath)
+            g_iniPath = iniPath;
+        load();
+        g_appliedWindowMode = 0;
+        g_appliedResWidth = -1;
+        g_appliedAspectForWindow = -1;
+        g_appliedVsync = !g_settings.vsync; // force the first apply
+        // The window starts windowed at its default size: apply the saved size/mode now.
+        applyWindowMode();
+        applyVsync();
+        applyVolume();
+    }
+
+    void update(Texture2D *frameTexture)
+    {
+        g_frameTexture = frameTexture;
+        installTapCapture();
+        latchTaps();
+        if (keyTap(KEY_F2))
+        {
+            const bool open = !g_menuOpen.load(std::memory_order_relaxed);
+            g_menuOpen.store(open, std::memory_order_relaxed);
+            g_editingHex = false;
+            g_draggingSlider = false;
+            if (open)
+                loadFonts();
+        }
+        else if (g_menuOpen.load(std::memory_order_relaxed))
+        {
+            if (!g_editingHex && (keyTap(KEY_ESCAPE) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)))
+                g_menuOpen.store(false, std::memory_order_relaxed);
+            else
+                handleMenuInput();
+        }
+        g_paused.store(g_menuOpen.load(std::memory_order_relaxed) && g_settings.pauseInMenu, std::memory_order_relaxed);
+
+        applyWindowMode();
+        applyVsync();
+        applyFilter();
+        applyVolume();
+        applyInternalResolution();
+    }
+
+    void pictureTargetSize(int screenWidth, int screenHeight, int &outWidth, int &outHeight)
+    {
+        outWidth = screenWidth;
+        outHeight = screenHeight;
+        if (g_settings.windowMode == 1 && g_settings.resWidth > 0 && g_settings.resHeight > 0)
+        {
+            outWidth = std::min(g_settings.resWidth, 7680);
+            outHeight = std::min(g_settings.resHeight, 4320);
+        }
+    }
+
+    void presentRect(float sourceWidth, float sourceHeight, float screenWidth, float screenHeight,
+                     float &outX, float &outY, float &outWidth, float &outHeight)
+    {
+        (void)sourceWidth;
+        (void)sourceHeight;
+        float aspect = 4.0f / 3.0f;
+        // 16:9 shows the game's widened 3D picture wide; pre-rendered movies stay 4:3.
+        if (g_settings.aspect == 1 && !ps2movie::playing())
+            aspect = 16.0f / 9.0f;
+        if (g_settings.aspect == 2)
+        {
+            outX = 0.0f;
+            outY = 0.0f;
+            outWidth = screenWidth;
+            outHeight = screenHeight;
+            return;
+        }
+        float width = screenWidth;
+        float height = width / aspect;
+        if (height > screenHeight)
+        {
+            height = screenHeight;
+            width = height * aspect;
+        }
+        outX = std::floor((screenWidth - width) * 0.5f);
+        outY = std::floor((screenHeight - height) * 0.5f);
+        outWidth = std::floor(width);
+        outHeight = std::floor(height);
+    }
+
+    void draw(double gameSpeedPercent)
+    {
+        if (g_settings.showFps)
+        {
+            loadFonts();
+            drawFpsOverlay(gameSpeedPercent);
+        }
+        if (g_menuOpen.load(std::memory_order_relaxed))
+            drawDrawer();
+    }
+}

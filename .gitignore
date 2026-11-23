@@ -1,0 +1,28 @@
+# Game files: never commit them (you need your own copy of the game)
+*.iso
+*.ISO
+*.bin
+*.img
+*.mdf
+*.cue
+SCUS_976*
+port/game/
+game/
+
+# Code generated from the game's executable by the recompiler (made by port/build.sh)
+port/output/
+ps2recomp/ps2xRuntime/src/runner/*
+!ps2recomp/ps2xRuntime/src/runner/register_functions.cpp
+ps2recomp/ps2xRuntime/include/ps2_recompiled_functions.h
+ps2recomp/ps2xRuntime/include/ps2_recompiled_stubs.h
+
+# Builds, logs, saves, captures
+build/
+out/
+Logs/
+saves/
+*.log
+*.exe
+*.zip
+settings.ini
+launcher.ini
