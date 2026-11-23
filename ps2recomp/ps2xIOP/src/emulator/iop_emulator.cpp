@@ -1,4 +1,6 @@
+#include <unordered_map>
 #include <chrono>
+#include <cstring>
 #include <vector>
 #include <string>
 #include <cstdlib>
@@ -185,6 +187,8 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            if (!memory.dmaStartPending()) // checked after every instruction: keep the common case inline
+                return;
             if (const auto dma = memory.takeDmaStart())
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
         }
@@ -409,6 +413,8 @@ namespace ps2x::iop::detail
                              memory.read32(cpu.gpr[4] & 0x1FFFFCu), memory.read32((cpu.gpr[4] + 4u) & 0x1FFFFCu),
                              memory.read32((cpu.gpr[4] + 8u) & 0x1FFFFCu), memory.read32((cpu.gpr[4] + 12u) & 0x1FFFFCu),
                              static_cast<unsigned long long>(totalCycles));
+            if (iopProfileOn())
+                profilePc(cpu.pc);
             if (cpu.stopped)
                 return false;
             if (cpu.pc == kThreadReturnSentinel || cpu.pc == kCallReturnSentinel)
@@ -427,7 +433,17 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // Import stubs are `jr ra` + `addiu zero, zero, n`: look at the word in RAM first, so the
+            // full decode only runs for returns (it used to run for every instruction).
+            const uint32_t physicalPc = cpu.pc & 0x1FFFFFFFu;
+            bool maybeStub = true;
+            if (physicalPc + 8u <= kRamSize && (physicalPc & 3u) == 0u)
+            {
+                uint32_t word = 0u;
+                std::memcpy(&word, memory.ram().data() + physicalPc, sizeof(word));
+                maybeStub = word == 0x03E00008u;
+            }
+            if (const auto import = maybeStub ? imports.decode(cpu.pc) : std::nullopt)
             {
                 // PS2X_TRACE_IOP_IMPORTS=<seconds>: log IOP import calls from that host time on.
                 static const double traceImportsAt = []()
@@ -463,6 +479,45 @@ namespace ps2x::iop::detail
             ++totalInstructions;
             ++totalCycles;
             return running;
+        }
+
+        // PS2X_IOP_PROFILE=1 (diagnostics): every 10 s of IOP time, the IOP addresses that ran
+        // the most instructions.
+        static bool iopProfileOn()
+        {
+            static const bool on = std::getenv("PS2X_IOP_PROFILE") != nullptr;
+            return on;
+        }
+        std::unordered_map<uint32_t, uint64_t> profileCounts;
+        uint64_t profileCalls = 0, profileIterations = 0;
+        double profileSpuNs = 0.0, profileKernelNs = 0.0, profileIdleNs = 0.0, profileCpuNs = 0.0;
+        uint64_t profileNextReport = 0;
+        uint64_t profileInstructionsAt = 0;
+        void profilePc(uint32_t pc)
+        {
+            ++profileCounts[pc];
+            if (totalCycles < profileNextReport)
+                return;
+            if (profileNextReport != 0u)
+            {
+                std::vector<std::pair<uint64_t, uint32_t>> top;
+                top.reserve(profileCounts.size());
+                for (const auto &[address, count] : profileCounts)
+                    top.emplace_back(count, address);
+                std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+                const uint64_t ran = totalInstructions - profileInstructionsAt;
+                std::fprintf(stderr, "[iop-profile] %.2fM instructions in 10 s of IOP time, %zu addresses | %llu runCycles calls, %llu loop passes | host ms: spu2 %.1f, kernel/timers %.1f, idle-skip %.1f, cpu %.1f\n",
+                             static_cast<double>(ran) / 1e6, profileCounts.size(), static_cast<unsigned long long>(profileCalls),
+                             static_cast<unsigned long long>(profileIterations), profileSpuNs / 1e6, profileKernelNs / 1e6, profileIdleNs / 1e6, profileCpuNs / 1e6);
+                profileCalls = profileIterations = 0;
+                profileSpuNs = profileKernelNs = profileIdleNs = profileCpuNs = 0.0;
+                for (size_t i = 0; i < top.size() && i < 30u; ++i)
+                    std::fprintf(stderr, "[iop-profile]   %08x %6.2f%%  %08x\n", top[i].second, 100.0 * static_cast<double>(top[i].first) / static_cast<double>(std::max<uint64_t>(ran, 1u)),
+                                 memory.read32(top[i].second));
+            }
+            profileCounts.clear();
+            profileInstructionsAt = totalInstructions;
+            profileNextReport = totalCycles + 368640000ull;
         }
 
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
@@ -648,15 +703,29 @@ namespace ps2x::iop::detail
             try
             {
                 const uint64_t target = totalCycles + cycles;
+                const bool timing = iopProfileOn();
+                auto now = []() { return std::chrono::steady_clock::now(); };
+                auto t0 = timing ? now() : std::chrono::steady_clock::time_point{};
+                if (timing)
+                    ++profileCalls;
                 while (totalCycles < target)
                 {
+                    if (timing)
+                        ++profileIterations;
                     memory.spu2().advanceTo(totalCycles);
                     if (memory.spu2().takeIrq())
                         (void)intrman.dispatchInterrupt(kSpu2Irq, *this);
+                    auto t1 = timing ? now() : t0;
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
+                    auto t2 = timing ? now() : t0;
+                    if (timing)
+                    {
+                        profileSpuNs += std::chrono::duration<double, std::nano>(t1 - t0).count();
+                        profileKernelNs += std::chrono::duration<double, std::nano>(t2 - t1).count();
+                    }
                     if (!next)
                     {
                         uint64_t nextWake = kernel.nextWakeCycle(target);
@@ -666,6 +735,12 @@ namespace ps2x::iop::detail
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
+                        if (timing)
+                        {
+                            const auto t3 = now();
+                            profileIdleNs += std::chrono::duration<double, std::nano>(t3 - t2).count();
+                            t0 = t3;
+                        }
                         continue;
                     }
                     const uint64_t before = totalCycles;
@@ -673,6 +748,12 @@ namespace ps2x::iop::detail
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
+                    if (timing)
+                    {
+                        const auto t3 = now();
+                        profileCpuNs += std::chrono::duration<double, std::nano>(t3 - t2).count();
+                        t0 = t3;
+                    }
                 }
             }
             catch (...)
@@ -684,6 +765,7 @@ namespace ps2x::iop::detail
         ModuleLoadResult loadImage(std::string path, std::span<const uint8_t> image, const void *arguments, uint32_t argumentSize)
         {
             ModuleLoadResult result{true, -1, -1};
+            imports.forgetStubs();
             const IopImageLoadResult loaded = IopModuleLoader::load(image, memory, moduleCursor);
             moduleCursor = loaded.nextModuleCursor;
             if (!loaded)

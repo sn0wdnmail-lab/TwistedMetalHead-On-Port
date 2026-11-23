@@ -57,12 +57,23 @@ namespace ps2gpu
     // VBlank: flush the GPU work, scan out the display as captured, queue the read-back of that picture.
     void vsync(const Scanout &scanout);
 
-    // Window thread: the newest picture that came back from the GPU (RGBA8, width x height).
+    // Window thread: the newest picture that came back from the GPU (width x height, 4 bytes a
+    // pixel). rawBgra: the bytes are the GPU's own B, G, R, (undefined alpha), to be drawn through
+    // the window's swizzle shader; otherwise RGBA with alpha 255.
     // Returns false when no new picture arrived since the last call.
-    bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, uint32_t &displayFbp);
+    bool takeFrame(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &displayFbp, bool &rawBgra);
+
+    // Window thread, once its swizzle shader is ready: pictures may be handed over as raw BGRA
+    // (a plain copy instead of a pass over every pixel on the CPU).
+    void setRawBgraFrames(bool enabled) noexcept;
 
     // Waits until everything queued for the GS feed thread has reached paraLLEl-GS.
     void drainFeed();
+
+    // The GS feed thread is woken in batches; anyone about to look at GS state the queued packets
+    // may change (CSR, SIGLBLID) kicks it so they are processed now.
+    void kickFeed() noexcept;
+    void setFeedBatching(bool enabled) noexcept; // settings.ini gpu_feed_batch (default on)
 
     // GS -> host transfer data (TRXDIR = 1), for the store-image path.
     uint32_t readLocalToHost(uint8_t *dst, uint32_t bytes);

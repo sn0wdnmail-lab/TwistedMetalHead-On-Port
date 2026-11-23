@@ -43,6 +43,7 @@ namespace ps2x::iop::detail
     void IopImportRegistry::reset()
     {
         m_libraries.clear();
+        m_stubCache.clear();
     }
 
     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
@@ -52,7 +53,18 @@ namespace ps2x::iop::detail
         const uint32_t delay = m_memory.read32(pc + 4u);
         if ((delay & 0xFFFF0000u) != 0x24000000u)
             return std::nullopt;
+        const uint32_t physicalPc = IopMemory::physicalAddress(pc);
+        const auto cached = m_stubCache.find(physicalPc);
+        if (cached != m_stubCache.end() && cached->second.delay == delay)
+            return cached->second.call;
+        std::optional<IopImportCall> call = decodeUncached(pc, delay);
+        if (call)
+            m_stubCache[physicalPc] = CachedStub{delay, *call};
+        return call;
+    }
 
+    std::optional<IopImportCall> IopImportRegistry::decodeUncached(uint32_t pc, uint32_t delay) const
+    {
         const uint32_t physicalPc = IopMemory::physicalAddress(pc);
         const uint32_t searchBegin = physicalPc > 0x10000u ? physicalPc - 0x10000u : 0u;
         for (uint32_t candidate = physicalPc & ~3u; candidate >= searchBegin + 20u; candidate -= 4u)
@@ -184,6 +196,7 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
     {
+        m_stubCache.clear(); // a module went away: its stubs (and anything loaded there later) differ
         for (auto library = m_libraries.begin(); library != m_libraries.end();)
         {
             if (library->first >= base && library->first < base + size)

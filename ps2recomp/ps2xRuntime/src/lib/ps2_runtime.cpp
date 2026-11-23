@@ -448,6 +448,50 @@ namespace
     }
 }
 
+// GPU pictures can come back as the GPU's own BGRA bytes; this shader swaps red and blue (and
+// ignores alpha) while the picture is drawn, so no pass over every pixel is needed on the CPU.
+extern "C" unsigned int rlGetShaderIdDefault(void); // rlgl (part of raylib)
+static Shader s_bgraShader{};
+static const char *const kBgraFragmentShader =
+    "#version 330\n"
+    "in vec2 fragTexCoord;\n"
+    "in vec4 fragColor;\n"
+    "uniform sampler2D texture0;\n"
+    "uniform vec4 colDiffuse;\n"
+    "out vec4 finalColor;\n"
+    "void main()\n"
+    "{\n"
+    "    vec4 t = texture(texture0, fragTexCoord);\n"
+    "    finalColor = vec4(t.b, t.g, t.r, 1.0) * colDiffuse * fragColor;\n"
+    "}\n";
+
+static void LoadBgraShader()
+{
+    Shader shader = LoadShaderFromMemory(nullptr, kBgraFragmentShader);
+    // A shader that fails to build comes back as raylib's default one: keep the CPU conversion then.
+    if (shader.id != 0u && shader.id != rlGetShaderIdDefault())
+    {
+        s_bgraShader = shader;
+        ps2gpu::setRawBgraFrames(true);
+    }
+    else
+    {
+        std::fprintf(stderr, "[gpu] swizzle shader unavailable: pictures are converted on the CPU\n");
+    }
+}
+
+static void BeginFrameShader()
+{
+    if (ps2settings::frameTextureRawBgra() && s_bgraShader.id != 0u)
+        BeginShaderMode(s_bgraShader);
+}
+
+static void EndFrameShader()
+{
+    if (ps2settings::frameTextureRawBgra() && s_bgraShader.id != 0u)
+        EndShaderMode();
+}
+
 // GPU renderer: the picture arrives already scanned out (and read back) at the size the GPU
 // produced; the texture follows that size.
 static void UploadGpuFrame(Texture2D &tex, uint32_t &outWidth, uint32_t &outHeight)
@@ -456,10 +500,12 @@ static void UploadGpuFrame(Texture2D &tex, uint32_t &outWidth, uint32_t &outHeig
     static uint32_t s_width = 0u, s_height = 0u, s_fbp = 0xFFFFFFFFu;
     ps2perf::Scope latchScope(ps2perf::MainLatch);
     uint32_t width = 0u, height = 0u, fbp = 0u;
-    if (ps2gpu::takeFrame(s_frame, width, height, fbp) && width != 0u && height != 0u &&
+    bool rawBgra = false;
+    if (ps2gpu::takeFrame(s_frame, width, height, fbp, rawBgra) && width != 0u && height != 0u &&
         s_frame.size() >= static_cast<size_t>(width) * height * 4u)
     {
         s_fbp = fbp; // new pictures are counted at the game's VBlank (EeScheduler)
+        ps2settings::setFrameTextureRawBgra(rawBgra && s_bgraShader.id != 0u);
         ps2perf::Scope uploadScope(ps2perf::MainUpload);
         if (static_cast<uint32_t>(tex.width) != width || static_cast<uint32_t>(tex.height) != height)
         {
@@ -491,6 +537,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UploadGpuFrame(tex, outWidth, outHeight);
         return;
     }
+    ps2settings::setFrameTextureRawBgra(false);
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
@@ -604,12 +651,18 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_hasUploadedFrame = true;
 }
 
+namespace ps2perf
+{
+    void applyCpuLimit(int percent) noexcept; // ps2_perf.cpp (testing: settings.ini cpu_limit_percent)
+}
+
 // Chooses the GS renderer: PS2X_RENDERER=vulkan|software, else settings.ini (renderer=0 GPU,
 // 1 software), else the GPU. A GPU that cannot start falls back to the software renderer.
 static void startGsRenderer(GSRegisters &privRegs)
 {
     const std::string iniPath = std::string(GetApplicationDirectory()) + "settings.ini";
     ps2settings::loadEarly(iniPath.c_str());
+    ps2perf::applyCpuLimit(ps2settings::get().cpuLimitPercent);
     bool wantGpu = ps2settings::get().renderer == 0;
     if (const char *env = std::getenv("PS2X_RENDERER"); env && *env)
     {
@@ -2823,6 +2876,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    LoadBgraShader();
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -3047,7 +3101,9 @@ void PS2Runtime::run()
             ClearBackground(BLACK);
             float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
             ps2settings::presentRect(srcWidth, srcHeight, static_cast<float>(targetWidth), static_cast<float>(targetHeight), x, y, w, h);
+            BeginFrameShader();
             DrawTexturePro(frameTex, srcRect, Rectangle{x, y, w, h}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            EndFrameShader();
             EndTextureMode();
         }
         else if (pictureTarget.id != 0)
@@ -3073,7 +3129,9 @@ void PS2Runtime::run()
             float dstX = 0.0f, dstY = 0.0f, dstWidth = 0.0f, dstHeight = 0.0f;
             ps2settings::presentRect(srcWidth, srcHeight, screenWidth, screenHeight, dstX, dstY, dstWidth, dstHeight);
             const Rectangle dstRect{dstX, dstY, dstWidth, dstHeight};
+            BeginFrameShader();
             DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            EndFrameShader();
         }
         ps2settings::draw(ps2perf::lastSpeedPercent());
         if (m_debugUiInitialized && m_debugUiDrawCallback)
@@ -3128,6 +3186,8 @@ void PS2Runtime::run()
                 Image shot = LoadImageFromTexture(frameTex);
                 if (shot.data != nullptr)
                 {
+                    if (shot.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                        ps2settings::fixFrameCopy(static_cast<unsigned char *>(shot.data), static_cast<size_t>(shot.width) * static_cast<size_t>(shot.height));
                     ImageCrop(&shot, Rectangle{0.0f, 0.0f, static_cast<float>(std::min<uint32_t>(presentWidth, FB_WIDTH)),
                                                static_cast<float>(std::min<uint32_t>(presentHeight, FB_HEIGHT))});
                     ImageFormat(&shot, PIXELFORMAT_UNCOMPRESSED_R8G8B8);

@@ -164,6 +164,24 @@ namespace ps2settings
             out << "record_frames=" << (s.recordFrames ? 1 : 0) << "\n";
             out << "fov=" << s.fovDegrees << "\n";
             out << "camera_distance=" << s.cameraDistance << "\n";
+            out << "# battle HUD layout (F2 > HUD): offsets in 0.1% of the picture, sizes in %\n";
+            out << "hud_radar_x=" << s.hudRadarX << "\n";
+            out << "hud_radar_y=" << s.hudRadarY << "\n";
+            out << "hud_radar_scale=" << s.hudRadarScale << "\n";
+            out << "hud_weapon_x=" << s.hudWeaponX << "\n";
+            out << "hud_weapon_y=" << s.hudWeaponY << "\n";
+            out << "hud_weapon_scale=" << s.hudWeaponScale << "\n";
+            if (s.cpuLimitPercent > 0)
+            {
+                out << "# testing: the whole game may use at most this % of all CPU cores together (0 = no limit)\n";
+                out << "cpu_limit_percent=" << s.cpuLimitPercent << "\n";
+            }
+            if (s.gpuFlushPrimitives > 0)
+                out << "gpu_flush_primitives=" << s.gpuFlushPrimitives << "\n";
+            if (s.gpuTimestamps != 1)
+                out << "gpu_timestamps=" << s.gpuTimestamps << "\n";
+            if (s.gpuFeedBatch != 1)
+                out << "gpu_feed_batch=" << s.gpuFeedBatch << "\n";
             out << "master_volume=" << s.masterVolume << "\n";
             out << "mute_unfocused=" << (s.muteUnfocused ? 1 : 0) << "\n";
             out << "pause_in_menu=" << (s.pauseInMenu ? 1 : 0) << "\n";
@@ -218,6 +236,16 @@ namespace ps2settings
                 else if (key == "record_frames") s.recordFrames = number != 0;
                 else if (key == "fov") s.fovDegrees = number <= 0 ? 0 : std::clamp(number, 50, 120);
                 else if (key == "camera_distance") s.cameraDistance = std::clamp(number, 50, 200);
+                else if (key == "hud_radar_x") s.hudRadarX = std::clamp(number, -1000, 1000);
+                else if (key == "hud_radar_y") s.hudRadarY = std::clamp(number, -1000, 1000);
+                else if (key == "hud_radar_scale") s.hudRadarScale = std::clamp(number, 40, 250);
+                else if (key == "hud_weapon_x") s.hudWeaponX = std::clamp(number, -1000, 1000);
+                else if (key == "hud_weapon_y") s.hudWeaponY = std::clamp(number, -1000, 1000);
+                else if (key == "hud_weapon_scale") s.hudWeaponScale = std::clamp(number, 40, 250);
+                else if (key == "cpu_limit_percent") s.cpuLimitPercent = std::clamp(number, 0, 100);
+                else if (key == "gpu_flush_primitives") s.gpuFlushPrimitives = std::clamp(number, 0, 1 << 20);
+                else if (key == "gpu_timestamps") s.gpuTimestamps = std::clamp(number, 0, 1);
+                else if (key == "gpu_feed_batch") s.gpuFeedBatch = std::clamp(number, 0, 1);
                 else if (key == "master_volume") s.masterVolume = std::clamp(number, 0, 100);
                 else if (key == "mute_unfocused") s.muteUnfocused = number != 0;
                 else if (key == "pause_in_menu") s.pauseInMenu = number != 0;
@@ -592,7 +620,23 @@ namespace ps2settings
         std::string g_hexBuffer;
         bool g_draggingSlider = false;
 
-        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "UI"};
+        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "HUD", "UI"};
+        constexpr int kTabCount = 5;
+
+        // ---------------------------------------------------------------- HUD editor state
+        bool g_hudEditor = false;          // the layout editor covers the screen instead of the drawer
+        int g_hudSelected = 0;             // tmho::HudPiece being edited
+        int g_hudDrag = 0;                 // 0 none, 1 moving, 2 resizing
+        Vector2 g_hudDragStart{};
+        int g_hudStartX = 0, g_hudStartY = 0, g_hudStartScale = 100;
+        // Until when (GetTime()) the paused game may run after a HUD layout change, so it draws its
+        // HUD in the new place: a few game frames, whatever the monitor's refresh rate.
+        std::atomic<double> g_hudStepUntil{0.0};
+        void stepHudFrames() { g_hudStepUntil.store(GetTime() + 0.15, std::memory_order_relaxed); }
+        bool g_hudDirty = false;           // layout changed since the last save
+        Texture2D g_hudPreview{};          // the last battle's picture, when no battle is running
+        bool g_hudPreviewLive = false;     // the game picture behind the editor shows the HUD now
+        void openHudEditor();
 
         std::vector<Row> buildRows(int tab)
         {
@@ -762,6 +806,58 @@ namespace ps2settings
                 quit.actionLabel = armed ? "Quit now" : "Quit";
                 rows.push_back(quit);
             }
+            else if (tab == 3)
+            {
+                Row edit{"Edit HUD layout", "Move and resize the battle HUD over your own game picture: drag a piece, scroll or drag a corner to resize. Best opened during a battle.",
+                         RowKind::Action, [] { return 0; }, [](int) { openHudEditor(); }};
+                edit.actionLabel = "Edit";
+                rows.push_back(edit);
+                auto hudChanged = [changed]
+                {
+                    changed();
+                    tmho::hudLayoutChanged();
+                    stepHudFrames();
+                };
+                Row radar{"Radar size", "Size of the radar with the cars-left count and your target's name.", RowKind::Slider,
+                          [&s] { return s.hudRadarScale; }, [&s, hudChanged](int v) { s.hudRadarScale = v; hudChanged(); }};
+                radar.minimum = 40;
+                radar.maximum = 250;
+                radar.step = 5;
+                radar.suffix = "%";
+                rows.push_back(radar);
+                Row weapon{"Weapon panel size", "Size of the weapon, ammo, health and turbo panel.", RowKind::Slider,
+                           [&s] { return s.hudWeaponScale; }, [&s, hudChanged](int v) { s.hudWeaponScale = v; hudChanged(); }};
+                weapon.minimum = 40;
+                weapon.maximum = 250;
+                weapon.step = 5;
+                weapon.suffix = "%";
+                rows.push_back(weapon);
+                Row edges{"Snap to screen edges", "Moves the radar and the weapon panel right into the corners of the screen, keeping the sizes you picked.",
+                          RowKind::Action, [] { return 0; }, [hudChanged](int)
+                          {
+                              // A small margin of 1.5 % of the picture's height on every side.
+                              const tmho::HudBox radarBox = tmho::hudBox(tmho::HudPiece::Radar);
+                              const tmho::HudBox weaponBox = tmho::hudBox(tmho::HudPiece::Weapon);
+                              const float aspect = g_settings.aspect == 1 ? 16.0f / 9.0f : 4.0f / 3.0f;
+                              const float marginY = 0.015f, marginX = 0.015f / aspect;
+                              Settings &st = g_settings;
+                              st.hudRadarX += static_cast<int>(std::lround((marginX - radarBox.x) * 1000.0f));
+                              st.hudRadarY += static_cast<int>(std::lround((marginY - radarBox.y) * 1000.0f));
+                              st.hudWeaponX += static_cast<int>(std::lround((1.0f - marginX - (weaponBox.x + weaponBox.width)) * 1000.0f));
+                              st.hudWeaponY += static_cast<int>(std::lround((1.0f - marginY - (weaponBox.y + weaponBox.height)) * 1000.0f));
+                              hudChanged();
+                          }};
+                edges.actionLabel = "Snap";
+                rows.push_back(edges);
+                Row reset{"Reset HUD layout", "Puts the HUD back to its default place: right at the screen edges in 16:9, where the game has it in 4:3.",
+                          RowKind::Action, [] { return 0; }, [&s, hudChanged](int)
+                          {
+                              s.hudRadarX = s.hudRadarY = s.hudWeaponX = s.hudWeaponY = 0;
+                              s.hudRadarScale = s.hudWeaponScale = 100;
+                              hudChanged();
+                          }};
+                rows.push_back(reset);
+            }
             else
             {
                 Row accent{"Accent color", "Colour of highlights in this menu.", RowKind::Swatches,
@@ -783,7 +879,7 @@ namespace ps2settings
                          [&s] { return s.menuSide; }, [&s, changed](int v) { s.menuSide = v; changed(); }, {"Left", "Right"}};
                 rows.push_back(side);
                 Row reset{"Reset all settings", "Puts every setting back to its default.", RowKind::Action,
-                          [] { return 0; }, [&s, changed](int) { s = Settings{}; changed(); }};
+                          [] { return 0; }, [&s, changed](int) { s = Settings{}; changed(); tmho::settingsChanged(); }};
                 rows.push_back(reset);
             }
             return rows;
@@ -871,7 +967,7 @@ namespace ps2settings
 
         Rectangle tabRect(const Layout &l, int index)
         {
-            const float width = (l.drawer.width - 2.0f * l.padding) / 4.0f;
+            const float width = (l.drawer.width - 2.0f * l.padding) / static_cast<float>(kTabCount);
             return Rectangle{l.drawer.x + l.padding + width * static_cast<float>(index), l.tabTop, width, l.tabHeight};
         }
 
@@ -937,7 +1033,7 @@ namespace ps2settings
                 tabDelta = +1;
             if (tabDelta != 0)
             {
-                g_tab = (g_tab + tabDelta + 4) % 4;
+                g_tab = (g_tab + tabDelta + kTabCount) % kTabCount;
                 g_focus = 0;
                 return;
             }
@@ -958,7 +1054,7 @@ namespace ps2settings
             const Vector2 mouse = GetMousePosition();
             if (g_clickThisFrame)
             {
-                for (int t = 0; t < 4; ++t)
+                for (int t = 0; t < kTabCount; ++t)
                 {
                     if (CheckCollisionPointRec(mouse, tabRect(layout, t)))
                     {
@@ -1081,11 +1177,11 @@ namespace ps2settings
             text(hint, hintBox.x + 7.0f * s, hintBox.y + (hintBox.height - hintSize) * 0.5f, hintSize, Color{180, 188, 200, 255}, true);
 
             // Tabs.
-            for (int t = 0; t < 4; ++t)
+            for (int t = 0; t < kTabCount; ++t)
             {
                 const Rectangle r = tabRect(l, t);
                 const bool active = t == g_tab;
-                const float size = 15.0f * s;
+                const float size = 14.0f * s;
                 const float w = textWidth(kTabs[t], size, true);
                 text(kTabs[t], r.x + (r.width - w) * 0.5f, r.y + (r.height - size) * 0.5f - 2.0f * s, size,
                      active ? WHITE : Color{138, 147, 163, 255}, true);
@@ -1239,6 +1335,350 @@ namespace ps2settings
                                               : "\xE2\x86\x91\xE2\x86\x93 Select   \xE2\x86\x90\xE2\x86\x92 Change   Q/E Tab   F2 Close";
             text(footer, l.drawer.x + l.padding, footerY + 4.0f * s, 14.0f * s, Color{138, 147, 163, 255});
         }
+
+        // ---------------------------------------------------------------- HUD editor
+        // Lays the battle HUD's pieces out over the player's own game picture. The game stays
+        // paused but runs a few frames after every change, so the real HUD follows the boxes.
+        bool g_hudLiveAtOpen = false; // the game showed its HUD right before F2 paused it
+
+        // Where the game picture is on the screen, as the window loop draws it.
+        Rectangle pictureOnScreen()
+        {
+            const float sw = static_cast<float>(GetScreenWidth());
+            const float sh = static_cast<float>(GetScreenHeight());
+            int tw = 0, th = 0;
+            pictureTargetSize(GetScreenWidth(), GetScreenHeight(), tw, th);
+            float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
+            if (tw > 0 && th > 0 && (tw != GetScreenWidth() || th != GetScreenHeight()))
+            {
+                presentRect(0.0f, 0.0f, static_cast<float>(tw), static_cast<float>(th), x, y, w, h);
+                const float scale = std::min(sw / static_cast<float>(tw), sh / static_cast<float>(th));
+                const float ox = std::floor((sw - std::floor(static_cast<float>(tw) * scale)) * 0.5f);
+                const float oy = std::floor((sh - std::floor(static_cast<float>(th) * scale)) * 0.5f);
+                return Rectangle{ox + x * scale, oy + y * scale, w * scale, h * scale};
+            }
+            presentRect(0.0f, 0.0f, sw, sh, x, y, w, h);
+            return Rectangle{x, y, w, h};
+        }
+
+        std::string hudPreviewPath()
+        {
+            return ps2perf::logDirectory() + "/hud_preview.png";
+        }
+
+        void getPiece(int piece, int &x, int &y, int &scale)
+        {
+            const Settings &s = g_settings;
+            x = piece == 0 ? s.hudRadarX : s.hudWeaponX;
+            y = piece == 0 ? s.hudRadarY : s.hudWeaponY;
+            scale = piece == 0 ? s.hudRadarScale : s.hudWeaponScale;
+        }
+
+        void setPiece(int piece, int x, int y, int scale)
+        {
+            Settings &s = g_settings;
+            x = std::clamp(x, -1000, 1000);
+            y = std::clamp(y, -1000, 1000);
+            scale = std::clamp(scale, 40, 250);
+            int &px = piece == 0 ? s.hudRadarX : s.hudWeaponX;
+            int &py = piece == 0 ? s.hudRadarY : s.hudWeaponY;
+            int &ps = piece == 0 ? s.hudRadarScale : s.hudWeaponScale;
+            if (px == x && py == y && ps == scale)
+                return;
+            px = x;
+            py = y;
+            ps = scale;
+            g_hudDirty = true;
+            tmho::hudLayoutChanged();
+            stepHudFrames(); // let the paused game redraw the HUD
+        }
+
+        Rectangle hudBoxOnScreen(int piece, const Rectangle &pic)
+        {
+            const tmho::HudBox b = tmho::hudBox(static_cast<tmho::HudPiece>(piece));
+            return Rectangle{pic.x + b.x * pic.width, pic.y + b.y * pic.height, b.width * pic.width, b.height * pic.height};
+        }
+
+        // The editor's bar (title, hints, buttons) sits at the top of the screen, or at the bottom
+        // when a HUD piece is under the top one.
+        Rectangle hudToolbar(float s, const Rectangle &pic)
+        {
+            const float h = 58.0f * s;
+            const float sw = static_cast<float>(GetScreenWidth());
+            const Rectangle top{0.0f, 0.0f, sw, h};
+            const Rectangle bottom{0.0f, static_cast<float>(GetScreenHeight()) - h, sw, h};
+            float overlapTop = 0.0f, overlapBottom = 0.0f;
+            for (int p = 0; p < 2; ++p)
+            {
+                const Rectangle box = hudBoxOnScreen(p, pic);
+                const Rectangle a = GetCollisionRec(top, box), b = GetCollisionRec(bottom, box);
+                overlapTop += a.width * a.height;
+                overlapBottom += b.width * b.height;
+            }
+            return overlapTop <= overlapBottom ? top : bottom;
+        }
+
+        void hudButtons(float s, Rectangle (&out)[3])
+        {
+            const Rectangle bar = hudToolbar(s, pictureOnScreen());
+            const float h = 34.0f * s;
+            const float y = bar.y + (bar.height - h) * 0.5f;
+            float right = static_cast<float>(GetScreenWidth()) - 16.0f * s;
+            const char *labels[3] = {"Done", "Reset all", "Reset piece"};
+            for (int i = 0; i < 3; ++i)
+            {
+                const float w = textWidth(labels[i], 16.0f * s, true) + 32.0f * s;
+                out[i] = Rectangle{right - w, y, w, h};
+                right -= w + 10.0f * s;
+            }
+        }
+
+        void saveHudIfChanged()
+        {
+            if (g_hudDirty)
+            {
+                save();
+                g_hudDirty = false;
+            }
+        }
+
+        void openHudEditor()
+        {
+            g_hudEditor = true;
+            g_hudDrag = 0;
+            g_hudPreviewLive = tmho::hudShownRecently(1.0) || (g_paused.load(std::memory_order_relaxed) && g_hudLiveAtOpen);
+            if (g_hudPreviewLive && g_frameTexture && g_frameTexture->id != 0)
+            {
+                // This battle's picture, for opening the editor outside a battle later.
+                Image image = LoadImageFromTexture(*g_frameTexture);
+                if (image.data)
+                {
+                    if (image.format == PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                        fixFrameCopy(static_cast<unsigned char *>(image.data), static_cast<size_t>(image.width) * static_cast<size_t>(image.height));
+                    ExportImage(image, hudPreviewPath().c_str());
+                    UnloadImage(image);
+                }
+                if (g_hudPreview.id != 0)
+                {
+                    UnloadTexture(g_hudPreview);
+                    g_hudPreview = Texture2D{};
+                }
+            }
+            if (!g_hudPreviewLive && g_hudPreview.id == 0 && FileExists(hudPreviewPath().c_str()))
+            {
+                g_hudPreview = LoadTexture(hudPreviewPath().c_str());
+                if (g_hudPreview.id != 0)
+                    SetTextureFilter(g_hudPreview, TEXTURE_FILTER_BILINEAR);
+            }
+        }
+
+        void closeHudEditor()
+        {
+            g_hudEditor = false;
+            g_hudDrag = 0;
+            saveHudIfChanged();
+        }
+
+        void handleHudEditorInput()
+        {
+            const float s = std::clamp(static_cast<float>(GetScreenHeight()) / 720.0f, 0.6f, 3.0f);
+            const Rectangle pic = pictureOnScreen();
+            const Vector2 mouse = GetMousePosition();
+            if (keyTap(KEY_ESCAPE) || keyTap(KEY_ENTER) || keyTap(KEY_KP_ENTER) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT) ||
+                padPressed(GAMEPAD_BUTTON_RIGHT_FACE_DOWN))
+            {
+                closeHudEditor();
+                return;
+            }
+            if (keyTap(KEY_TAB) || keyTap(KEY_Q) || keyTap(KEY_E) || padPressed(GAMEPAD_BUTTON_LEFT_TRIGGER_1) ||
+                padPressed(GAMEPAD_BUTTON_RIGHT_TRIGGER_1))
+                g_hudSelected = (g_hudSelected + 1) % 2;
+
+            int x = 0, y = 0, scale = 100;
+            getPiece(g_hudSelected, x, y, scale);
+            const int step = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT) ? 20 : 5;
+            bool keyed = false;
+            auto nudge = [&](bool pressed, int &value, int delta) { if (pressed) { value += delta; keyed = true; } };
+            nudge(keyPressed(KEY_LEFT) || keyPressed(KEY_A) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_LEFT), x, -step);
+            nudge(keyPressed(KEY_RIGHT) || keyPressed(KEY_D) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_RIGHT), x, step);
+            nudge(keyPressed(KEY_UP) || keyPressed(KEY_W) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_UP), y, -step);
+            nudge(keyPressed(KEY_DOWN) || keyPressed(KEY_S) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_DOWN), y, step);
+            nudge(keyPressed(KEY_EQUAL) || keyPressed(KEY_KP_ADD) || keyPressed(KEY_PAGE_UP) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_UP), scale, 5);
+            nudge(keyPressed(KEY_MINUS) || keyPressed(KEY_KP_SUBTRACT) || keyPressed(KEY_PAGE_DOWN) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_LEFT), scale, -5);
+            if (keyTap(KEY_R))
+            {
+                x = y = 0;
+                scale = 100;
+                keyed = true;
+            }
+            if (keyed)
+            {
+                setPiece(g_hudSelected, x, y, scale);
+                saveHudIfChanged();
+            }
+
+            Rectangle buttons[3];
+            hudButtons(s, buttons);
+            if (g_clickThisFrame)
+            {
+                if (CheckCollisionPointRec(mouse, buttons[0]))
+                {
+                    closeHudEditor();
+                    return;
+                }
+                if (CheckCollisionPointRec(mouse, buttons[1]))
+                {
+                    setPiece(0, 0, 0, 100);
+                    setPiece(1, 0, 0, 100);
+                    saveHudIfChanged();
+                    return;
+                }
+                if (CheckCollisionPointRec(mouse, buttons[2]))
+                {
+                    setPiece(g_hudSelected, 0, 0, 100);
+                    saveHudIfChanged();
+                    return;
+                }
+                // The selected piece first (it is drawn on top), then the other.
+                const float grab = 10.0f * s;
+                for (int k = 0; k < 2; ++k)
+                {
+                    const int piece = k == 0 ? g_hudSelected : 1 - g_hudSelected;
+                    const Rectangle box = hudBoxOnScreen(piece, pic);
+                    const Rectangle area{box.x - grab, box.y - grab, box.width + 2.0f * grab, box.height + 2.0f * grab};
+                    if (!CheckCollisionPointRec(mouse, area))
+                        continue;
+                    g_hudSelected = piece;
+                    const bool nearLeft = std::fabs(mouse.x - box.x) <= grab, nearRight = std::fabs(mouse.x - (box.x + box.width)) <= grab;
+                    const bool nearTop = std::fabs(mouse.y - box.y) <= grab, nearBottom = std::fabs(mouse.y - (box.y + box.height)) <= grab;
+                    g_hudDrag = (nearLeft || nearRight) && (nearTop || nearBottom) ? 2 : 1;
+                    g_hudDragStart = mouse;
+                    getPiece(piece, g_hudStartX, g_hudStartY, g_hudStartScale);
+                    break;
+                }
+            }
+            if (g_hudDrag != 0)
+            {
+                if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+                {
+                    g_hudDrag = 0;
+                    saveHudIfChanged();
+                }
+                else if (g_hudDrag == 1)
+                {
+                    const int nx = g_hudStartX + static_cast<int>(std::lround((mouse.x - g_hudDragStart.x) / std::max(1.0f, pic.width) * 1000.0f));
+                    const int ny = g_hudStartY + static_cast<int>(std::lround((mouse.y - g_hudDragStart.y) / std::max(1.0f, pic.height) * 1000.0f));
+                    setPiece(g_hudSelected, nx, ny, g_hudStartScale);
+                }
+                else
+                {
+                    // Corner: the size follows the pointer's distance from the box's centre.
+                    int bx = 0, by = 0, bs = 100;
+                    getPiece(g_hudSelected, bx, by, bs);
+                    setPiece(g_hudSelected, g_hudStartX, g_hudStartY, g_hudStartScale);
+                    const Rectangle start = hudBoxOnScreen(g_hudSelected, pic);
+                    setPiece(g_hudSelected, bx, by, bs);
+                    const Vector2 centre{start.x + start.width * 0.5f, start.y + start.height * 0.5f};
+                    const float d0 = std::max(4.0f, std::hypot(g_hudDragStart.x - centre.x, g_hudDragStart.y - centre.y));
+                    const float d1 = std::hypot(mouse.x - centre.x, mouse.y - centre.y);
+                    setPiece(g_hudSelected, g_hudStartX, g_hudStartY, static_cast<int>(std::lround(g_hudStartScale * d1 / d0 / 5.0f)) * 5);
+                }
+            }
+            const float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f && g_hudDrag == 0)
+            {
+                int piece = g_hudSelected;
+                for (int p = 0; p < 2; ++p)
+                    if (CheckCollisionPointRec(mouse, hudBoxOnScreen(p, pic)))
+                        piece = p;
+                g_hudSelected = piece;
+                int px = 0, py = 0, ps = 100;
+                getPiece(piece, px, py, ps);
+                setPiece(piece, px, py, ps + (wheel > 0.0f ? 5 : -5));
+                saveHudIfChanged();
+            }
+        }
+
+        void drawHudEditor()
+        {
+            const float s = std::clamp(static_cast<float>(GetScreenHeight()) / 720.0f, 0.6f, 3.0f);
+            const float sw = static_cast<float>(GetScreenWidth());
+            const uint32_t accent = accentRgb();
+            const Color accentColor = rgb(accent);
+            const Rectangle pic = pictureOnScreen();
+
+            // Outside a battle: the last battle's picture (or nothing yet) stands in for the game.
+            if (!g_hudPreviewLive)
+            {
+                DrawRectangleRec(pic, Color{10, 12, 16, 255});
+                if (g_hudPreview.id != 0)
+                    DrawTexturePro(g_hudPreview, Rectangle{0.0f, 0.0f, static_cast<float>(g_hudPreview.width), static_cast<float>(g_hudPreview.height)},
+                                   pic, Vector2{0.0f, 0.0f}, 0.0f, Color{255, 255, 255, 150});
+                const char *note = g_hudPreview.id != 0 ? "Picture from your last battle. The real HUD follows when you play."
+                                                        : "Start a battle to see your HUD here. The boxes show where its pieces go.";
+                const float size = 16.0f * s;
+                text(note, pic.x + (pic.width - textWidth(note, size)) * 0.5f, pic.y + pic.height * 0.5f - size * 0.5f, size,
+                     Color{200, 206, 214, 255});
+            }
+            DrawRectangleLinesEx(pic, 1.0f, Color{255, 255, 255, 50});
+
+            const char *names[2] = {"Radar", "Weapons & health"};
+            for (int k = 0; k < 2; ++k)
+            {
+                const int piece = k == 0 ? 1 - g_hudSelected : g_hudSelected; // selected one on top
+                const bool selected = piece == g_hudSelected;
+                const Rectangle box = hudBoxOnScreen(piece, pic);
+                DrawRectangleRec(box, selected ? rgb(accent, 44) : Color{255, 255, 255, 16});
+                DrawRectangleLinesEx(box, selected ? 2.0f * s : 1.0f * s, selected ? accentColor : Color{255, 255, 255, 140});
+                int px = 0, py = 0, ps = 100;
+                getPiece(piece, px, py, ps);
+                char label[64];
+                std::snprintf(label, sizeof(label), "%s  %d%%", names[piece], ps);
+                const float size = 13.0f * s;
+                const float tagW = textWidth(label, size, true) + 14.0f * s;
+                const float tagH = size + 8.0f * s;
+                float tagY = box.y - tagH - 3.0f * s;
+                if (tagY < pic.y)
+                    tagY = box.y + box.height + 3.0f * s;
+                const float tagX = std::clamp(box.x, 0.0f, sw - tagW);
+                DrawRectangleRounded(Rectangle{tagX, tagY, tagW, tagH}, 0.3f, 6, selected ? accentColor : Color{14, 17, 22, 220});
+                text(label, tagX + 7.0f * s, tagY + 4.0f * s, size, selected ? inkFor(accent) : WHITE, true);
+                if (selected)
+                {
+                    const float h = 7.0f * s;
+                    for (const Vector2 c : {Vector2{box.x, box.y}, Vector2{box.x + box.width, box.y}, Vector2{box.x, box.y + box.height},
+                                            Vector2{box.x + box.width, box.y + box.height}})
+                    {
+                        DrawRectangleRec(Rectangle{c.x - h * 0.5f, c.y - h * 0.5f, h, h}, WHITE);
+                        DrawRectangleLinesEx(Rectangle{c.x - h * 0.5f, c.y - h * 0.5f, h, h}, 1.0f, accentColor);
+                    }
+                }
+            }
+
+            // The bar: title, how it works, buttons.
+            const Rectangle bar = hudToolbar(s, pic);
+            DrawRectangleRec(bar, Color{14, 17, 22, 228});
+            DrawRectangle(static_cast<int>(18.0f * s), static_cast<int>(bar.y + 14.0f * s), static_cast<int>(4.0f * s), static_cast<int>(30.0f * s), accentColor);
+            text("HUD LAYOUT", 30.0f * s, bar.y + 12.0f * s, 20.0f * s, WHITE, true);
+            Rectangle buttons[3];
+            hudButtons(s, buttons);
+            const char *hint = "Drag a piece to move it  \xC2\xB7  scroll or drag a corner to resize  \xC2\xB7  arrows nudge (Shift: more)  \xC2\xB7  Tab: other piece  \xC2\xB7  R: reset piece  \xC2\xB7  Enter: done";
+            const float hintSize = 13.0f * s;
+            const float hintRoom = buttons[2].x - 30.0f * s - 16.0f * s;
+            if (textWidth(hint, hintSize) > hintRoom)
+                hint = "Drag: move  \xC2\xB7  scroll / corner: size  \xC2\xB7  arrows: nudge  \xC2\xB7  Tab: other piece  \xC2\xB7  Enter: done";
+            text(hint, 30.0f * s, bar.y + 36.0f * s, hintSize, Color{170, 178, 190, 255});
+
+            const char *labels[3] = {"Done", "Reset all", "Reset piece"};
+            const Vector2 mouse = GetMousePosition();
+            for (int i = 0; i < 3; ++i)
+            {
+                const bool hover = CheckCollisionPointRec(mouse, buttons[i]);
+                DrawRectangleRounded(buttons[i], 0.35f, 6, i == 0 ? accentColor : (hover ? Color{70, 78, 92, 240} : Color{40, 46, 58, 235}));
+                text(labels[i], buttons[i].x + 16.0f * s, buttons[i].y + (buttons[i].height - 16.0f * s) * 0.5f, 16.0f * s,
+                     i == 0 ? inkFor(accent) : WHITE, true);
+            }
+        }
     }
 
     namespace ui
@@ -1320,17 +1760,27 @@ namespace ps2settings
             g_menuOpen.store(open, std::memory_order_relaxed);
             g_editingHex = false;
             g_draggingSlider = false;
+            if (g_hudEditor)
+                closeHudEditor();
             if (open)
+            {
                 loadFonts();
+                g_hudLiveAtOpen = tmho::hudShownRecently(1.0);
+            }
         }
         else if (g_menuOpen.load(std::memory_order_relaxed))
         {
-            if (!g_editingHex && (keyTap(KEY_ESCAPE) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)))
+            if (g_hudEditor)
+                handleHudEditorInput();
+            else if (!g_editingHex && (keyTap(KEY_ESCAPE) || padPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)))
                 g_menuOpen.store(false, std::memory_order_relaxed);
             else
                 handleMenuInput();
         }
-        g_paused.store(g_menuOpen.load(std::memory_order_relaxed) && g_settings.pauseInMenu, std::memory_order_relaxed);
+        // Paused while the menu is open, except for a moment after a HUD layout change so the
+        // game draws its HUD in the new place.
+        const bool stepping = GetTime() < g_hudStepUntil.load(std::memory_order_relaxed);
+        g_paused.store(g_menuOpen.load(std::memory_order_relaxed) && g_settings.pauseInMenu && !stepping, std::memory_order_relaxed);
 
         applyWindowMode();
         applyVsync();
@@ -1388,6 +1838,42 @@ namespace ps2settings
             drawFpsOverlay(gameSpeedPercent);
         }
         if (g_menuOpen.load(std::memory_order_relaxed))
-            drawDrawer();
+        {
+            if (g_hudEditor)
+                drawHudEditor();
+            else
+                drawDrawer();
+        }
+    }
+}
+
+namespace ps2settings
+{
+    namespace
+    {
+        std::atomic<bool> g_frameRawBgra{false};
+    }
+
+    void setFrameTextureRawBgra(bool raw) noexcept
+    {
+        g_frameRawBgra.store(raw, std::memory_order_relaxed);
+    }
+
+    bool frameTextureRawBgra() noexcept
+    {
+        return g_frameRawBgra.load(std::memory_order_relaxed);
+    }
+
+    void fixFrameCopy(unsigned char *pixels, size_t pixelCount) noexcept
+    {
+        if (!pixels || !frameTextureRawBgra())
+            return;
+        for (size_t i = 0; i < pixelCount; ++i, pixels += 4)
+        {
+            const unsigned char b = pixels[0];
+            pixels[0] = pixels[2];
+            pixels[2] = b;
+            pixels[3] = 255u;
+        }
     }
 }

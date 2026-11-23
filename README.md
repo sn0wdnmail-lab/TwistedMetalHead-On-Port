@@ -64,14 +64,27 @@ A controller works too; the keyboard keeps working alongside it.
 - **Internal resolution** 1x (native 640×448), 2x or 4x, or **Auto** (2x up to 1080p, 4x above).
   Changes take effect immediately.
 - **True 16:9 widescreen**: the 3D cameras see more to each side instead of stretching the
-  picture; the HUD, radar, weapon icons, names and text are moved and resized to fit; movies stay
-  4:3. Also **4:3** (original) and **Stretch**.
+  picture; the battle HUD sits right at the screen edges, and the radar, weapon panel, names and
+  text keep their shape; movies stay 4:3. Also **4:3** (original) and **Stretch**.
 - **Display modes**: Windowed, Borderless and exclusive **Fullscreen**. Resolutions from
   640×480 (4:3 native) and 854×480 (16:9) up to 4K (3840×2160), plus your monitor's own display
   modes in Fullscreen. Everything switches **live, without restarting the game**.
 - Scaling filter (smooth or sharp) and V-Sync.
 - **Lighting fix**: the COP2 instruction fix from PCSX2's game database, which corrects
   lighting that came out wrong when the vector unit was read too early.
+
+### Battle HUD layout (F2 > HUD)
+- **HUD editor**: the radar and the weapon panel are shown over your own game picture; drag a
+  piece to move it anywhere, scroll or drag a corner to resize it (40–250%), arrow keys nudge it.
+  Changes show live in the game behind the editor.
+- **Snap to screen edges** moves both pieces into the corners, keeping their sizes; **Reset**
+  puts them back (screen edges in 16:9, the game's own place in 4:3).
+- A moved or resized weapon panel keeps the look the game gave it: the panel is drawn as the
+  game placed it and then slid and scaled on screen as a whole, so the special-weapon icon stays
+  centred in its frame wherever the panel goes (its parts lie at different depths, so simply
+  moving the 3D model showed it from another angle and pushed the icon off-centre).
+- The ammo and cars-left numbers keep their 4:3 width in 16:9, so a thin "1" no longer drops
+  out between the font texture's texels.
 
 ### Camera
 - **Field of view** slider (50–120°; the game's own view is 65° at 4:3 and 81° at 16:9).
@@ -110,6 +123,36 @@ A controller works too; the keyboard keeps working alongside it.
 - The performance log's profiler samples the VU1 thread as well as the game thread, and its
   timers use QueryPerformanceCounter directly (cheaper than the C runtime clock it used before).
 
+#### Version 6.1: less CPU for the same 60 fps
+Measured on the same PC (Ryzen 7 3700X, 16 hardware threads; RTX 2080 SUPER; 16:9, Auto
+resolution), from the port's own performance log (CPU time of every thread of the game):
+
+| | V6 | V6.1 |
+|---|---|---|
+| Whole game in a Challenge battle | 1.5–1.8 cores | 1.1–1.3 cores with one opponent, 1.5–1.65 in the heaviest five-opponent fights |
+| GS feed thread | 0.40–0.44 cores (woken 47,000–88,000 times a second) | 0.19–0.30 cores (about 3,000 wake-ups a second) |
+| GPU queue submissions | about 1,100 a second | about 480 a second |
+
+- **GS feed thread wakes in batches**: the VU1 thread hands graphics packets over in groups
+  (24 packets / 96 KB, every vsync, and whenever the game reads a GS register) instead of waking
+  the feed thread for each of its ~120,000 packets a second.
+- **Native Windows locks**: the threads that hand work to each other use Windows' own slim locks
+  and condition variables instead of the MinGW pthread emulation.
+- **One GPU submission per frame**: paraLLEl-GS used to hand queued work to the GPU every 4,096
+  primitives (three or four times a frame); a battle frame now goes in one piece.
+- **Frame hand-off without a CPU pass**: the finished frame is copied as it is and the colour
+  channels are swapped by a tiny shader on the GPU, instead of a per-pixel loop on the CPU.
+- **Faster compiled VU1 code** (about 10%): broadcast operands are loaded as whole registers and
+  shuffled, avoiding a store-to-load forwarding stall on every such instruction.
+- **I/O processor fast paths**: cached import-stub lookups and a cheaper DMA check.
+- Per-frame GPU images without dedicated driver allocations, and **instant exit** (no more
+  `TMHO.exe` left hanging in a graphics driver on quit).
+- **CPU-limit test**: with the whole game capped at 10% of the CPU (1.6 of the 16 hardware
+  threads, `cpu_limit_percent=10` in `settings.ini`, a Windows job-object hard cap), battles
+  with one opponent and normal play stay at 60 fps with no frame over 25 ms; the heaviest
+  five-opponent fight dipped to 43–56 fps for about 14 seconds, when the game needs ~1.6 cores.
+  The cap is off by default.
+
 ### Accuracy
 - The PS2 CPU's floating-point rules are reproduced: no infinities or NaNs, clamping to the
   largest number instead, square roots of the absolute value, division by zero giving ±max.
@@ -123,6 +166,7 @@ A controller works too; the keyboard keeps working alongside it.
 - **Audio**: master volume, mute in the background.
 - **Game**: pause while the menu is open, FPS counter, screenshot recording, VU1 thread, game
   disc, field of view, camera distance, quit.
+- **HUD**: the HUD editor, radar and weapon panel sizes, snap to screen edges, reset.
 - The **setup screen** (F2 > Game > Game disc > Setup, or "Show this screen at start") has the
   disc, Build game and Build shaders.
 - **UI**: accent colour, menu opacity, which side the menu opens on.
@@ -143,10 +187,12 @@ A controller works too; the keyboard keeps working alongside it.
 
 ## Known issues
 
-- **The heaviest five-opponent moments can dip briefly** (92–99% speed for a couple of
-  seconds on a Ryzen 7 3700X). The game thread and the VU1 thread are both close to a full core
-  then, and the game waits for the VU1 to finish each frame's drawing before it starts the next.
-  Slower CPUs will see more of this.
+- **The heaviest five-opponent moments need about 1.6 cores** (VU1 thread ~0.7, game thread
+  ~0.55, GS feed ~0.25). That is full speed on a Ryzen 7 3700X, but a CPU-starved PC (or the 10%
+  cap test above) dips there, because the game waits for the VU1 to finish each frame's drawing
+  before it starts the next.
+- **The software (CPU) renderer's text looks rough**: it samples textures without filtering, so
+  thin strokes of the small HUD font can drop out. The Vulkan renderer filters them.
 - **No 120 fps yet.** The game's logic, physics and animations are tied to the PS2's 60 Hz
   frame clock, so a higher frame rate needs changes inside the game's systems, not just a
   setting (see the plans below).
@@ -166,6 +212,8 @@ A controller works too; the keyboard keeps working alongside it.
 - **Native 120 fps** (and a frame-rate setting): running the game's frame timing, physics steps
   and animations at 120 Hz without speeding the game up and without interpolated frames.
 - **Widescreen menus**: the 2D menu screens kept at their shape (pillarboxed) or adapted to 16:9.
+- **A true 16:9 frame** (854 pixels wide instead of 640), so text and HUD no longer need squeezing
+  to keep their shape.
 - **More accurate sound**: SPU2 reverb, volume envelopes and the PS2's own sample
   interpolation.
 - **Collision follow-up**: tracking down any remaining fall-through spots.
@@ -190,7 +238,7 @@ FFMPEG_ROOT=/path/to/ffmpeg-mingw port/build.sh /path/to/your/SCUS_976.21 window
 | Path | What it is |
 |---|---|
 | `ps2recomp/` | PS2Recomp (recompiler, runtime, I/O processor emulator) with all of the port's changes |
-| `ps2recomp/ps2xRuntime/src/lib/tmho_game.cpp` | Head-On specific code: widescreen, HUD placement, field of view, camera distance |
+| `ps2recomp/ps2xRuntime/src/lib/tmho_game.cpp` | Head-On specific code: widescreen, HUD placement and layout, field of view, camera distance |
 | `ps2recomp/ps2xRuntime/third_party/parallel-gs` | paraLLEl-GS (git submodule), patched by `port/patches/parallel-gs.patch` |
 | `port/tmho.toml` | Recompiler configuration for SCUS_976.21: function map, SDK bindings, instruction patches |
 | `port/tmho_functions_named.csv` | Function boundaries and names used by the recompiler |

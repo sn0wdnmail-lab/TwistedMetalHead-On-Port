@@ -83,6 +83,7 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
+        [[nodiscard]] bool dmaStartPending() const noexcept { return m_dmaStart.has_value(); }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
         [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }

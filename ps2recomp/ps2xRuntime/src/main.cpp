@@ -19,6 +19,26 @@
 #include <cctype>
 #include <vector>
 
+#if defined(_WIN32)
+// Declared here instead of including <windows.h>, whose names clash with raylib's.
+extern "C" __declspec(dllimport) void *__stdcall GetCurrentProcess(void);
+extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void *process, unsigned int exitCode);
+#endif
+
+// Ends the process at once. On Windows this skips the DLL detach routines ExitProcess runs: with
+// the graphics driver and the audio thread still active, a driver's detach routine can wait
+// forever and leave a frozen window behind (seen when the setup screen was closed).
+[[noreturn]] static void endProcess(int code)
+{
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(nullptr);
+#if defined(_WIN32)
+    TerminateProcess(GetCurrentProcess(), static_cast<unsigned int>(code));
+#endif
+    std::_Exit(code);
+}
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <unistd.h>
@@ -322,9 +342,7 @@ int main(int argc, char *argv[])
             const ps2launcher::Result setup = ps2launcher::run(kGame);
             if (!setup.play)
             {
-                std::cout.flush();
-                std::cerr.flush();
-                std::_Exit(0); // window closed on the setup screen
+                endProcess(0); // window closed on the setup screen
             }
             pathObj = setup.program;
             PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
@@ -358,9 +376,7 @@ int main(int argc, char *argv[])
 #ifdef _DEBUG
         ps2_log::print_saved_location();
 #endif
-        std::cout.flush();
-        std::cerr.flush();
-        std::_Exit(0);
+        endProcess(0);
     }
     catch (const std::exception &e)
     {
@@ -373,7 +389,5 @@ int main(int argc, char *argv[])
         fatal("The game stopped because of an unexpected error.");
     }
 
-    std::cout.flush();
-    std::cerr.flush();
-    std::_Exit(1);
+    endProcess(1);
 }

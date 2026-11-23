@@ -355,6 +355,7 @@ namespace ps2perf
             std::string label;
         };
         std::unordered_map<uint64_t, CensusEntry> g_census;
+        std::atomic<unsigned long> g_otherThreadId{0}; // the busiest thread that is not one of ours (sampled too; a Windows thread id)
         uint64_t g_censusTick = 0;
 
 #if defined(_WIN32)
@@ -424,6 +425,8 @@ namespace ps2perf
             };
             std::vector<Busy> busy;
             unsigned threadCount = 0;
+            double otherCores = 0.0;
+            DWORD otherId = 0;
             THREADENTRY32 entry{};
             entry.dwSize = sizeof(entry);
             for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry))
@@ -454,8 +457,19 @@ namespace ps2perf
                 const double cores = static_cast<double>(delta) / static_cast<double>(intervalNs);
                 if (cores >= 0.05)
                     busy.push_back({cores, it->second.label});
+                {
+                    const std::string &label = it->second.label;
+                    const bool ours = label == "GameThread" || label.rfind("VU1 thread", 0) == 0 || label.rfind("GS feed", 0) == 0 ||
+                                      label.rfind("window", 0) == 0 || label == "perf sampler";
+                    if (!ours && cores >= 0.03 && cores > otherCores)
+                    {
+                        otherCores = cores;
+                        otherId = entry.th32ThreadID;
+                    }
+                }
             }
             CloseHandle(snapshot);
+            g_otherThreadId.store(otherId, std::memory_order_relaxed);
             for (auto it = g_census.begin(); it != g_census.end();)
                 it = (it->second.seenTick != g_censusTick) ? g_census.erase(it) : std::next(it);
 
@@ -587,10 +601,12 @@ namespace ps2perf
         std::vector<Symbol> g_symbols;
         void loadSymbolsOnce();
         std::mutex g_profileMutex;
-        std::unordered_map<std::string, uint64_t> g_profileCounts; // label -> samples
-        uint64_t g_profileSamples = 0;
-        std::unordered_map<std::string, uint64_t> g_vuProfileCounts; // the VU1 thread's samples (Windows)
-        uint64_t g_vuProfileSamples = 0;
+        // Samples per sampled thread: 0 game thread, 1 VU1 thread, 2 GS feed thread (the last two on
+        // Windows): label -> samples.
+        constexpr int kSampledThreads = 4;
+        const char *const kSampledNames[kSampledThreads] = {"game thread", "VU1 thread", "GS feed thread", "busiest other thread"};
+        std::unordered_map<std::string, uint64_t> g_profileCounts[kSampledThreads];
+        uint64_t g_profileSamples[kSampledThreads] = {};
         std::atomic<bool> g_samplerRunning{false};
         uint64_t g_imageBase = 0;
         uint64_t g_imageSize = 0;
@@ -703,16 +719,17 @@ namespace ps2perf
             return "other runtime";
         }
 
-        void recordSample(const std::string &label, bool vuThread = false)
+        void recordSample(const std::string &label, int thread = 0)
         {
             std::lock_guard<std::mutex> lock(g_profileMutex);
-            ++(vuThread ? g_vuProfileCounts : g_profileCounts)[label];
-            ++(vuThread ? g_vuProfileSamples : g_profileSamples);
+            ++g_profileCounts[thread][label];
+            ++g_profileSamples[thread];
         }
 
 #if defined(_WIN32)
         HANDLE g_sampledThread = nullptr;
         HANDLE vuThreadHandle(); // the VU1 thread, once it has registered (below, with the watchdog)
+        HANDLE g_feedThreadHandle = nullptr; // the GS feed thread, once it has registered
 
         // Samples outside TMHO.exe: "[module] export" when the address sits right after an exported
         // function's start (the syscall stubs in ntdll.dll show what a waiting thread waits on),
@@ -798,16 +815,34 @@ namespace ps2perf
 
         void samplerMain()
         {
+            registerThread("perf sampler");
+            DWORD otherId = 0;
+            HANDLE otherHandle = nullptr;
             while (g_samplerRunning.load(std::memory_order_relaxed))
             {
                 Sleep(2);
                 uint64_t rip = 0;
                 if (sampleThread(g_sampledThread, rip))
                     recordSample(labelForAddress(rip));
-                // The VU1 thread too: VIF1, the VU1 microprograms and the PATH1 packets they send.
+                // The VU1 thread too (VIF1, the VU1 microprograms, PATH1 packets) and the GS feed thread.
                 if (sampleThread(vuThreadHandle(), rip))
-                    recordSample(labelForAddress(rip), true);
+                    recordSample(labelForAddress(rip), 1);
+                if (sampleThread(g_feedThreadHandle, rip))
+                    recordSample(labelForAddress(rip), 2);
+                // And whichever other thread used the most CPU (driver, audio, ...), to name it.
+                const DWORD wanted = static_cast<DWORD>(g_otherThreadId.load(std::memory_order_relaxed));
+                if (wanted != otherId)
+                {
+                    if (otherHandle)
+                        CloseHandle(otherHandle);
+                    otherHandle = wanted ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, wanted) : nullptr;
+                    otherId = wanted;
+                }
+                if (otherHandle && sampleThread(otherHandle, rip))
+                    recordSample(labelForAddress(rip), 3);
             }
+            if (otherHandle)
+                CloseHandle(otherHandle);
         }
 #else
         pthread_t g_sampledThread{};
@@ -946,14 +981,15 @@ namespace ps2perf
         }
 
         // Every 10 s: the busiest places on the game thread (and on Windows the VU1 thread).
-        void writeProfileTableLocked(FILE *file, double seconds, bool vuThread)
+        void writeProfileTableLocked(FILE *file, double seconds, int thread)
         {
+            const bool vuThread = thread != 0;
             std::vector<std::pair<std::string, uint64_t>> rows;
             uint64_t total = 0;
             {
                 std::lock_guard<std::mutex> lock(g_profileMutex);
-                auto &counts = vuThread ? g_vuProfileCounts : g_profileCounts;
-                uint64_t &samples = vuThread ? g_vuProfileSamples : g_profileSamples;
+                auto &counts = g_profileCounts[thread];
+                uint64_t &samples = g_profileSamples[thread];
                 rows.assign(counts.begin(), counts.end());
                 total = samples;
                 counts.clear();
@@ -964,7 +1000,7 @@ namespace ps2perf
             std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
             char line[1024];
             std::snprintf(line, sizeof(line), "           ---- where the %s spent the last %.0f s (%llu samples%s) ----",
-                          vuThread ? "VU1 thread" : "game thread", seconds,
+                          kSampledNames[thread], seconds,
                           static_cast<unsigned long long>(total), g_symbols.empty() ? ", no symbol map" : "");
             writeLine(file, line);
             {
@@ -1000,8 +1036,8 @@ namespace ps2perf
 
         void writeProfileLocked(FILE *file, double seconds)
         {
-            writeProfileTableLocked(file, seconds, false);
-            writeProfileTableLocked(file, seconds, true);
+            for (int thread = 0; thread < kSampledThreads; ++thread)
+                writeProfileTableLocked(file, seconds, thread);
         }
 
         // Resident memory of the whole process (RAM the game occupies right now).
@@ -1563,12 +1599,45 @@ namespace ps2perf
 
     void registerThread(const char *name) noexcept
     {
+#if defined(_WIN32)
+        // Give the thread a name Windows shows (and the thread list in this log uses), unless it
+        // already has one.
+        if (name && *name)
+        {
+            using SetDescription = HRESULT(WINAPI *)(HANDLE, PCWSTR);
+            using GetDescription = HRESULT(WINAPI *)(HANDLE, PWSTR *);
+            static const HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+            static const auto setFn = kernel ? reinterpret_cast<SetDescription>(reinterpret_cast<void *>(GetProcAddress(kernel, "SetThreadDescription"))) : nullptr;
+            static const auto getFn = kernel ? reinterpret_cast<GetDescription>(reinterpret_cast<void *>(GetProcAddress(kernel, "GetThreadDescription"))) : nullptr;
+            bool named = false;
+            PWSTR current = nullptr;
+            if (getFn && SUCCEEDED(getFn(GetCurrentThread(), &current)) && current)
+            {
+                named = current[0] != L'\0';
+                LocalFree(current);
+            }
+            if (setFn && !named)
+            {
+                wchar_t wide[64] = {};
+                for (size_t i = 0; i + 1 < 64 && name[i] && name[i] != '('; ++i)
+                    wide[i] = static_cast<wchar_t>(static_cast<unsigned char>(name[i]));
+                for (size_t n = wcslen(wide); n > 0 && wide[n - 1] == L' '; --n)
+                    wide[n - 1] = L'\0';
+                setFn(GetCurrentThread(), wide);
+            }
+        }
+#endif
         if (name && std::strncmp(name, "VU1 thread", 10) == 0)
             t_vuThread = true;
         if (name && std::strncmp(name, "GS feed", 7) == 0)
         {
             t_feedThread = true;
             g_feedSeen.store(true, std::memory_order_relaxed);
+#if defined(_WIN32)
+            if (!g_feedThreadHandle)
+                DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_feedThreadHandle,
+                                THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
+#endif
         }
         if (name)
         {
@@ -1749,6 +1818,28 @@ namespace ps2perf
                 return;
             }
         }
+    }
+
+    // Testing only (settings.ini cpu_limit_percent): the whole game may use at most this share of
+    // all CPU cores together, enforced by Windows (a job object with a hard CPU-rate cap).
+    void applyCpuLimit(int percent) noexcept
+    {
+        if (percent <= 0 || percent >= 100)
+            return;
+#if defined(_WIN32)
+        HANDLE job = CreateJobObjectW(nullptr, nullptr);
+        if (!job)
+            return;
+        JOBOBJECT_CPU_RATE_CONTROL_INFORMATION rate{};
+        rate.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+        rate.CpuRate = static_cast<DWORD>(percent) * 100u; // in 1/100 of a percent
+        const bool ok = SetInformationJobObject(job, JobObjectCpuRateControlInformation, &rate, sizeof(rate)) &&
+                        AssignProcessToJobObject(job, GetCurrentProcess());
+        performanceNote("           CPU limit (testing): %s - the game may use %d%% of all CPU cores together", ok ? "on" : "could not be set", percent);
+        std::fprintf(stderr, "[perf] CPU limit %d%%: %s\n", percent, ok ? "on" : "failed");
+#else
+        performanceNote("           CPU limit (testing): %d%% asked for, only available on Windows", percent);
+#endif
     }
 
     void performanceNote(const char *fmt, ...) noexcept
@@ -2025,10 +2116,11 @@ namespace ps2perf
             {
                 const double perSecondStats = perSecond;
                 std::snprintf(l7, sizeof(l7),
-                              "           VU1 thread ms/s: vu1 %.0f | vif1 %.0f | gs-feed %.0f | gpu-handoff %.0f | other %.0f | idle %.0f | handed over %.0f tasks/s (%.1f MB/s) | game thread waits: catch-up %.0f/s (VU1 memory %.0f, GIF_STAT %.0f, other %.0f), frame-ahead %.0f ms/s, queue-full %.0f ms/s",
+                              "           VU1 thread ms/s: vu1 %.0f | vif1 %.0f | gs-feed %.0f | gpu-handoff %.0f | other %.0f | idle %.0f | handed over %.0f tasks/s (%.1f MB/s), woke %.0f/s | game thread waits: catch-up %.0f/s (VU1 memory %.0f, GIF_STAT %.0f, other %.0f), frame-ahead %.0f ms/s, queue-full %.0f ms/s",
                               msPerSecond(buckets[VuThreadVu1]), msPerSecond(buckets[VuThreadVif1]), msPerSecond(buckets[VuThreadGs]),
                               msPerSecond(buckets[VuThreadGpu]), msPerSecond(buckets[VuThreadOther]), msPerSecond(buckets[VuThreadIdle]),
                               static_cast<double>(mtvu.tasks) * perSecondStats, static_cast<double>(mtvu.queuedBytes) * perSecondStats / 1e6,
+                              static_cast<double>(mtvu.wakeups) * perSecondStats,
                               static_cast<double>(mtvu.syncs[0] + mtvu.syncs[1] + mtvu.syncs[2]) * perSecondStats,
                               static_cast<double>(mtvu.syncs[0]) * perSecondStats, static_cast<double>(mtvu.syncs[1]) * perSecondStats,
                               static_cast<double>(mtvu.syncs[2]) * perSecondStats,

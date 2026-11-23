@@ -213,6 +213,7 @@ int main(int argc, char **argv)
     }
     const fs::path dir = argv[1];
     int repeat = 20;
+    bool shuffle = false; // time the runs in a mixed order (closer to a game frame than run after run of one program)
     std::string mode = "both";
     std::string traceRun;
     for (int i = 2; i < argc; ++i)
@@ -220,6 +221,8 @@ int main(int argc, char **argv)
         const std::string arg = argv[i];
         if (arg == "--repeat" && i + 1 < argc)
             repeat = std::atoi(argv[++i]);
+        else if (arg == "--shuffle")
+            shuffle = true;
         else if (arg == "--mode" && i + 1 < argc)
             mode = argv[++i];
         else if (arg == "--trace" && i + 1 < argc)
@@ -309,6 +312,15 @@ int main(int argc, char **argv)
         std::printf("compiled   : %d of %zu runs differ from the recording\n", failures[1], runs.size());
 
     // 2. Speed.
+    if (shuffle)
+    {
+        uint32_t seed = 12345u;
+        for (size_t i = runs.size(); i > 1; --i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            std::swap(runs[i - 1], runs[seed % i]);
+        }
+    }
     for (int core = 0; core < 2; ++core)
     {
         if ((core == 0 && !doInterp) || (core == 1 && !doAot))

@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include "runtime/ps2_fast_sync.h"
 #include <cstdio>
 #include <exception>
 #include <cstdlib>
@@ -42,9 +43,10 @@ namespace ps2mtvu
         constexpr size_t kMaxQueuedTasks = 16384u;
         constexpr uint32_t kMaxFramesQueued = 1u; // frames handed over but not yet finished
 
-        std::mutex g_mutex;
-        std::condition_variable g_workCv; // VU1 thread: work arrived / stop
-        std::condition_variable g_doneCv; // EE: work finished
+        ps2sync::Mutex g_mutex;
+        ps2sync::CondVar g_workCv; // VU1 thread: work arrived / stop
+        ps2sync::CondVar g_doneCv; // EE: work finished
+        bool g_workerSleeping = false; // under g_mutex: the VU1 thread waits for work
         std::deque<Task> g_queue;
         size_t g_queuedBytes = 0;   // under g_mutex: posted, not yet finished
         size_t g_queuedTasks = 0;   // under g_mutex
@@ -55,7 +57,7 @@ namespace ps2mtvu
         std::atomic<uint64_t> g_completed{0};
         thread_local bool t_onWorker = false;
 
-        std::atomic<uint64_t> s_tasks{0}, s_frames{0}, s_syncWaitNs{0}, s_frameWaitNs{0}, s_fullWaitNs{0}, s_bytes{0};
+        std::atomic<uint64_t> s_tasks{0}, s_frames{0}, s_syncWaitNs{0}, s_frameWaitNs{0}, s_fullWaitNs{0}, s_bytes{0}, s_wakeups{0};
         std::atomic<uint64_t> s_syncs[static_cast<uint32_t>(SyncReason::Count)];
 
         uint64_t nowNs()
@@ -86,11 +88,14 @@ namespace ps2mtvu
             for (;;)
             {
                 {
-                    std::unique_lock<std::mutex> lock(g_mutex);
+                    std::unique_lock<ps2sync::Mutex> lock(g_mutex);
                     if (g_queue.empty())
                     {
                         ps2perf::Scope idle(ps2perf::IdleWait);
+                        s_wakeups.fetch_add(1u, std::memory_order_relaxed);
+                        g_workerSleeping = true;
                         g_workCv.wait(lock, [] { return g_stop || !g_queue.empty(); });
+                        g_workerSleeping = false;
                     }
                     if (g_queue.empty())
                         return; // stop requested and nothing left
@@ -120,7 +125,7 @@ namespace ps2mtvu
                 const size_t count = batch.size();
                 batch.clear();
                 {
-                    std::lock_guard<std::mutex> lock(g_mutex);
+                    std::lock_guard<ps2sync::Mutex> lock(g_mutex);
                     g_queuedBytes -= bytes;
                     g_queuedTasks -= count;
                     g_queuedFrames -= frames;
@@ -154,7 +159,7 @@ namespace ps2mtvu
         if (!g_active.load())
             return;
         {
-            std::lock_guard<std::mutex> lock(g_mutex);
+            std::lock_guard<ps2sync::Mutex> lock(g_mutex);
             g_stop = true;
         }
         g_workCv.notify_all();
@@ -172,7 +177,7 @@ namespace ps2mtvu
     {
         void enqueue(Task &&task, bool frame)
         {
-            std::unique_lock<std::mutex> lock(g_mutex);
+            std::unique_lock<ps2sync::Mutex> lock(g_mutex);
             // Back-pressure: the EE waits while the VU1 thread is too far behind.
             if (g_queuedBytes > kMaxQueuedBytes || g_queuedTasks > kMaxQueuedTasks)
             {
@@ -195,8 +200,10 @@ namespace ps2mtvu
             s_bytes.fetch_add(task.bytes, std::memory_order_relaxed);
             g_queue.push_back(std::move(task));
             g_posted.fetch_add(1u, std::memory_order_relaxed);
+            const bool wake = g_workerSleeping;
             lock.unlock();
-            g_workCv.notify_one();
+            if (wake)
+                g_workCv.notify_one();
             s_tasks.fetch_add(1u, std::memory_order_relaxed);
             if (frame)
                 s_frames.fetch_add(1u, std::memory_order_relaxed);
@@ -240,7 +247,7 @@ namespace ps2mtvu
         const uint64_t start = nowNs();
         {
             ps2perf::Scope wait(ps2perf::MtvuWait);
-            std::unique_lock<std::mutex> lock(g_mutex);
+            std::unique_lock<ps2sync::Mutex> lock(g_mutex);
             g_doneCv.wait(lock, [target] { return g_completed.load(std::memory_order_acquire) >= target; });
         }
         s_syncWaitNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
@@ -257,6 +264,7 @@ namespace ps2mtvu
         stats.frameWaitNs = s_frameWaitNs.exchange(0, std::memory_order_relaxed);
         stats.fullWaitNs = s_fullWaitNs.exchange(0, std::memory_order_relaxed);
         stats.queuedBytes = s_bytes.exchange(0, std::memory_order_relaxed);
+        stats.wakeups = s_wakeups.exchange(0, std::memory_order_relaxed);
         return stats;
     }
 }

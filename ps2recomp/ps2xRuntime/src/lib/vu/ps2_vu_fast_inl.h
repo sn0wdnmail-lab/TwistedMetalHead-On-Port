@@ -103,6 +103,21 @@ namespace vufast
     };
     inline const LaneMasks g_laneMasks{};
 
+    // One lane of a register in all four lanes. The register is read whole (16 bytes, the same
+    // span it was written with): reading the lane alone lets the compiler widen it into a 16-byte
+    // read that starts mid-register and overlaps the next one, which cannot be forwarded from the
+    // store that just wrote the register and stalls the CPU for a dozen cycles or more.
+    VU_FAST_INLINE __m128 broadcastLane(__m128 v, uint32_t lane)
+    {
+        switch (lane & 3u)
+        {
+        case 0u: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(0, 0, 0, 0));
+        case 1u: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(1, 1, 1, 1));
+        case 2u: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 2, 2, 2));
+        default: return _mm_shuffle_ps(v, v, _MM_SHUFFLE(3, 3, 3, 3));
+        }
+    }
+
     VU_FAST_INLINE void storeMasked(float *dst, __m128 value, uint8_t dest)
     {
         if (dest == 0xFu)
@@ -284,7 +299,7 @@ VU_FAST_INLINE void VU1Interpreter::fastExecUpperKind(const FastPair &pair)
             __m128 t;
             switch (pair.upSrc)
             {
-            case FSRC_BC: t = _mm_set1_ps(normScalar(m_state.vf[pair.upFt][pair.upBc])); break;
+            case FSRC_BC: t = vuNorm(broadcastLane(_mm_loadu_ps(m_state.vf[pair.upFt]), pair.upBc)); break;
             case FSRC_VT: t = vuNorm(_mm_loadu_ps(m_state.vf[pair.upFt])); break;
             case FSRC_Q: t = _mm_set1_ps(normScalar(m_state.q)); break;
             default: t = _mm_set1_ps(normScalar(m_state.i)); break;
@@ -1379,8 +1394,8 @@ struct Vu1Aot
             {
             case FSRC_BC:
             {
-                const float lane = vu.m_state.vf[pair.upFt][pair.upBc];
-                t = _mm_set1_ps((Norm & 2u) ? normScalar(lane) : lane);
+                const __m128 lane = broadcastLane(_mm_loadu_ps(vu.m_state.vf[pair.upFt]), pair.upBc);
+                t = (Norm & 2u) ? vuNorm(lane) : lane;
                 break;
             }
             case FSRC_VT:

@@ -6,6 +6,7 @@
 // Everything here runs on the window (main) thread except menuOpen() and emulationPaused(),
 // which the game thread reads to neutralise controller input and to pause the EE scheduler.
 
+#include <cstddef>
 #include <cstdint>
 
 struct Texture; // raylib (Texture2D is a typedef of it)
@@ -36,6 +37,14 @@ namespace ps2settings
         bool recordFrames = false; // a screenshot every 0.5 s into Logs\frames (ps2_capture)
         int fovDegrees = 0;        // battle camera horizontal field of view, 0 = the game's own (tmho_game)
         int cameraDistance = 100;  // chase camera distance in percent of the game's own (tmho_game)
+        // Battle HUD layout (F2 > HUD, tmho_game): per piece an offset in 0.1 % of the picture's
+        // width / height from where the game puts it, and a size in percent.
+        int hudRadarX = 0, hudRadarY = 0, hudRadarScale = 100;
+        int hudWeaponX = 0, hudWeaponY = 0, hudWeaponScale = 100;
+        int cpuLimitPercent = 0;   // testing only: cap the whole game at this share of all CPU cores (0 = off)
+        int gpuFlushPrimitives = 0; // tuning (hidden): paraLLEl-GS hands queued work to the GPU after this many primitives (0 = default)
+        int gpuTimestamps = 1;      // tuning (hidden): measure GPU time per stage for Graphicslogs.txt (0 = off)
+        int gpuFeedBatch = 1;       // tuning (hidden): wake the GS feed thread per batch of packets (0 = per packet)
     };
 
     // paraLLEl-GS super-sampling rate for internalScale: 2x2 (4) and 4x4 (16) samples give a
@@ -81,4 +90,11 @@ namespace ps2settings
     // Window thread, inside BeginDrawing/EndDrawing after the game picture: FPS overlay and drawer.
     // gameSpeedPercent: emulation speed (100 = full speed), negative if unknown.
     void draw(double gameSpeedPercent);
+
+    // The game picture's texture holds the GPU's raw BGRA bytes (drawn through a shader that swaps
+    // red and blue). A copy read back from that texture (4 bytes a pixel) is put right with
+    // fixFrameCopy, which does nothing when the texture holds ordinary RGBA.
+    void setFrameTextureRawBgra(bool raw) noexcept;
+    bool frameTextureRawBgra() noexcept;
+    void fixFrameCopy(unsigned char *pixels, size_t pixelCount) noexcept;
 }

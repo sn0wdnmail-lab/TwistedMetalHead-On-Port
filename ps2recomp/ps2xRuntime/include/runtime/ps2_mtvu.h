@@ -55,6 +55,7 @@ namespace ps2mtvu
         uint64_t frameWaitNs = 0; // EE waiting because the VU1 thread was a frame behind
         uint64_t fullWaitNs = 0;  // EE waiting because the queue was full
         uint64_t queuedBytes = 0; // data handed over
+        uint64_t wakeups = 0;     // times the VU1 thread went to sleep for lack of work (each one is woken later)
     };
     // Counters since the last call (performance log).
     Stats takeStats() noexcept;

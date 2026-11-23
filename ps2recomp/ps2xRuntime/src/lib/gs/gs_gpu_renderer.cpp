@@ -1,7 +1,9 @@
 #include <deque>
+#include <emmintrin.h>
 #include <chrono>
 #include <filesystem>
 #include <condition_variable>
+#include "runtime/ps2_fast_sync.h"
 // GPU GS renderer bridge - see include/runtime/gs/gs_gpu_renderer.h.
 //
 // paraLLEl-GS (third_party/parallel-gs, LGPLv3+) does the GS work on the GPU: the GIF packets go
@@ -14,6 +16,7 @@
 
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_settings.h"
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +59,7 @@ namespace ps2gpu
 {
     std::atomic<uint32_t> g_requestedSuperSampling{0u};
     std::atomic<uint32_t> g_currentSuperSampling{1u};
+    std::atomic<bool> g_rawBgraFrames{false}; // the window can draw raw BGRA pictures
     namespace
     {
         void startFeed();
@@ -188,7 +192,7 @@ namespace ps2gpu
 
         struct State
         {
-            std::mutex mutex; // everything that touches Vulkan / the GS emulator
+            ps2sync::Mutex mutex; // everything that touches Vulkan / the GS emulator
             bool inited = false;
             Context context;
             Device device;
@@ -204,12 +208,13 @@ namespace ps2gpu
             std::thread::id lastThread{};
             bool warnedRegisterWrite = false;
 
-            std::mutex frameMutex; // the newest picture, handed to the window thread
+            ps2sync::Mutex frameMutex; // the newest picture, handed to the window thread
             std::vector<uint8_t> frame;
             uint32_t frameWidth = 0;
             uint32_t frameHeight = 0;
             uint32_t frameFbp = 0;
             bool frameFresh = false;
+            bool frameRawBgra = false; // frame holds the GPU's BGRA bytes as they came back
         };
 
         // Never destroyed: the device must not go away behind a thread that is still running.
@@ -266,13 +271,16 @@ namespace ps2gpu
             const auto *src = static_cast<const uint32_t *>(s.device.map_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT));
             const size_t pixels = static_cast<size_t>(slot.width) * slot.height;
             {
-                std::lock_guard<std::mutex> lock(s.frameMutex);
+                std::lock_guard<ps2sync::Mutex> lock(s.frameMutex);
                 s.frame.resize(pixels * 4u);
                 uint32_t *dst = reinterpret_cast<uint32_t *>(s.frame.data());
                 const bool bgra = slot.format == VK_FORMAT_B8G8R8A8_UNORM || slot.format == VK_FORMAT_B8G8R8A8_SRGB;
+                const bool raw = bgra && g_rawBgraFrames.load(std::memory_order_relaxed);
                 if (src)
                 {
-                    if (bgra)
+                    if (raw)
+                        std::memcpy(dst, src, pixels * 4u); // the window's shader swaps red and blue
+                    else if (bgra)
                     {
                         for (size_t i = 0; i < pixels; ++i)
                         {
@@ -289,6 +297,7 @@ namespace ps2gpu
                 s.frameWidth = slot.width;
                 s.frameHeight = slot.height;
                 s.frameFbp = slot.displayFbp;
+                s.frameRawBgra = raw;
                 s.frameFresh = true;
             }
             s.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
@@ -390,7 +399,7 @@ namespace ps2gpu
     bool init(GSRegisters *privRegs, const Options &options, Description &outDescription, std::string &outError)
     {
         State &s = st();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
         if (s.inited)
             return true;
@@ -432,12 +441,20 @@ namespace ps2gpu
         s.regs = privRegs;
         s.signals.regs = privRegs;
         s.iface.set_signal_interface(&s.signals);
-        if (ps2perf::enabled() && !std::getenv("PS2X_GPU_NO_TIMESTAMPS"))
+        if (ps2perf::enabled() && !std::getenv("PS2X_GPU_NO_TIMESTAMPS") && ps2settings::get().gpuTimestamps != 0)
         {
             DebugMode debug = {};
             debug.timestamps = true; // GPU time per second in Graphicslogs.txt
             s.iface.set_debug_mode(debug);
         }
+        // paraLLEl-GS hands queued work to the GPU after 4096 primitives by default: four times a
+        // frame in a battle, each costing several GPU queue submissions (about 1100 a second in
+        // all). The GPU is far from busy here, so one submission at the end of each frame (65536
+        // primitives is more than a battle frame holds) halves that (settings.ini can override).
+        ParallelGS::set_minimum_primitives_for_flush(ps2settings::get().gpuFlushPrimitives > 0
+                                                         ? static_cast<uint32_t>(ps2settings::get().gpuFlushPrimitives)
+                                                         : 65536u);
+        setFeedBatching(ps2settings::get().gpuFeedBatch != 0);
         s.superSampling = static_cast<uint32_t>(gsOptions.super_sampling);
         g_currentSuperSampling.store(s.superSampling);
 
@@ -488,17 +505,29 @@ namespace ps2gpu
         constexpr size_t kFeedMaxBytes = 32u << 20; // the producer waits beyond this much data
         constexpr uint32_t kFeedMaxFrames = 1u;     // ... or when a whole frame is still waiting
 
-        std::mutex g_feedMutex;
-        std::condition_variable g_feedWorkCv;
-        std::condition_variable g_feedDoneCv;
+        ps2sync::Mutex g_feedMutex;
+        ps2sync::CondVar g_feedWorkCv;
+        ps2sync::CondVar g_feedDoneCv;
         std::deque<FeedItem> g_feed;
         size_t g_feedBytes = 0;
         uint32_t g_feedFrames = 0;
         bool g_feedBusy = false;
         bool g_feedStop = false;
+        bool g_feedSleeping = false;           // under g_feedMutex: the feed thread waits for work
+        uint32_t g_feedWaiters = 0;            // under g_feedMutex: threads waiting on g_feedDoneCv
+        std::vector<std::vector<uint8_t>> g_feedPool; // under g_feedMutex: emptied packet buffers to reuse
         std::thread g_feedThread;
         std::atomic<bool> g_feedOn{false};
         thread_local bool t_onFeedThread = false;
+        std::atomic<uint64_t> g_feedItemCount{0}, g_feedSleepCount{0}; // packets handed over, times the feed thread slept
+        // Packets come in about 10 microseconds apart in a big battle (90,000+ a second). Waking the
+        // feed thread for each one cost more kernel time (on both threads) than the packets
+        // themselves, so a sleeping feed thread is woken once a batch has built up, at every
+        // VBlank, and whenever someone needs what is queued (a GS register read, a drain).
+        constexpr size_t kFeedWakeItems = 24u;
+        constexpr size_t kFeedWakeBytes = 96u << 10;
+        std::atomic<bool> g_feedBatching{true};
+        size_t g_feedPendingItems = 0; // under g_feedMutex: queued since the feed thread last took the queue
 
         void gifTransferNow(uint32_t path, const uint8_t *data, size_t size);
         void vsyncNow(const Scanout &scanout);
@@ -507,30 +536,57 @@ namespace ps2gpu
         {
             t_onFeedThread = true;
             ps2perf::registerThread("GS feed thread");
+            std::deque<FeedItem> batch;
             for (;;)
             {
-                FeedItem item;
                 {
-                    std::unique_lock<std::mutex> lock(g_feedMutex);
-                    g_feedWorkCv.wait(lock, [] { return g_feedStop || !g_feed.empty(); });
+                    std::unique_lock<ps2sync::Mutex> lock(g_feedMutex);
+                    if (g_feed.empty() && !g_feedStop)
+                    {
+                        g_feedSleepCount.fetch_add(1u, std::memory_order_relaxed);
+                        g_feedSleeping = true;
+                        g_feedWorkCv.wait(lock, [] { return g_feedStop || !g_feed.empty(); });
+                        g_feedSleeping = false;
+                    }
                     if (g_feed.empty())
                         return; // stopping, and everything handed over has been fed
-                    item = std::move(g_feed.front());
-                    g_feed.pop_front();
+                    batch.swap(g_feed); // everything queued so far, in order
+                    g_feedPendingItems = 0;
                     g_feedBusy = true;
                 }
-                if (item.vsync)
-                    vsyncNow(item.scanout);
-                else
-                    gifTransferNow(item.path, item.bytes.data(), item.bytes.size());
+                for (FeedItem &item : batch)
                 {
-                    std::lock_guard<std::mutex> lock(g_feedMutex);
-                    g_feedBytes -= item.bytes.size();
                     if (item.vsync)
-                        --g_feedFrames;
-                    g_feedBusy = false;
+                        vsyncNow(item.scanout);
+                    else
+                        gifTransferNow(item.path, item.bytes.data(), item.bytes.size());
+                    // Give this item's share of the budget back right away, so a waiting producer
+                    // does not wait for the rest of the batch.
+                    bool wake = false;
+                    {
+                        std::lock_guard<ps2sync::Mutex> lock(g_feedMutex);
+                        g_feedBytes -= item.bytes.size();
+                        if (item.vsync)
+                            --g_feedFrames;
+                        if (item.bytes.capacity() != 0u && g_feedPool.size() < 64u)
+                        {
+                            item.bytes.clear();
+                            g_feedPool.push_back(std::move(item.bytes));
+                        }
+                        wake = g_feedWaiters != 0u;
+                    }
+                    if (wake)
+                        g_feedDoneCv.notify_all();
                 }
-                g_feedDoneCv.notify_all();
+                batch.clear();
+                bool wake = false;
+                {
+                    std::lock_guard<ps2sync::Mutex> lock(g_feedMutex);
+                    g_feedBusy = false;
+                    wake = g_feedWaiters != 0u;
+                }
+                if (wake)
+                    g_feedDoneCv.notify_all();
             }
         }
 
@@ -541,15 +597,39 @@ namespace ps2gpu
 
         void enqueueFeed(FeedItem &&item)
         {
-            std::unique_lock<std::mutex> lock(g_feedMutex);
-            g_feedDoneCv.wait(lock, [&item]
-                              { return g_feedStop || (g_feedBytes < kFeedMaxBytes && (!item.vsync || g_feedFrames < kFeedMaxFrames)); });
+            std::unique_lock<ps2sync::Mutex> lock(g_feedMutex);
+            auto roomFor = [&item]
+            { return g_feedStop || (g_feedBytes < kFeedMaxBytes && (!item.vsync || g_feedFrames < kFeedMaxFrames)); };
+            if (!roomFor())
+            {
+                ++g_feedWaiters;
+                g_feedDoneCv.wait(lock, roomFor);
+                --g_feedWaiters;
+            }
             g_feedBytes += item.bytes.size();
             if (item.vsync)
                 ++g_feedFrames;
+            const bool vsync = item.vsync;
             g_feed.push_back(std::move(item));
+            ++g_feedPendingItems;
+            const bool wake = g_feedSleeping &&
+                              (vsync || !g_feedBatching.load(std::memory_order_relaxed) || g_feedPendingItems >= kFeedWakeItems ||
+                               g_feedBytes >= kFeedWakeBytes);
             lock.unlock();
-            g_feedWorkCv.notify_one();
+            g_feedItemCount.fetch_add(1u, std::memory_order_relaxed);
+            if (wake)
+                g_feedWorkCv.notify_one();
+        }
+
+        // A packet buffer for the feed: an emptied one when there is one (keeps its memory).
+        std::vector<uint8_t> takeFeedBuffer()
+        {
+            std::lock_guard<ps2sync::Mutex> lock(g_feedMutex);
+            if (g_feedPool.empty())
+                return {};
+            std::vector<uint8_t> buffer = std::move(g_feedPool.back());
+            g_feedPool.pop_back();
+            return buffer;
         }
 
         void startFeed()
@@ -567,7 +647,7 @@ namespace ps2gpu
             if (!g_feedOn.exchange(false))
                 return;
             {
-                std::lock_guard<std::mutex> lock(g_feedMutex);
+                std::lock_guard<ps2sync::Mutex> lock(g_feedMutex);
                 g_feedStop = true;
             }
             g_feedWorkCv.notify_all();
@@ -577,12 +657,38 @@ namespace ps2gpu
         }
     }
 
+    void kickFeed() noexcept
+    {
+        if (!g_feedOn.load(std::memory_order_relaxed) || t_onFeedThread)
+            return;
+        bool wake = false;
+        {
+            std::lock_guard<ps2sync::Mutex> lock(g_feedMutex);
+            wake = g_feedSleeping && !g_feed.empty();
+        }
+        if (wake)
+            g_feedWorkCv.notify_one();
+    }
+
+    void setFeedBatching(bool enabled) noexcept
+    {
+        g_feedBatching.store(enabled, std::memory_order_relaxed);
+    }
+
     void drainFeed()
     {
         if (!g_feedOn.load(std::memory_order_acquire) || t_onFeedThread)
             return;
-        std::unique_lock<std::mutex> lock(g_feedMutex);
-        g_feedDoneCv.wait(lock, [] { return g_feedStop || (g_feed.empty() && !g_feedBusy); });
+        std::unique_lock<ps2sync::Mutex> lock(g_feedMutex);
+        auto drained = [] { return g_feedStop || (g_feed.empty() && !g_feedBusy); };
+        if (g_feedSleeping && !g_feed.empty())
+            g_feedWorkCv.notify_one();
+        if (!drained())
+        {
+            ++g_feedWaiters;
+            g_feedDoneCv.wait(lock, drained);
+            --g_feedWaiters;
+        }
     }
 
     void gifTransfer(uint32_t path, const uint8_t *data, size_t size)
@@ -593,6 +699,7 @@ namespace ps2gpu
         {
             FeedItem item;
             item.path = path;
+            item.bytes = takeFeedBuffer();
             item.bytes.assign(data, data + (size & ~static_cast<size_t>(15u)));
             enqueueFeed(std::move(item));
             return;
@@ -611,7 +718,7 @@ namespace ps2gpu
             ps2perf::count(ps2perf::GifBytes, size);
         }
         State &s = st();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
         s.iface.gif_transfer(path & 3u, data, size & ~static_cast<size_t>(15u));
         // Hand finished pictures to the window as early as possible.
@@ -633,7 +740,7 @@ namespace ps2gpu
         packet[3] = reg;
         State &s = st();
         {
-            std::lock_guard<std::mutex> lock(s.mutex);
+            std::lock_guard<ps2sync::Mutex> lock(s.mutex);
             if (!s.warnedRegisterWrite)
             {
                 s.warnedRegisterWrite = true;
@@ -690,7 +797,7 @@ namespace ps2gpu
     {
         ps2perf::Scope scope(ps2perf::GpuFrame);
         State &s = st();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
 
         if (const uint32_t wanted = g_requestedSuperSampling.exchange(0u); wanted != 0u && wanted != s.superSampling)
@@ -808,12 +915,46 @@ namespace ps2gpu
             ps2perf::count(ps2perf::GpuCopies, stats.num_copies);
             ps2perf::count(ps2perf::GpuPaletteUpdates, stats.num_palette_updates);
             double gpuSeconds = 0.0;
+            double byStage[static_cast<int>(TimestampType::Count)] = {};
             for (int t = 0; t < static_cast<int>(TimestampType::Count); ++t)
-                gpuSeconds += s.iface.get_accumulated_timestamps(static_cast<TimestampType>(t));
+            {
+                byStage[t] = s.iface.get_accumulated_timestamps(static_cast<TimestampType>(t));
+                gpuSeconds += byStage[t];
+            }
             if (gpuSeconds > s.gpuSecondsSeen)
             {
                 ps2perf::count(ps2perf::GpuBusyNs, static_cast<uint64_t>((gpuSeconds - s.gpuSecondsSeen) * 1e9));
                 s.gpuSecondsSeen = gpuSeconds;
+            }
+            // Every ten seconds: which GPU stage the time went to.
+            static double stageSeen[static_cast<int>(TimestampType::Count)] = {};
+            static auto stageSince = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            const double span = std::chrono::duration<double>(now - stageSince).count();
+            if (span >= 10.0)
+            {
+                double ms[static_cast<int>(TimestampType::Count)];
+                for (int t = 0; t < static_cast<int>(TimestampType::Count); ++t)
+                {
+                    ms[t] = (byStage[t] - stageSeen[t]) * 1000.0 / span;
+                    stageSeen[t] = byStage[t];
+                }
+                stageSince = now;
+                ps2perf::graphicsNote("           GPU time by stage (ms/s): sync to VRAM %.1f, VRAM copies %.1f, palettes %.1f, texture upload %.1f, "
+                                      "triangle setup %.1f, binning %.1f, shading %.1f, readback %.1f, vsync/scanout %.1f",
+                                      ms[0], ms[1], ms[2], ms[3], ms[4], ms[5], ms[6], ms[7], ms[8]);
+                ps2perf::graphicsNote("           GS feed thread: %.0f packets/s handed over, slept %.0f times/s",
+                                      static_cast<double>(g_feedItemCount.exchange(0)) / span, static_cast<double>(g_feedSleepCount.exchange(0)) / span);
+                uint64_t fc[ParallelGS::FlushCounterCount] = {};
+                ParallelGS::take_flush_counters(fc, ParallelGS::FlushCounterCount);
+                auto per = [span](uint64_t v) { return static_cast<double>(v) / span; };
+                const int rb = ParallelGS::FlushCounterReasonBase;
+                ps2perf::graphicsNote("           paraLLEl-GS: %.0f primitives/s, %.0f flushes/s -> %.0f GPU queue submits/s | work-queued flushes %.0f/s (primitives %.0f, passes %.0f, images %.0f, other %.0f) | "
+                                      "render passes ended by: FB change %.0f, overflow %.0f, texture hazard %.0f, copy hazard %.0f, submission %.0f, pressure %.0f, CPU access %.0f /s",
+                                      per(fc[ParallelGS::FlushCounterPrimitives]), per(fc[ParallelGS::FlushCounterSubmitCalls]), per(fc[ParallelGS::FlushCounterQueueSubmits]), per(fc[ParallelGS::FlushCounterPressure]),
+                                      per(fc[ParallelGS::FlushCounterPressurePrimitives]), per(fc[ParallelGS::FlushCounterPressurePasses]),
+                                      per(fc[ParallelGS::FlushCounterPressureImages]), per(fc[ParallelGS::FlushCounterPressureOther]),
+                                      per(fc[rb + 0]), per(fc[rb + 1]), per(fc[rb + 2]), per(fc[rb + 3]), per(fc[rb + 4]), per(fc[rb + 5]), per(fc[rb + 6]));
             }
         }
 
@@ -824,18 +965,24 @@ namespace ps2gpu
     }
     }
 
-    bool takeFrame(std::vector<uint8_t> &rgba, uint32_t &width, uint32_t &height, uint32_t &displayFbp)
+    bool takeFrame(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &displayFbp, bool &rawBgra)
     {
         State &s = st();
-        std::lock_guard<std::mutex> lock(s.frameMutex);
+        std::lock_guard<ps2sync::Mutex> lock(s.frameMutex);
         if (!s.frameFresh)
             return false;
-        rgba.swap(s.frame);
+        pixels.swap(s.frame);
         width = s.frameWidth;
         height = s.frameHeight;
         displayFbp = s.frameFbp;
+        rawBgra = s.frameRawBgra;
         s.frameFresh = false;
         return true;
+    }
+
+    void setRawBgraFrames(bool enabled) noexcept
+    {
+        g_rawBgraFrames.store(enabled, std::memory_order_relaxed);
     }
 
     void requestSuperSampling(uint32_t rate) noexcept
@@ -855,7 +1002,7 @@ namespace ps2gpu
         ps2perf::Scope scope(ps2perf::GpuSync); // downloads are counted where they start (VIF1_STAT.FDR)
         drainFeed(); // the transfer set-up may still be on its way to paraLLEl-GS
         State &s = st();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
         const uint32_t words = bytes / 16u;
         s.iface.read_transfer_fifo(dst, words);
@@ -868,7 +1015,7 @@ namespace ps2gpu
             return;
         stopFeed();
         State &s = st();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
         g_active.store(false, std::memory_order_release);
         s.device.wait_idle();
@@ -961,7 +1108,10 @@ namespace ps2gpu
     void writeRegister(uint8_t, uint64_t) {}
     Scanout captureScanout(const GSRegisters &) { return Scanout{}; }
     void vsync(const Scanout &) {}
-    bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, uint32_t &) { return false; }
+    bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, uint32_t &, bool &) { return false; }
+    void setRawBgraFrames(bool) noexcept {}
+    void kickFeed() noexcept {}
+    void setFeedBatching(bool) noexcept {}
     uint32_t readLocalToHost(uint8_t *, uint32_t) { return 0u; }
     void drainFeed() {}
     void requestSuperSampling(uint32_t) noexcept {}

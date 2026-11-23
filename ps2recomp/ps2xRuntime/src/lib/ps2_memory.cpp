@@ -3,6 +3,7 @@
 #include "runtime/ps2_mtvu.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_gpu_renderer.h"
 #include "ps2_log.h"
 #include "ps2_gs_download.h"
 #include "runtime/ps2_perf.h"
@@ -844,6 +845,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2gpu::kickFeed(); // packets still queued for the GPU may set CSR / SIGLBLID bits
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -892,6 +894,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2gpu::kickFeed(); // packets still queued for the GPU may set CSR / SIGLBLID bits
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -2687,6 +2690,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (isGsPrivReg(address))
     {
+        ps2gpu::kickFeed(); // packets still queued for the GPU may set CSR / SIGLBLID bits
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;

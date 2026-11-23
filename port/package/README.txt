@@ -13,7 +13,14 @@ Getting started
      made from. If another copy of the port on this PC was built before
      (an older version folder, say), Build reuses its files instead: that
      takes no extra disk space.
-  4. Click PLAY.
+  4. Optional: click "Build shaders". It prepares all 10,904 of the game's
+     GPU shader variants now and saves them as shadercache.bin next to
+     TMHO.exe (a few seconds; longer right after a graphics driver update),
+     so starting the game doesn't have to compile them and no effect
+     stutters the first time it appears. The game also adds any new shaders
+     to that file itself when you quit. Build them again after a graphics
+     driver update.
+  5. Click PLAY.
 
 From then on TMHO.exe shows the setup screen with PLAY ready; turn off
 "Show this screen at start" to go straight into the game. To pick another
@@ -28,7 +35,7 @@ Keys (or plug in a controller)
   C or Esc          Circle         Q / E        L1 / R1
   Z                 Square         Left/Right Shift   L2 / R2
   V                 Triangle
-  F2                settings (video, audio, game, UI colour)
+  F2                settings (video, audio, game, HUD, UI colour)
   F1                debugger
 
 To quit, close the window, or use F2 > Game > Quit game (press Quit twice).
@@ -51,6 +58,18 @@ Camera (F2 > Game)
   Field of view        How wide the battle camera sees (the game's own view is
                        65 degrees at 4:3, 81 at 16:9).
   Camera distance      How far the chase camera sits behind your car, 50-200%.
+
+Battle HUD (F2 > HUD)
+  Edit HUD layout      Shows the radar and the weapon panel over your own game
+                       picture: drag a piece to move it, scroll or drag a
+                       corner to resize it (arrow keys nudge it, Tab switches
+                       piece, R resets the piece, Enter closes). Best opened
+                       during a battle.
+  Radar size, Weapon panel size   40-250 %.
+  Snap to screen edges Moves both pieces right into the corners of the screen,
+                       keeping the sizes you picked.
+  Reset HUD layout     Puts the HUD back where it starts: right at the screen
+                       edges in 16:9, where the game has it in 4:3.
 
 Record screenshots (F2 > Game) saves a picture of the game every half second
 in Logs\frames (pictures older than 10 minutes are deleted). Handy for bug
