@@ -73,8 +73,9 @@ A controller works too; the keyboard keeps working alongside it.
 - **Replaceable font** (V6.2, Vulkan renderer): a `textures/font_atlas.png` next to TMHO.exe
   (the game's 16×16 grid of letters, upright, redrawn at 2, 4, 8 or 16 times the size) is used
   for every piece of text instead of the game's 512×512 font texture. It is mipmapped, so it
-  stays clean at every internal resolution, and the higher the internal resolution, the more
-  of its detail shows. No font picture ships with the port.
+  stays clean at every internal resolution. Since V6.3 its text is shaded per sample at 2x and
+  4x (paraLLEl-GS otherwise shades sprites once per native pixel), so letters get sharper with
+  the internal resolution instead of losing thin strokes. No font picture ships with the port.
 - **Lighting fix**: the COP2 instruction fix from PCSX2's game database, which corrects
   lighting that came out wrong when the vector unit was read too early.
 

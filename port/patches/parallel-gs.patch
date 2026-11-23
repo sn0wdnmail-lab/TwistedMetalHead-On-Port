@@ -1,5 +1,5 @@
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
-index ea00016..4a72584 100644
+index ea00016..29c747f 100644
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
 @@ -132,6 +132,8 @@ static bool write_mask_is_16bit_channel_slice(uint32_t psm, uint32_t color_mask)
@@ -41,7 +41,7 @@ index ea00016..4a72584 100644
  		render_pass.tex_infos.push_back(info);
  		render_pass.tex0_infos.push_back(ctx.tex0.desc);
  		render_pass.held_images.push_back(std::move(image));
-@@ -1811,6 +1836,87 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+@@ -1811,6 +1836,89 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
  	return texture_index;
  }
  
@@ -73,7 +73,8 @@ index ea00016..4a72584 100644
 +// primitive gets a fixed LOD here: the level where about one or two replacement texels land on
 +// each output pixel (bilinear within the level).
 +void GSInterface::apply_replacement_lod(PrimitiveAttribute &prim_attr, const VertexPosition *pos,
-+                                        const VertexAttribute *attr, uint32_t count, const TextureInfo &info) const
++                                        const VertexAttribute *attr, uint32_t count, const TextureInfo &info,
++                                        bool per_sample) const
 +{
 +	const auto &prim = registers.prim;
 +	const auto &ctx = registers.ctx[prim.desc.CTXT];
@@ -103,8 +104,9 @@ index ea00016..4a72584 100644
 +		x_lo = std::min(x_lo, x); x_hi = std::max(x_hi, x);
 +		y_lo = std::min(y_lo, y); y_hi = std::max(y_hi, y);
 +	}
-+	float dx = (x_hi - x_lo) * float(1u << sampling_rate_x_log2);
-+	float dy = (y_hi - y_lo) * float(1u << sampling_rate_y_log2);
++	// Screen size in shaded samples: the LOD is the mip whose texels are about one sample apart.
++	float dx = (x_hi - x_lo) * float(1u << (per_sample ? sampling_rate_x_log2 : 0u));
++	float dy = (y_hi - y_lo) * float(1u << (per_sample ? sampling_rate_y_log2 : 0u));
 +	float ratio = 0.0f;
 +	if (dx > 0.0f)
 +		ratio = std::max(ratio, (u_hi - u_lo) * info.replacement_scale / dx);
@@ -129,20 +131,39 @@ index ea00016..4a72584 100644
  void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb)
  {
  	if (!get_and_clear_dirty_flag(STATE_DIRTY_PRIM_TEMPLATE_BIT))
-@@ -2687,6 +2793,12 @@ void GSInterface::drawing_kick_append()
+@@ -2687,6 +2795,18 @@ void GSInterface::drawing_kick_append()
  	PrimitiveAttribute prim_attr;
  	prim_attr.tex = prim_state.tex;
  	prim_attr.tex2 = prim_state.tex2;
++	bool replaced_texture = false;
 +	if (prim.desc.TME)
 +	{
 +		uint32_t tex_index = prim_attr.tex & ((1u << TEX_TEXTURE_INDEX_BITS) - 1u);
 +		if (tex_index < render_pass.tex_infos.size() && render_pass.tex_infos[tex_index].replacement_levels != 0)
-+			apply_replacement_lod(prim_attr, pos, attr, num_vertices, render_pass.tex_infos[tex_index]);
++		{
++			// Sprites are shaded per sample below; other primitives may be shaded once per
++			// native pixel (decided on the GPU), so their LOD assumes native pixels.
++			apply_replacement_lod(prim_attr, pos, attr, num_vertices, render_pass.tex_infos[tex_index], quad);
++			replaced_texture = true;
++		}
 +	}
  	prim_attr.state = prim_state.state;
  	prim_attr.fbmsk = ctx.frame.desc.FBMSK;
  	prim_attr.fogcol = registers.fogcol.words[0];
-@@ -4268,6 +4380,7 @@ void GSInterface::flush()
+@@ -2719,6 +2839,12 @@ void GSInterface::drawing_kick_append()
+ 		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
+ 	}
+ 
++	// [ps2x] Sprites are normally shaded once per native pixel when super-sampling (UI is kept at
++	// native resolution). A replacement texture has the detail for every sample, and its LOD is
++	// chosen per sample, so shade those sprites per sample: coverage and texture coordinates.
++	if (replaced_texture && quad)
++		prim_attr.state &= ~((1u << STATE_BIT_SNAP_RASTER) | (1u << STATE_BIT_SNAP_ATTRIBUTE));
++
+ 	prim_attr.state |= render_pass.current_instance << STATE_VERTEX_RENDER_PASS_INSTANCE_OFFSET;
+ 
+ 	// If our damage region expands, then mark hazards.
+@@ -4268,6 +4394,7 @@ void GSInterface::flush()
  {
  	flush_pending_transfer(true);
  	uint64_t value = tracker.mark_submission_timeline();
@@ -151,7 +172,7 @@ index ea00016..4a72584 100644
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
 diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
-index 9f05da8..d37c8c4 100644
+index 9f05da8..431d6b2 100644
 --- a/gs/gs_interface.hpp
 +++ b/gs/gs_interface.hpp
 @@ -251,11 +251,31 @@ public:
@@ -198,7 +219,7 @@ index 9f05da8..d37c8c4 100644
 +		Vulkan::ImageHandle image;
 +	} texture_replacement;
 +	void apply_replacement_lod(PrimitiveAttribute &prim_attr, const VertexPosition *pos, const VertexAttribute *attr,
-+	                           uint32_t count, const TextureInfo &info) const;
++	                           uint32_t count, const TextureInfo &info, bool per_sample) const;
 +
  	struct PrimitiveTemplate
  	{

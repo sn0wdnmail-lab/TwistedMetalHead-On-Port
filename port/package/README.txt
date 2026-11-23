@@ -59,7 +59,8 @@ Sharper font (Vulkan renderer)
   replaces the game's font, so the text can be sharper than the game's own
   512 x 512 one. It is the same 16 x 16 grid of letters, upright, at 2, 4, 8
   or 16 times the size (2048 x 2048 is plenty, even at 4K). Every piece of
-  text in the game is drawn from it. Remove the file to get the game's own
+  text in the game is drawn from it at the full internal resolution, so the
+  letters are sharpest at 2x or 4x. Remove the file to get the game's own
   font back. Graphicslogs.txt notes whether it was used.
 
 Camera (F2 > Game)
