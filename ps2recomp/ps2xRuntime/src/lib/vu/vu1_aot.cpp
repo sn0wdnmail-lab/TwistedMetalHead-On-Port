@@ -28,7 +28,7 @@ bool &Vu1Aot::enabledFlag()
 
 Vu1Aot::Fn Vu1Aot::lookup(const uint8_t *code, uint32_t codeSize)
 {
-    if (!code || codeSize != 16384u)
+    if (!code || (codeSize != 16384u && codeSize != 4096u)) // VU1 or VU0 code memory
         return nullptr;
     const uint64_t hash = vufast::codeHash(code, codeSize);
     const Vu1AotProgram *found = nullptr;
@@ -48,14 +48,15 @@ Vu1Aot::Fn Vu1Aot::lookup(const uint8_t *code, uint32_t codeSize)
         std::lock_guard<std::mutex> lock(mutex);
         if (seen.insert(hash).second)
         {
+            const char *unit = codeSize == 4096u ? "VU0" : "VU1";
             if (found)
-                ps2perf::performanceNote("           VU1 microprogram image %016llx: compiled (%u pairs) - fast path",
+                ps2perf::performanceNote("           %s microprogram image %016llx: compiled (%u pairs) - fast path", unit,
                                          static_cast<unsigned long long>(hash), found->pairs);
             else
-                ps2perf::performanceNote("           VU1 microprogram image %016llx: not compiled - interpreter",
+                ps2perf::performanceNote("           %s microprogram image %016llx: not compiled - interpreter", unit,
                                          static_cast<unsigned long long>(hash));
-            std::fprintf(stderr, "[vu1-aot] image %016llx: %s\n", static_cast<unsigned long long>(hash),
-                         found ? "compiled" : "interpreted");
+            std::fprintf(stderr, "[%s-aot] image %016llx: %s\n", codeSize == 4096u ? "vu0" : "vu1",
+                         static_cast<unsigned long long>(hash), found ? "compiled" : "interpreted");
         }
     }
     return found ? found->fn : nullptr;

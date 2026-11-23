@@ -8,6 +8,7 @@
 // Threads: init/gifTransfer/vsync/shutdown are called on the game thread (init may also run on
 // the window thread before the game starts); takeFrame is called on the window thread.
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -73,4 +74,22 @@ namespace ps2gpu
     uint32_t currentSuperSampling() noexcept;
 
     void shutdown();
+
+    // ---- Shader cache (shadercache.bin beside the executable) ----
+    // The Vulkan pipelines paraLLEl-GS builds are kept in a pipeline cache: init() loads it and
+    // shutdown() saves it back, so a pipeline is compiled once per graphics driver, not per start.
+    std::string shaderCachePath();
+    // Bytes in shadercache.bin, 0 when there is none.
+    uint64_t shaderCacheBytes();
+    struct ShaderBuildProgress
+    {
+        std::atomic<uint32_t> done{0};   // shader variants compiled so far
+        std::atomic<uint32_t> total{0};  // variants to compile (known once the device is up)
+        std::atomic<uint32_t> threads{0}; // CPU threads compiling
+        std::atomic<bool> cancel{false}; // set to stop early; what was compiled is still saved
+    };
+    // The setup screen's shader builder: compiles every GS shader variant paraLLEl-GS knows in
+    // advance with a Vulkan device of its own and saves the cache. Blocking (run it on a worker
+    // thread). gpuName: the graphics card it was built for. False with a reason on failure.
+    bool buildShaderCache(ShaderBuildProgress &progress, std::string &gpuName, std::string &error);
 }

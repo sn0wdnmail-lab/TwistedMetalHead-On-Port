@@ -1,4 +1,6 @@
 #include <deque>
+#include <chrono>
+#include <filesystem>
 #include <condition_variable>
 // GPU GS renderer bridge - see include/runtime/gs/gs_gpu_renderer.h.
 //
@@ -30,6 +32,26 @@
 #include "logging.hpp"
 #include "thread_id.hpp"
 
+namespace ps2launcher
+{
+    std::string executableDirectory(); // ps2_file_dialog.cpp
+}
+
+namespace
+{
+    // fopen for a UTF-8 path (Windows needs the wide-character name).
+    FILE *ps2gpuOpenFile(const std::string &path, const char *mode)
+    {
+#if defined(_WIN32)
+        const std::wstring wide = std::filesystem::u8path(path).wstring();
+        std::wstring wmode(mode, mode + std::strlen(mode));
+        return _wfopen(wide.c_str(), wmode.c_str());
+#else
+        return std::fopen(path.c_str(), mode);
+#endif
+    }
+}
+
 namespace ps2gpu
 {
     std::atomic<uint32_t> g_requestedSuperSampling{0u};
@@ -44,6 +66,58 @@ namespace ps2gpu
     {
         using namespace Vulkan;
         using namespace ParallelGS;
+
+        // shadercache.bin: a Vulkan pipeline cache with Granite's header (GPU UUID + hash), so a
+        // cache from another graphics card or driver is ignored and rebuilt.
+        size_t g_shaderCacheLoaded = 0; // bytes read at start: the game only writes the file back when it grew
+
+        bool loadShaderCache(Device &device)
+        {
+            std::vector<uint8_t> data;
+            if (FILE *f = ps2gpuOpenFile(shaderCachePath(), "rb"))
+            {
+                std::fseek(f, 0, SEEK_END);
+                const long size = std::ftell(f);
+                std::fseek(f, 0, SEEK_SET);
+                if (size > 0)
+                {
+                    data.resize(static_cast<size_t>(size));
+                    if (std::fread(data.data(), 1, data.size(), f) != data.size())
+                        data.clear();
+                }
+                std::fclose(f);
+            }
+            const bool ok = device.init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size());
+            g_shaderCacheLoaded = ok ? data.size() : 0u;
+            ps2perf::graphicsNote(" Shader cache: %s (%.1f MB)", data.empty() ? "none yet, shaders are compiled as needed" : "loaded",
+                                  static_cast<double>(data.size()) / (1024.0 * 1024.0));
+            return ok;
+        }
+
+        bool saveShaderCache(Device &device, bool onlyIfGrown)
+        {
+            const size_t size = device.get_pipeline_cache_size();
+            if (size == 0)
+                return false;
+            if (onlyIfGrown && size <= g_shaderCacheLoaded)
+                return true; // no new shaders this run
+            std::vector<uint8_t> data(size);
+            if (!device.get_pipeline_cache_data(data.data(), size))
+                return false;
+            const std::string path = shaderCachePath();
+            const std::string temp = path + ".tmp";
+            FILE *f = ps2gpuOpenFile(temp, "wb");
+            if (!f)
+                return false;
+            const bool written = std::fwrite(data.data(), 1, size, f) == size;
+            std::fclose(f);
+            std::error_code ec;
+            if (written)
+                std::filesystem::rename(std::filesystem::u8path(temp), std::filesystem::u8path(path), ec);
+            else
+                std::filesystem::remove(std::filesystem::u8path(temp), ec);
+            return written && !ec;
+        }
 
         // Granite's log lines go to stderr as before and into Graphicslogs.txt.
         struct LogForward final : Util::LoggingInterface
@@ -341,6 +415,7 @@ namespace ps2gpu
         }
         s.device.set_context(s.context);
         s.device.init_frame_contexts(4);
+        loadShaderCache(s.device);
 
         GSOptions gsOptions = {};
         gsOptions.vram_size = 4u * 1024u * 1024u;
@@ -797,6 +872,77 @@ namespace ps2gpu
         registerThreadLocked(s);
         g_active.store(false, std::memory_order_release);
         s.device.wait_idle();
+        saveShaderCache(s.device, true);
+    }
+
+    std::string shaderCachePath()
+    {
+        return ps2launcher::executableDirectory() + "shadercache.bin";
+    }
+
+    uint64_t shaderCacheBytes()
+    {
+        std::error_code ec;
+        const auto size = std::filesystem::file_size(std::filesystem::u8path(shaderCachePath()), ec);
+        return ec ? 0u : static_cast<uint64_t>(size);
+    }
+
+    bool buildShaderCache(ShaderBuildProgress &progress, std::string &gpuName, std::string &error)
+    {
+        progress.done = 0;
+        progress.total = 0;
+        progress.threads = (std::thread::hardware_concurrency() + 1u) / 2u;
+        Util::register_thread_index(0);
+        if (!Context::init_loader(nullptr))
+        {
+            error = "No Vulkan driver was found.";
+            return false;
+        }
+        Context context;
+        context.set_num_thread_indices(1);
+        ContextCreationFlags flags = CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT;
+        if (!context.init_instance_and_device(nullptr, 0, nullptr, 0, flags))
+        {
+            error = "The Vulkan device could not be created.";
+            return false;
+        }
+        Device device;
+        device.set_context(context);
+        device.init_frame_contexts(4);
+        gpuName = device.get_gpu_properties().deviceName;
+        loadShaderCache(device);
+        {
+            GSInterface iface;
+            GSOptions options = {};
+            options.vram_size = 4u * 1024u * 1024u;
+            options.super_sampling = SuperSampling::X1;
+            options.dynamic_super_sampling = true;
+            options.super_sampled_textures = false;
+            if (!iface.init(&device, options))
+            {
+                error = "This graphics card or driver lacks a Vulkan feature paraLLEl-GS needs.";
+                return false;
+            }
+            // paraLLEl-GS starts compiling its shader variants on its own threads in init().
+            for (;;)
+            {
+                uint32_t d = 0, t = 0;
+                iface.get_shader_compilation_progress(d, t);
+                progress.total = t;
+                progress.done = std::min(d, t);
+                if (iface.shader_compilation_finished() || progress.cancel.load())
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            device.wait_idle();
+        } // GSInterface goes away here: a cancelled build stops after the variants in flight
+
+        if (!saveShaderCache(device, false))
+        {
+            error = "The shader cache could not be saved beside TMHO.exe.";
+            return false;
+        }
+        return true;
     }
 }
 
@@ -821,6 +967,13 @@ namespace ps2gpu
     void requestSuperSampling(uint32_t) noexcept {}
     uint32_t currentSuperSampling() noexcept { return 1u; }
     void shutdown() {}
+    std::string shaderCachePath() { return {}; }
+    uint64_t shaderCacheBytes() { return 0; }
+    bool buildShaderCache(ShaderBuildProgress &, std::string &, std::string &error)
+    {
+        error = "this build has no Vulkan GS renderer";
+        return false;
+    }
 }
 
 #endif

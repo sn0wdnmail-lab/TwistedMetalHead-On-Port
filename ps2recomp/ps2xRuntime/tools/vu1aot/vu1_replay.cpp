@@ -1,5 +1,6 @@
-// vu1_replay: replays VU1 runs recorded with PS2X_VU1_CAPTURE=1 and checks the fast core
-// (interpreter and compiled programs) against what the game produced on the recording PC.
+// vu1_replay: replays VU1 runs recorded with PS2X_VU1_CAPTURE=1 (or VU0 runs recorded with
+// PS2X_VU0_CAPTURE=1) and checks the fast core (interpreter and compiled programs) against what
+// the game produced on the recording PC.
 //
 //   vu1_replay <capture dir> [--repeat N] [--mode interp|aot|both]
 //
@@ -33,6 +34,8 @@ namespace
         std::string name;
         uint64_t hash = 0;
         uint32_t startPc = 0, top = 0, itop = 0, maxCycles = 0, ended = 0, resume = 0;
+        bool vu0 = false;
+        uint32_t size = 16384; // code and data memory size of the unit
         VU1State before{}, after{};
         std::vector<uint8_t> dataBefore, dataAfter, gif;
         uint64_t cycles = 0;
@@ -68,17 +71,20 @@ namespace
             return false;
         uint32_t header[8];
         std::memcpy(header, p, sizeof(header)); p += sizeof(header);
-        if (header[0] != 0x52315556u)
+        if (header[0] != 0x52315556u && header[0] != 0x52305556u) // 'VU1R' / 'VU0R'
             return false;
+        run.vu0 = header[0] == 0x52305556u;
+        run.size = run.vu0 ? 4096u : 16384u;
+        const uint32_t size = run.size;
         run.startPc = header[2]; run.top = header[3]; run.itop = header[4]; run.maxCycles = header[5]; run.ended = header[6];
         run.resume = header[7];
         std::memcpy(&run.hash, p, 8); p += 8;
-        if (!readState(p, end, run.before) || end - p < 16384)
+        if (!readState(p, end, run.before) || end - p < size)
             return false;
-        run.dataBefore.assign(p, p + 16384); p += 16384;
-        if (!readState(p, end, run.after) || end - p < 16384 + 12)
+        run.dataBefore.assign(p, p + size); p += size;
+        if (!readState(p, end, run.after) || end - p < size + 12)
             return false;
-        run.dataAfter.assign(p, p + 16384); p += 16384;
+        run.dataAfter.assign(p, p + size); p += size;
         std::memcpy(&run.cycles, p, 8); p += 8;
         uint32_t gifSize = 0;
         std::memcpy(&gifSize, p, 4); p += 4;
@@ -104,10 +110,13 @@ namespace
     {
         auto &slot = g_units[Vu1Aot::enabled() ? 1 : 0][run.hash];
         if (!slot)
-            slot = std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU1);
+            slot = std::make_unique<VU1Interpreter>(run.vu0 ? VU1Interpreter::Unit::VU0 : VU1Interpreter::Unit::VU1);
         VU1Interpreter &vu = *slot;
-        std::memcpy(memory.getVU1Code(), code.data(), 16384);
-        std::memcpy(memory.getVU1Data(), run.dataBefore.data(), 16384);
+        uint8_t *const vuCode = run.vu0 ? memory.getVU0Code() : memory.getVU1Code();
+        uint8_t *const vuData = run.vu0 ? memory.getVU0Data() : memory.getVU1Data();
+        const uint32_t size = run.size;
+        std::memcpy(vuCode, code.data(), size);
+        std::memcpy(vuData, run.dataBefore.data(), size);
         vu.state() = run.before;
         out.gif.clear();
         Vu1Aot::setGifCapture(vu, &out.gif, false);
@@ -117,14 +126,13 @@ namespace
             // MSCNT: continue from the recorded state with a drained pipeline.
             Vu1Aot::resetPipeline(vu);
             vu.state() = run.before;
-            vu.resume(memory.getVU1Code(), 16384, memory.getVU1Data(), 16384, gs, &memory, run.top, run.itop, run.maxCycles);
+            vu.resume(vuCode, size, vuData, size, gs, &memory, run.top, run.itop, run.maxCycles);
         }
         else
-            vu.execute(memory.getVU1Code(), 16384, memory.getVU1Data(), 16384, gs, &memory, run.startPc, run.top, run.itop,
-                       run.maxCycles);
+            vu.execute(vuCode, size, vuData, size, gs, &memory, run.startPc, run.top, run.itop, run.maxCycles);
         out.cycles = Vu1Aot::cycle(vu) - start;
         out.state = vu.state();
-        out.data.assign(memory.getVU1Data(), memory.getVU1Data() + 16384);
+        out.data.assign(vuData, vuData + size);
     }
 
     // Returns a description of the first difference, or empty.
@@ -237,7 +245,7 @@ int main(int argc, char **argv)
             std::snprintf(name, sizeof(name), "code_%016" PRIx64 ".bin", run.hash);
             std::ifstream in(dir / name, std::ios::binary);
             std::vector<uint8_t> code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            if (code.size() != 16384)
+            if (code.size() != run.size)
                 continue;
             codes[run.hash] = std::move(code);
         }
@@ -283,7 +291,7 @@ int main(int argc, char **argv)
             if ((core == 0 && !doInterp) || (core == 1 && !doAot))
                 continue;
             Vu1Aot::enabledFlag() = core == 1;
-            g_ignoreSticky = core == 1;
+            g_ignoreSticky = core == 1 && !run.vu0; // VU0 keeps every flag: the EE reads them afterwards
             Outcome out;
             execute(memory, gs, codes[run.hash], run, out);
             const std::string diff = compare(out.state, out.data, out.gif, out.cycles, run.after, run.dataAfter, run.gif, run.cycles);
@@ -312,10 +320,12 @@ int main(int argc, char **argv)
         for (int r = 0; r < repeat; ++r)
             for (const Run &run : runs)
             {
-                std::memcpy(memory.getVU1Code(), codes[run.hash].data(), 16384);
-                std::memcpy(memory.getVU1Data(), run.dataBefore.data(), 16384);
+                uint8_t *const vuCode = run.vu0 ? memory.getVU0Code() : memory.getVU1Code();
+                uint8_t *const vuData = run.vu0 ? memory.getVU0Data() : memory.getVU1Data();
+                std::memcpy(vuCode, codes[run.hash].data(), run.size);
+                std::memcpy(vuData, run.dataBefore.data(), run.size);
                 out.state = run.before;
-                out.data.assign(memory.getVU1Data(), memory.getVU1Data() + 16384);
+                out.data.assign(vuData, vuData + run.size);
             }
         const double setup = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
         const auto t0 = std::chrono::steady_clock::now();

@@ -114,8 +114,56 @@ VU1Interpreter::VU1Interpreter(Unit unit)
     reset();
 }
 
+namespace
+{
+    bool fastCoreOnly()
+    {
+        // PS2X_VU_CORE = fast (default) | accurate | compare; see vuCoreMode() below.
+        static const bool fastOnly = []()
+        {
+            const char *env = std::getenv("PS2X_VU_CORE");
+            return !(env && (std::strcmp(env, "accurate") == 0 || std::strcmp(env, "compare") == 0));
+        }();
+        return fastOnly;
+    }
+}
+
 void VU1Interpreter::resetScheduler()
 {
+    if (fastCoreOnly())
+    {
+        // The fast core only uses FDIV/EFU, the ready times, the flag ring and the branch backup.
+        // This runs at every microprogram start (VU0 calls, VU1 MSCALs): the accurate core's
+        // pipelines (several KB) are left alone, and ready times all in the past already read as
+        // ready, so they are only cleared when something is still in flight (m_accReady[3] holds
+        // the latest one, see Vu1Aot::pendingUntil).
+        m_fdiv = {};
+        m_efu = {};
+        if (m_accReady[3] > m_cycle)
+        {
+            m_vfReady = {};
+            m_viReady = {};
+            m_accReady[3] = 0;
+        }
+        m_efuResourceReady = 0;
+        m_xgkick.sourceAddress = 0;
+        m_xgkick.totalBytes = 0;
+        m_xgkick.copiedBytes = 0;
+        m_xgkick.currentTagEnd = 0;
+        m_xgkick.cycleCredit = 0;
+        m_xgkick.issueCycle = 0;
+        m_xgkick.active = false;
+        m_xgkick.currentTagEop = false;
+        m_workingClip = m_state.clip;
+        m_viBranchBackupValue = 0;
+        m_viBranchBackupReg = 0;
+        m_viBranchBackupValid = false;
+        m_stopRequested = false;
+        m_pendingHaltD = false;
+        m_pendingHaltT = false;
+        fastResetPipelines();
+        return;
+    }
     m_flagPipeline = {};
     m_fdiv = {};
     m_efu = {};
@@ -1685,6 +1733,7 @@ static void ps2xDumpVu1(const VU1State &st, const uint8_t *code, uint32_t codeSi
 //                                     entry point: registers + data memory before and after, the
 //                                     cycles used and the PATH1 packets it produced
 //   entries.txt                       runs and cycles per entry point (rewritten every 2000 runs)
+// PS2X_VU0_CAPTURE=1 does the same for VU0 microprograms (4 KB code and data) in Logs/vu0capture.
 // ---------------------------------------------------------------------------------------------
 namespace
 {
@@ -1707,30 +1756,38 @@ namespace
         std::set<uint64_t> savedImages;
     };
 
+    Vu1Capture *makeCapture(const char *envName, const char *dirName)
+    {
+        auto *c = new Vu1Capture;
+        const char *env = std::getenv(envName);
+        c->enabled = env && *env && *env != '0';
+        if (const char *runs = std::getenv("PS2X_VU1_CAPTURE_RUNS"); runs && *runs)
+            c->runsPerEntry = static_cast<uint32_t>(std::max(0, std::atoi(runs)));
+        if (c->enabled)
+        {
+            c->dir = ps2perf::logDirectory() + "/" + dirName;
+#if defined(_WIN32)
+            for (char &ch : c->dir)
+                if (ch == '/')
+                    ch = '\\';
+            _mkdir(c->dir.c_str());
+#else
+            mkdir(c->dir.c_str(), 0755);
+#endif
+            std::fprintf(stderr, "[vu-capture] writing to %s\n", c->dir.c_str());
+        }
+        return c;
+    }
+
     Vu1Capture &vu1Capture()
     {
-        static Vu1Capture *capture = []()
-        {
-            auto *c = new Vu1Capture;
-            const char *env = std::getenv("PS2X_VU1_CAPTURE");
-            c->enabled = env && *env && *env != '0';
-            if (const char *runs = std::getenv("PS2X_VU1_CAPTURE_RUNS"); runs && *runs)
-                c->runsPerEntry = static_cast<uint32_t>(std::max(0, std::atoi(runs)));
-            if (c->enabled)
-            {
-                c->dir = ps2perf::logDirectory() + "/vu1capture";
-#if defined(_WIN32)
-                for (char &ch : c->dir)
-                    if (ch == '/')
-                        ch = '\\';
-                _mkdir(c->dir.c_str());
-#else
-                mkdir(c->dir.c_str(), 0755);
-#endif
-                std::fprintf(stderr, "[vu1-capture] writing to %s\n", c->dir.c_str());
-            }
-            return c;
-        }();
+        static Vu1Capture *capture = makeCapture("PS2X_VU1_CAPTURE", "vu1capture");
+        return *capture;
+    }
+
+    Vu1Capture &vu0Capture()
+    {
+        static Vu1Capture *capture = makeCapture("PS2X_VU0_CAPTURE", "vu0capture");
         return *capture;
     }
 
@@ -1791,6 +1848,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     Vu1Capture *const captureContext =
         (vu1Capture().enabled && m_unit == Unit::VU1 && memory && vuCode && vuData && codeSize == 16384u && dataSize == 16384u)
             ? &vu1Capture()
+        : (vu0Capture().enabled && m_unit == Unit::VU0 && memory && vuCode && vuData && codeSize == 4096u && dataSize == 4096u)
+            ? &vu0Capture()
             : nullptr;
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
@@ -1832,9 +1891,10 @@ void VU1Interpreter::runCaptured(uint8_t *vuCode, uint32_t codeSize, uint8_t *vu
                                  GS &gs, PS2Memory *memory, uint32_t startPC, uint32_t top, uint32_t itop,
                                  uint32_t maxCycles, bool isResume)
 {
-    Vu1Capture *capture = &vu1Capture();
+    const bool vu0 = m_unit == Unit::VU0;
+    Vu1Capture *capture = vu0 ? &vu0Capture() : &vu1Capture();
 
-    const uint64_t generation = memory->getVU1CodeGeneration();
+    const uint64_t generation = vu0 ? memory->getVU0CodeGeneration() : memory->getVU1CodeGeneration();
     if (generation != capture->generation)
     {
         capture->generation = generation;
@@ -1872,7 +1932,8 @@ void VU1Interpreter::runCaptured(uint8_t *vuCode, uint32_t codeSize, uint8_t *vu
                       before.pc, stats.captured);
         if (FILE *f = std::fopen(capturePath(*capture, name).c_str(), "wb"))
         {
-            const uint32_t header[8] = {0x52315556u /* 'VU1R' */, 1u, startPC, top, itop, maxCycles, m_lastRunEnded ? 1u : 0u, isResume ? 1u : 0u};
+            const uint32_t header[8] = {vu0 ? 0x52305556u /* 'VU0R' */ : 0x52315556u /* 'VU1R' */, 1u, startPC, top, itop, maxCycles,
+                                        m_lastRunEnded ? 1u : 0u, isResume ? 1u : 0u};
             std::fwrite(header, sizeof(uint32_t), 8, f);
             std::fwrite(&capture->hash, sizeof(uint64_t), 1, f);
             writeState(f, before);
@@ -1902,6 +1963,8 @@ void VU1Interpreter::runCaptured(uint8_t *vuCode, uint32_t codeSize, uint8_t *vu
             writeEntries(*capture);
         }
     }
+    if (vu0 && (capture->totalRuns % 100000u) == 0u)
+        writeEntries(*capture); // VU0 runs come thousands a second: also rewrite it on a run count
 }
 
 void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,

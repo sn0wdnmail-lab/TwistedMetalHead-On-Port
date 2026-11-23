@@ -24,7 +24,10 @@ memory cards.
    image next to `TMHO.exe`, or in a `Game Rom` folder one or two levels up, is found by itself.
 4. Click **Build game**. It copies the game's files from the disc into a `game` folder (about
    4.1 GB) and checks that the game program is the version the port was made from.
-5. Click **PLAY**.
+5. Optional: click **Build shaders**. It prepares all of the GPU renderer's shader variants
+   (10,904 of them) and saves them as `shadercache.bin` next to `TMHO.exe`, so the game starts
+   without compiling them and no effect stutters the first time it appears.
+6. Click **PLAY**.
 
 Needs Windows 10/11 (64-bit) and a graphics card with Vulkan. Keep the `.iso` where it is: the
 game still streams music and movies from it. Saves go in the `saves` folder next to `TMHO.exe`.
@@ -51,8 +54,8 @@ A controller works too; the keyboard keeps working alongside it.
   game modes are part of it. Most of the testing so far has been Challenge matches on Big Blue
   Stadium and the movies; reports from other modes and battlegrounds are welcome.
 - **Setup screen** that builds the game from your disc image, checks the version, finds your
-  disc by itself, reuses the files of another copy of the port on the same PC, and can be
-  skipped at start.
+  disc by itself, reuses the files of another copy of the port on the same PC, builds the
+  shader cache, and can be skipped at start.
 - **Memory cards** saved as files (`saves\mc0`, `saves\mc1`).
 
 ### Graphics
@@ -83,12 +86,29 @@ A controller works too; the keyboard keeps working alongside it.
 - Master volume and **mute when the window is in the background**.
 
 ### Performance
-- The vector-unit (VU1) microprograms run on a fast core, with the game's programs compiled
-  ahead of time, on a **CPU core of their own**.
-- **GS feed thread**: the graphics packets are parsed and handed to the GPU on another core, so
-  the vector unit is not slowed down by them.
-- On a Ryzen 7 3700X with an RTX 2080 SUPER, a one-opponent match runs at **full speed (60 fps)
-  in 16:9 at 2x internal resolution**.
+- **Full speed in big battles.** On a Ryzen 7 3700X with an RTX 2080 SUPER (16:9, Auto/2x
+  internal resolution), Challenge matches on Big Blue Stadium with **three opponents now run at
+  100% speed / 60 fps** (they ran at 70–85% before), and with **five opponents** at 100% nearly
+  all the time, with an occasional two-second stretch at 92–99% in the heaviest explosions.
+- **Both vector units' microprograms are compiled ahead of time** to native code, and checked
+  bit for bit (registers, memory, flags, graphics output and cycle counts) against runs recorded
+  from the game:
+  - **VU1** (3D geometry) uses a two-tier compiler: a static tier that works out the VU1's
+    pipeline stalls, flag timing and branch delay slots while compiling, so the common paths run
+    with no runtime pipeline bookkeeping, and a dynamic tier for everything else. In recorded
+    runs it takes 3.1 ns per VU cycle: **2x faster** than the previous compiled code (6.5 ns)
+    and 6.5x faster than the interpreter core (20 ns).
+  - **VU0** (the game's physics and maths helpers, called about 80,000 times a second in a big
+    battle) is compiled the same way, keeping every flag the CPU reads back: **2.2x faster** in
+    recorded runs, and its share of the game thread fell from about 150–210 to 75–100 ms per
+    second in a five-opponent battle.
+- The VU1 runs on a **CPU core of its own**, and a **GS feed thread** parses the graphics
+  packets and hands them to the GPU on another core.
+- **Shader cache**: the GPU renderer's pipelines are kept in `shadercache.bin` (made by Build
+  shaders on the setup screen, and topped up by the game when it compiled anything new), so the
+  start-up precompile is a cache load: all 10,904 variants load in under a second.
+- The performance log's profiler samples the VU1 thread as well as the game thread, and its
+  timers use QueryPerformanceCounter directly (cheaper than the C runtime clock it used before).
 
 ### Accuracy
 - The PS2 CPU's floating-point rules are reproduced: no infinities or NaNs, clamping to the
@@ -103,6 +123,8 @@ A controller works too; the keyboard keeps working alongside it.
 - **Audio**: master volume, mute in the background.
 - **Game**: pause while the menu is open, FPS counter, screenshot recording, VU1 thread, game
   disc, field of view, camera distance, quit.
+- The **setup screen** (F2 > Game > Game disc > Setup, or "Show this screen at start") has the
+  disc, Build game and Build shaders.
 - **UI**: accent colour, menu opacity, which side the menu opens on.
 - Settings are kept in `settings.ini`.
 
@@ -121,9 +143,10 @@ A controller works too; the keyboard keeps working alongside it.
 
 ## Known issues
 
-- **Big battles can run below full speed.** With three opponents the game runs at about
-  70–85% speed on a Ryzen 7 3700X. The vector-unit (VU1) emulation is the limit: it needs more
-  than one CPU core's worth of work in the heaviest scenes.
+- **The heaviest five-opponent moments can dip briefly** (92–99% speed for a couple of
+  seconds on a Ryzen 7 3700X). The game thread and the VU1 thread are both close to a full core
+  then, and the game waits for the VU1 to finish each frame's drawing before it starts the next.
+  Slower CPUs will see more of this.
 - **No 120 fps yet.** The game's logic, physics and animations are tied to the PS2's 60 Hz
   frame clock, so a higher frame rate needs changes inside the game's systems, not just a
   setting (see the plans below).
@@ -137,8 +160,9 @@ A controller works too; the keyboard keeps working alongside it.
 
 ## Coming in the future
 
-- **Full speed in every battle**: a faster VU1 compiler (fewer pipeline checks where the
-  program does not need them, better register use), so the heaviest scenes stay at 60 fps.
+- **More headroom in the heaviest battles**: keeping VU registers in CPU registers across
+  compiled blocks, faster VIF1 unpacking, a faster I/O-processor core, and overlapping more of
+  each frame's VU1 work with the game's own work, so slower CPUs stay at 60 fps too.
 - **Native 120 fps** (and a frame-rate setting): running the game's frame timing, physics steps
   and animations at 120 Hz without speeding the game up and without interpolated frames.
 - **Widescreen menus**: the 2D menu screens kept at their shape (pillarboxed) or adapted to 16:9.

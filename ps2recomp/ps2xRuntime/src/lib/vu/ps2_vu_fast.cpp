@@ -532,17 +532,20 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
         }
     }
 
-    // Ahead-of-time compiled version of this code image (VU1 only), resolved once per upload.
-    static uint64_t s_aotImageHash = 0; // image of m_aotFn, for the compiled-code miss report
+    // Ahead-of-time compiled version of this code image, resolved once per upload. VU1 images
+    // (16 KB) and VU0 images (4 KB) share the table; each unit keeps its own m_aotFn.
+    static uint64_t s_aotImageHash[2] = {0, 0}; // image of m_aotFn per unit, for the compiled-code miss report
+    const int unitIndex = m_unit == Unit::VU1 ? 1 : 0;
     Vu1Aot::Fn aot = nullptr;
-    if (m_unit == Unit::VU1 && memory != nullptr && vuCode == memory->getVU1Code() && Vu1Aot::enabled())
+    if (memory != nullptr && Vu1Aot::enabled() &&
+        vuCode == (unitIndex ? memory->getVU1Code() : memory->getVU0Code()))
     {
-        const uint64_t generation = memory->getVU1CodeGeneration();
+        const uint64_t generation = unitIndex ? memory->getVU1CodeGeneration() : memory->getVU0CodeGeneration();
         if (generation != m_aotGeneration)
         {
             m_aotGeneration = generation;
             m_aotFn = reinterpret_cast<void *>(Vu1Aot::lookup(vuCode, codeSize));
-            s_aotImageHash = m_aotFn ? vufast::codeHash(vuCode, codeSize) : 0;
+            s_aotImageHash[unitIndex] = m_aotFn ? vufast::codeHash(vuCode, codeSize) : 0;
         }
         aot = reinterpret_cast<Vu1Aot::Fn>(m_aotFn);
     }
@@ -556,7 +559,7 @@ void VU1Interpreter::runFast(uint8_t *vuCode, uint32_t codeSize,
     {
         if (missPairs != 0u)
         {
-            ps2perf::vu1CompiledMiss(s_aotImageHash, missPc, missPairs);
+            ps2perf::vu1CompiledMiss(s_aotImageHash[unitIndex], missPc, missPairs);
             interpretedPairs += missPairs;
             missPairs = 0;
         }

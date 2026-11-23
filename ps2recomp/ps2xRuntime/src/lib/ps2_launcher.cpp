@@ -2,6 +2,7 @@
 
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_settings.h"
+#include "runtime/gs/gs_gpu_renderer.h"
 #include "ps2_settings_ui.h"
 
 #include "raylib.h"
@@ -573,11 +574,58 @@ namespace ps2launcher
             build->state = Build::Done;
         }
 
+        // ---------------------------------------------------------------- shader builder
+        // Compiles the GS shader variants into shadercache.bin beside the executable (see
+        // ps2gpu::buildShaderCache), so the game neither compiles them on its first frames nor
+        // hitches the first time an effect shows up.
+        struct ShaderBuild
+        {
+            enum State
+            {
+                Running,
+                Done,
+                Failed
+            };
+            std::atomic<int> state{Running};
+            ps2gpu::ShaderBuildProgress progress;
+            std::mutex mutex;
+            std::string gpuName;
+            std::string error;
+            double startTime = 0.0;
+            double seconds = 0.0;
+            bool handled = false;
+        };
+
+        void runShaderBuild(ShaderBuild *build)
+        {
+            std::string gpuName, error;
+            const bool ok = ps2gpu::buildShaderCache(build->progress, gpuName, error);
+            {
+                std::lock_guard<std::mutex> lock(build->mutex);
+                build->gpuName = gpuName;
+                build->error = error;
+            }
+            build->state = ok ? ShaderBuild::Done : ShaderBuild::Failed;
+        }
+
+        std::string seconds(double value)
+        {
+            char text[32];
+            if (value >= 60.0)
+                std::snprintf(text, sizeof(text), "%d min %02d s", static_cast<int>(value) / 60, static_cast<int>(value) % 60);
+            else if (value >= 10.0)
+                std::snprintf(text, sizeof(text), "%.0f s", value);
+            else
+                std::snprintf(text, sizeof(text), "%.1f s", value);
+            return text;
+        }
+
         // ---------------------------------------------------------------- screen
         enum Item
         {
             ItemBrowse,
             ItemBuild,
+            ItemShaders,
             ItemShowAtStart,
             ItemPlay,
             ItemCount
@@ -599,6 +647,9 @@ namespace ps2launcher
             int focus = ItemBrowse;
             std::unique_ptr<std::thread> worker;
             std::unique_ptr<Build> build;
+            std::unique_ptr<std::thread> shaderWorker;
+            std::unique_ptr<ShaderBuild> shaders;
+            uint64_t shaderBytes = 0; // shadercache.bin, 0 when there is none
             // disc check running in the background
             std::unique_ptr<std::thread> checker;
             std::mutex checkMutex;
@@ -739,6 +790,38 @@ namespace ps2launcher
             screen.reuseDir.clear();
         }
 
+        bool shadersRunning(const Screen &screen)
+        {
+            return screen.shaders && screen.shaders->state == ShaderBuild::Running;
+        }
+
+        void startShaderBuild(Screen &screen)
+        {
+            if (shadersRunning(screen))
+            {
+                screen.shaders->progress.cancel = true; // the button says "Stop" while it runs
+                return;
+            }
+            if (!ps2gpu::compiledIn())
+                return;
+            if (screen.shaderWorker && screen.shaderWorker->joinable())
+                screen.shaderWorker->join();
+            screen.shaders = std::make_unique<ShaderBuild>();
+            screen.shaders->startTime = GetTime();
+            screen.shaderWorker = std::make_unique<std::thread>(runShaderBuild, screen.shaders.get());
+        }
+
+        void pollShaderBuild(Screen &screen)
+        {
+            if (!screen.shaders || screen.shaders->handled || shadersRunning(screen))
+                return;
+            screen.shaders->handled = true;
+            screen.shaders->seconds = GetTime() - screen.shaders->startTime;
+            screen.shaderBytes = ps2gpu::shaderCacheBytes();
+            if (screen.shaders->state == ShaderBuild::Done && screen.focus == ItemShaders)
+                screen.focus = screen.built ? ItemPlay : ItemBuild;
+        }
+
         void selectDisc(Screen &screen, const std::string &path)
         {
             if (path.empty() || (screen.build && screen.build->state == Build::Running))
@@ -877,6 +960,7 @@ namespace ps2launcher
         Screen screen;
         screen.game = &game;
         screen.config = loadConfig();
+        screen.shaderBytes = ps2gpu::shaderCacheBytes();
 
         // Built before: check that it is still all there.
         uint64_t programSize = 0;
@@ -922,9 +1006,11 @@ namespace ps2launcher
         {
             pollCheck(screen);
             pollBuild(screen);
+            pollShaderBuild(screen);
             ps2settings::update(nullptr); // F2 drawer (accent colour, window size...) works here too
 
             const bool buildRunning = screen.build && screen.build->state == Build::Running;
+            const bool shaderRunning = shadersRunning(screen);
             const bool menuOpen = ps2settings::menuOpen();
             bool activate[ItemCount] = {};
             if (!menuOpen)
@@ -962,7 +1048,7 @@ namespace ps2launcher
             look.accentColor = ui::rgb(look.accent, 255);
             const float s = look.s;
             const float cardW = std::min(sw - 40.0f * s, 700.0f * s);
-            const float cardH = std::min(sh - 40.0f * s, 560.0f * s);
+            const float cardH = std::min(sh - 40.0f * s, 650.0f * s);
             const Rectangle card{std::floor((sw - cardW) * 0.5f), std::floor((sh - cardH) * 0.5f), cardW, cardH};
             const float pad = 32.0f * s;
             const float left = card.x + pad;
@@ -1095,6 +1181,71 @@ namespace ps2launcher
             }
             y += 92.0f * s;
 
+            // ---- 3. Shaders (optional)
+            {
+                const bool haveCache = screen.shaderBytes > 0;
+                const bool failed = screen.shaders && screen.shaders->handled && screen.shaders->state == ShaderBuild::Failed;
+                const bool justBuilt = screen.shaders && screen.shaders->handled && screen.shaders->state == ShaderBuild::Done;
+                stepBadge(look, left, y, 3, !haveCache && !shaderRunning, haveCache && !shaderRunning);
+                ui::text("Shaders", textLeft, y + 2.0f * s, 18.0f * s, kBody, true);
+                ui::text("optional", textLeft + ui::textWidth("Shaders", 18.0f * s, true) + 10.0f * s, y + 5.0f * s, 13.0f * s, kMuted, false);
+                if (shaderRunning)
+                {
+                    const uint32_t done = screen.shaders->progress.done.load();
+                    const uint32_t total = screen.shaders->progress.total.load();
+                    const float t = total ? static_cast<float>(done) / static_cast<float>(total) : 0.0f;
+                    const Rectangle track{textLeft, y + 30.0f * s, right - buttonW - 20.0f * s - textLeft, 8.0f * s};
+                    DrawRectangleRounded(track, 1.0f, 8, Color{40, 45, 56, 255});
+                    DrawRectangleRounded(Rectangle{track.x, track.y, std::max(track.height, track.width * t), track.height}, 1.0f, 8, look.accentColor);
+                    char line[160];
+                    if (total == 0)
+                        std::snprintf(line, sizeof(line), "Starting the graphics card...");
+                    else if (screen.shaders->progress.cancel.load())
+                        std::snprintf(line, sizeof(line), "Stopping - keeping the %u shaders already compiled...", done);
+                    else
+                        std::snprintf(line, sizeof(line), "%.0f%%  -  %u of %u shaders, %u CPU threads, %s", t * 100.0f, done, total,
+                                      screen.shaders->progress.threads.load(), seconds(GetTime() - screen.shaders->startTime).c_str());
+                    ui::text(fitPath(line, 14.0f * s, track.width).c_str(), textLeft, y + 46.0f * s, 14.0f * s, kMuted, false);
+                }
+                else if (failed)
+                {
+                    std::string message;
+                    {
+                        std::lock_guard<std::mutex> lock(screen.shaders->mutex);
+                        message = screen.shaders->error;
+                    }
+                    statusIcon(look, textLeft, y + 27.0f * s, kBad, false);
+                    ui::text(fitPath(message, 14.0f * s, textWidth - 24.0f * s).c_str(), textLeft + 24.0f * s, y + 26.0f * s, 14.0f * s, kBad, false);
+                }
+                else if (haveCache)
+                {
+                    std::string line;
+                    if (justBuilt)
+                    {
+                        std::lock_guard<std::mutex> lock(screen.shaders->mutex);
+                        line = "Built in " + seconds(screen.shaders->seconds) + " - " + megabytes(screen.shaderBytes) + " for " + screen.shaders->gpuName + ".";
+                    }
+                    else
+                        line = "Shader cache ready (" + megabytes(screen.shaderBytes) + ") - the game loads it at start.";
+                    statusIcon(look, textLeft, y + 27.0f * s, kGood, true);
+                    ui::text(fitPath(line, 14.0f * s, textWidth - 24.0f * s).c_str(), textLeft + 24.0f * s, y + 26.0f * s, 14.0f * s, kGood, false);
+                    ui::text("Build them again after a graphics driver update.", textLeft, y + 47.0f * s, 14.0f * s, kMuted, false);
+                }
+                else
+                {
+                    ui::text(fitPath("Compiles the game's GPU shaders now and saves them,", 14.0f * s, textWidth).c_str(), textLeft, y + 26.0f * s, 14.0f * s, kMuted, false);
+                    ui::text(fitPath("so starts are quicker and new effects don't stutter.", 14.0f * s, textWidth).c_str(), textLeft, y + 47.0f * s, 14.0f * s, kMuted, false);
+                }
+                const char *label = shaderRunning ? "Stop" : (haveCache ? "Rebuild shaders" : "Build shaders");
+                const Rectangle shaderRect{right - buttonW, y + 4.0f * s, buttonW, buttonH};
+                const bool enabled = ps2gpu::compiledIn() && !menuOpen && !(shaderRunning && screen.shaders->progress.cancel.load());
+                if (button(look, shaderRect, label, screen.focus == ItemShaders, enabled, false))
+                    activate[ItemShaders] = true;
+                if (!menuOpen && CheckCollisionPointRec(GetMousePosition(), shaderRect) && (GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f))
+                    screen.focus = ItemShaders;
+            }
+            y += 92.0f * s;
+
             // ---- Show this screen at start
             {
                 const Rectangle row{left, y - 6.0f * s, right - left, 40.0f * s};
@@ -1124,7 +1275,8 @@ namespace ps2launcher
 
             // ---- Play
             const Rectangle playRect{left, card.y + card.height - pad - 52.0f * s, right - left, 52.0f * s};
-            if (button(look, playRect, screen.built ? "PLAY" : "PLAY  -  build the game first", screen.focus == ItemPlay, screen.built && !buildRunning && !menuOpen, screen.built))
+            const char *playLabel = !screen.built ? "PLAY  -  build the game first" : (shaderRunning ? "PLAY  -  wait for the shaders" : "PLAY");
+            if (button(look, playRect, playLabel, screen.focus == ItemPlay, screen.built && !buildRunning && !shaderRunning && !menuOpen, screen.built))
                 activate[ItemPlay] = true;
             if (!menuOpen && CheckCollisionPointRec(GetMousePosition(), playRect) && (GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f))
                 screen.focus = ItemPlay;
@@ -1146,12 +1298,14 @@ namespace ps2launcher
             }
             if (activate[ItemBuild])
                 startBuild(screen);
+            if (activate[ItemShaders])
+                startShaderBuild(screen);
             if (activate[ItemShowAtStart])
             {
                 screen.config.showAtStart = !screen.config.showAtStart;
                 saveConfig(screen.config);
             }
-            if (activate[ItemPlay] && screen.built && !buildRunning)
+            if (activate[ItemPlay] && screen.built && !buildRunning && !shaderRunning)
             {
                 result.play = true;
                 result.program = program;
@@ -1165,6 +1319,12 @@ namespace ps2launcher
             screen.checker->join();
         if (screen.worker && screen.worker->joinable())
             screen.worker->join(); // closing the window while building: let the copy finish its file
+        if (screen.shaderWorker && screen.shaderWorker->joinable())
+        {
+            if (screen.shaders)
+                screen.shaders->progress.cancel = true; // keeps what was compiled
+            screen.shaderWorker->join();
+        }
         return result;
     }
 }

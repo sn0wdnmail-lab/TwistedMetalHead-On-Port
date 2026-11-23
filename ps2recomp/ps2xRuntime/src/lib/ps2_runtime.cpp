@@ -1854,7 +1854,9 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
         return;
     }
 
-    m_vu0.reset();
+    // No m_vu0.reset() per call: the state is replaced below and execute() resets the pipelines.
+    // The cycle counter keeps running (a run's length is the difference).
+    const uint64_t startCycle = m_vu0.state().cycles;
     copyVu0ContextToState(ctx, m_vu0.state());
     // VU0 runs a microprogram to its E-bit before the EE continues. A fixed 4096-cycle budget cut
     // longer programs short and handed the EE half-finished results.
@@ -1866,7 +1868,7 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
     {
         static const bool trace = []() { const char *e = std::getenv("PS2X_TRACE_VU0_RUNS"); return e && *e && *e != '0'; }();
         static uint32_t longRunsReported = 0;
-        const uint64_t used = m_vu0.state().cycles;
+        const uint64_t used = m_vu0.state().cycles - startCycle;
         if ((trace || !m_vu0.lastRunEnded()) && longRunsReported < 16u && (used > 4096u || !m_vu0.lastRunEnded()))
         {
             ++longRunsReported;

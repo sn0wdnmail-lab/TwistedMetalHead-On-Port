@@ -57,20 +57,28 @@ The script builds the recompiler, recompiles the executable with `port/tmho.toml
 7,260 generated files takes a while; the runtime's unity build (32 files per compile unit) keeps
 it manageable.
 
-## 5. Optional: VU1 programs compiled ahead of time
+## 5. Optional: VU1 and VU0 programs compiled ahead of time
 
 `ps2recomp/ps2xRuntime/src/lib/vu/vu1_aot_programs.cpp` is an empty table here, because the real
-one is made from the game's VU1 microcode. Without it every VU1 program runs on the fast
+one is made from the game's own VU microcode. Without it every VU program runs on the fast
 interpreter core (same results, slower in big battles). To make it:
 
-1. Run the game with `PS2X_VU1_CAPTURE=1` and play the parts you care about (menus, a few
-   battles). The code images it sees are saved under `Logs/vu1capture`.
-2. Build the generator and run it:
+1. Run the game with `PS2X_VU1_CAPTURE=1 PS2X_VU0_CAPTURE=1` and play the parts you care about
+   (menus, a few battles with several opponents). The code images and sample runs it sees are
+   saved under `Logs/vu1capture` and `Logs/vu0capture`.
+2. Build the generator and run it on both folders:
    ```sh
    cmake --build build/linux --target vu1aot_gen
-   build/linux/ps2xRuntime/vu1aot_gen -o ps2recomp/ps2xRuntime/src/lib/vu/vu1_aot_programs.cpp Logs/vu1capture
+   build/linux/ps2xRuntime/vu1aot_gen -o ps2recomp/ps2xRuntime/src/lib/vu/vu1_aot_programs.cpp \
+       Logs/vu1capture Logs/vu0capture
    ```
-3. Build again. `vu1_replay` (same folder) can check compiled programs against the recordings.
+   It writes `vu1_aot_programs.cpp` (dispatchers and the program table) plus eight parts
+   `vu1_aot_programs_p0.cpp` .. `_p7.cpp` (`--parts N` changes the count): one 12 MB file needed
+   over 7 GB of compiler memory, the parts about 1 GB each and they build in parallel. CMake picks
+   the parts up by itself.
+3. Build again. `vu1_replay <capture folder>` (same folder as the generator) replays the recorded
+   runs on the interpreter and on the compiled code, checks registers, memory, PATH1 output and
+   cycle counts against the recording, and times both.
 
 ## Useful environment variables
 
@@ -80,7 +88,7 @@ interpreter core (same results, slower in big battles). To make it:
 | `PS2X_GS_THREAD=0` | parse GS packets on the VU1 thread instead of a thread of their own |
 | `PS2X_MTVU=0` | run VIF1/VU1 on the game thread |
 | `PS2X_EE_ROUND=nearest` | the PC's round-to-nearest instead of the PS2's round-toward-zero |
-| `PS2X_VU1_AOT=0` | no ahead-of-time VU1 programs |
+| `PS2X_VU1_AOT=0` | no ahead-of-time VU programs (VU1 and VU0) |
 | `PS2X_RECORD_FRAMES=1` | screenshot every 0.5 s into `Logs/frames` |
 | `PS2X_TMHO_TRACE=1` | log the widescreen / field-of-view / camera hooks |
 | `PS2X_LOG_DIR=<dir>` | where the logs go |

@@ -103,7 +103,7 @@ namespace vufast
     };
     inline const LaneMasks g_laneMasks{};
 
-    inline void storeMasked(float *dst, __m128 value, uint8_t dest)
+    VU_FAST_INLINE void storeMasked(float *dst, __m128 value, uint8_t dest)
     {
         if (dest == 0xFu)
         {
@@ -116,7 +116,7 @@ namespace vufast
     }
 
     // PS2 operand rules: denormals read as signed zero, Inf/NaN exponents read as +-FLT_MAX.
-    inline __m128 vuNorm(__m128 value)
+    VU_FAST_INLINE __m128 vuNorm(__m128 value)
     {
         const __m128i expMask = _mm_set1_epi32(0x7F800000);
         const __m128i signMask = _mm_set1_epi32(static_cast<int>(0x80000000u));
@@ -131,7 +131,7 @@ namespace vufast
         return _mm_castsi128_ps(bits);
     }
 
-    inline float normScalar(float value)
+    VU_FAST_INLINE float normScalar(float value)
     {
         uint32_t bits;
         std::memcpy(&bits, &value, 4);
@@ -145,7 +145,7 @@ namespace vufast
     }
 
     // Clamp a FMAC result to PS2 range and compute its MAC flags and status nibble.
-    inline __m128 vuResult(__m128 value, uint8_t dest, uint32_t &mac, uint32_t &statusNibble)
+    VU_FAST_INLINE __m128 vuResult(__m128 value, uint8_t dest, uint32_t &mac, uint32_t &statusNibble)
     {
         const __m128i expMask = _mm_set1_epi32(0x7F800000);
         const __m128i signMask = _mm_set1_epi32(static_cast<int>(0x80000000u));
@@ -1287,6 +1287,15 @@ struct Vu1Aot
             if (pair.delaysNextBranchRead)
                 vu.recordViWriteForBranch(viWriteReg, oldVi);
         }
+        if ((pair.upWriteReg | pair.loWriteReg | viWriteReg) != 0u)
+        {
+            const uint64_t latest = vu.m_cycle + std::max<uint32_t>(std::max<uint32_t>(pair.upWriteReg ? pair.upLatency : 0u,
+                                                                                          pair.loWriteReg ? pair.loVfLatency : 0u),
+                                                                    viWriteReg ? pair.viLatency : 0u);
+            uint64_t &until = pendingUntil(vu);
+            if (latest > until)
+                until = latest;
+        }
 
         if (pair.writesVf0)
         {
@@ -1352,6 +1361,210 @@ struct Vu1Aot
         return programEnded;
     }
 
+    // FU_ARITH / FU_ABS / FU_FTOI for the static tier: operands are brought into PS2 range
+    // (denormal -> 0, Inf/NaN exponent -> max) only where the generator could not prove they
+    // already are. Norm bits: 1 = fs, 2 = ft (or the broadcast lane), 4 = ACC. Q and I are
+    // always in range (normalized when they are written). Everything else is fastExecUpperKind.
+    template <uint8_t Kind, uint8_t Norm>
+    static VU_FAST_INLINE void upperStatic(VU1Interpreter &vu, const Pair &pair)
+    {
+        using namespace vufast;
+        if constexpr (Kind == FU_ARITH)
+        {
+            const uint8_t dest = pair.upDest;
+            const __m128 sRaw = _mm_loadu_ps(vu.m_state.vf[pair.upFs]);
+            const __m128 s = (Norm & 1u) ? vuNorm(sRaw) : sRaw;
+            __m128 t;
+            switch (pair.upSrc)
+            {
+            case FSRC_BC:
+            {
+                const float lane = vu.m_state.vf[pair.upFt][pair.upBc];
+                t = _mm_set1_ps((Norm & 2u) ? normScalar(lane) : lane);
+                break;
+            }
+            case FSRC_VT:
+            {
+                const __m128 tRaw = _mm_loadu_ps(vu.m_state.vf[pair.upFt]);
+                t = (Norm & 2u) ? vuNorm(tRaw) : tRaw;
+                break;
+            }
+            case FSRC_Q: t = _mm_set1_ps(vu.m_state.q); break;
+            default: t = _mm_set1_ps(vu.m_state.i); break;
+            }
+            auto acc = [&]()
+            {
+                const __m128 aRaw = _mm_loadu_ps(vu.m_state.acc);
+                return (Norm & 4u) ? vuNorm(aRaw) : aRaw;
+            };
+            __m128 result;
+            bool fmac = true;
+            switch (pair.upArith)
+            {
+            case FA_ADD: result = _mm_add_ps(s, t); break;
+            case FA_SUB: result = _mm_sub_ps(s, t); break;
+            case FA_MUL: result = _mm_mul_ps(s, t); break;
+            case FA_MADD: result = _mm_add_ps(acc(), _mm_mul_ps(s, t)); break;
+            case FA_MSUB: result = _mm_sub_ps(acc(), _mm_mul_ps(s, t)); break;
+            case FA_MAX: result = _mm_max_ps(s, t); fmac = false; break;
+            case FA_MINI: result = _mm_min_ps(s, t); fmac = false; break;
+            case FA_OPMULA:
+            case FA_OPMSUB:
+            {
+                const __m128 sYzx = _mm_shuffle_ps(s, s, _MM_SHUFFLE(3, 0, 2, 1));
+                const __m128 tZxy = _mm_shuffle_ps(t, t, _MM_SHUFFLE(3, 1, 0, 2));
+                __m128 product = _mm_mul_ps(sYzx, tZxy);
+                if (pair.upArith == FA_OPMSUB)
+                    product = _mm_sub_ps(acc(), product);
+                result = _mm_and_ps(product, g_laneMasks.mask[0xE]);
+                break;
+            }
+            default: result = _mm_setzero_ps(); break;
+            }
+            float *target = pair.upToAcc ? vu.m_state.acc : vu.m_state.vf[pair.upFd];
+            if (fmac && (!vu.m_fastNeedMacStatus || pair.flagsDead))
+            {
+                const __m128 maxValue = _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF));
+                const __m128 minValue = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0xFF7FFFFFu)));
+                result = _mm_min_ps(_mm_max_ps(result, minValue), maxValue);
+                storeMasked(target, result, dest);
+                return;
+            }
+            if (fmac)
+            {
+                if (dest == 0u)
+                    return;
+                uint32_t mac = 0u;
+                uint32_t statusNibble = 0u;
+                result = vuResult(result, dest, mac, statusNibble);
+                storeMasked(target, result, dest);
+                VU1Interpreter::FastFlagEntry entry;
+                entry.issueCycle = vu.m_cycle;
+                entry.readyCycle = vu.m_cycle + VU1Interpreter::kFmacLatency;
+                entry.mac = mac;
+                entry.status = statusNibble;
+                entry.writes = 1u;
+                vu.fastPushFlagEntry(entry);
+            }
+            else
+            {
+                storeMasked(target, result, dest);
+            }
+        }
+        else if constexpr (Kind == FU_ABS && !(Norm & 1u))
+        {
+            const __m128 absMask = _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF));
+            storeMasked(vu.m_state.vf[pair.upFt], _mm_and_ps(_mm_loadu_ps(vu.m_state.vf[pair.upFs]), absMask), pair.upDest);
+        }
+        else
+        {
+            vu.fastExecUpperKind<Kind>(pair);
+        }
+    }
+
+    // Pipeline kinds of FastPair::loPipeline, for the generator.
+    static constexpr uint8_t kPipeNone = VU1Interpreter::PipelineNone;
+    static constexpr uint8_t kPipeFdiv = VU1Interpreter::PipelineFdiv;
+    static constexpr uint8_t kPipeEfu = VU1Interpreter::PipelineEfu;
+
+    // ---- Static tier (compiled blocks whose stalls were worked out by the generator) ----
+    // The upper/lower execution of pairCoreWith without the stall and ready-time bookkeeping.
+    // Branch lower kinds are left to the caller (Lower = false).
+    template <typename Exec, bool Lower>
+    static VU_FAST_INLINE void execStatic(VU1Interpreter &vu, const Pair &pair, uint8_t *vuData, uint32_t dataSize)
+    {
+        using namespace vufast;
+        if (pair.iBit)
+        {
+            Exec::upper(vu, pair);
+            vu.m_state.i = normScalar(pair.immediate);
+        }
+        else if (pair.shadowReg != 0u && Lower)
+        {
+            float oldValue[4];
+            float upperValue[4];
+            std::memcpy(oldValue, vu.m_state.vf[pair.shadowReg], sizeof(oldValue));
+            Exec::upper(vu, pair);
+            std::memcpy(upperValue, vu.m_state.vf[pair.shadowReg], sizeof(upperValue));
+            std::memcpy(vu.m_state.vf[pair.shadowReg], oldValue, sizeof(oldValue));
+            Exec::lower(vu, pair, vuData, dataSize);
+            std::memcpy(vu.m_state.vf[pair.shadowReg], upperValue, sizeof(upperValue));
+        }
+        else
+        {
+            Exec::upper(vu, pair);
+            if constexpr (Lower)
+            {
+                if (pair.loKind != FL_NOP)
+                    Exec::lower(vu, pair, vuData, dataSize);
+            }
+        }
+        if (pair.writesVf0)
+        {
+            vu.m_state.vf[0][0] = 0.0f;
+            vu.m_state.vf[0][1] = 0.0f;
+            vu.m_state.vf[0][2] = 0.0f;
+            vu.m_state.vf[0][3] = 1.0f;
+        }
+    }
+    static VU_FAST_INLINE void setCycle(VU1Interpreter &vu, uint64_t value) { vu.m_cycle = value; }
+    // Latest ready time ever written to m_vfReady / m_viReady since the last resetScheduler, so a
+    // "nothing in flight" test does not scan 144 entries. Kept in m_accReady[3], which only the
+    // accurate core uses otherwise (it never runs the fast core's paths).
+    static VU_FAST_INLINE uint64_t &pendingUntil(VU1Interpreter &vu) { return vu.m_accReady[3]; }
+    static VU_FAST_INLINE void setVfReady(VU1Interpreter &vu, uint32_t reg, uint32_t lane, uint64_t at)
+    {
+        vu.m_vfReady[reg][lane] = at;
+        if (at > pendingUntil(vu))
+            pendingUntil(vu) = at;
+    }
+    static VU_FAST_INLINE void setViReady(VU1Interpreter &vu, uint32_t reg, uint64_t at)
+    {
+        vu.m_viReady[reg] = at;
+        if (at > pendingUntil(vu))
+            pendingUntil(vu) = at;
+    }
+    static VU_FAST_INLINE int32_t vi(const VU1Interpreter &vu, uint32_t reg) { return vu.m_state.vi[reg]; }
+    static VU_FAST_INLINE void setVi(VU1Interpreter &vu, uint32_t reg, int32_t value)
+    {
+        if (reg != 0u)
+            vu.m_state.vi[reg] = value;
+    }
+    // VU1Interpreter::readBranchVi / recordViWriteForBranch, inline.
+    static VU_FAST_INLINE int32_t branchVi(const VU1Interpreter &vu, uint32_t reg)
+    {
+        if (reg == 0u)
+            return 0;
+        if (vu.m_viBranchBackupValid && vu.m_viBranchBackupReg == reg)
+            return vu.m_viBranchBackupValue;
+        return vu.m_state.vi[reg];
+    }
+    static VU_FAST_INLINE void clearBranchBackup(VU1Interpreter &vu) { vu.m_viBranchBackupValid = false; }
+    static VU_FAST_INLINE void recordBranchBackup(VU1Interpreter &vu, uint32_t reg, int32_t oldValue)
+    {
+        if (reg == 0u)
+            return;
+        vu.m_viBranchBackupValue = oldValue;
+        vu.m_viBranchBackupReg = static_cast<uint8_t>(reg);
+        vu.m_viBranchBackupValid = true;
+    }
+    // Nothing in flight that a stall could wait for, and no branch, E bit or halt pending: the
+    // static tier's blocks assume exactly this at their clean entry points.
+    static bool quiescent(const VU1Interpreter &vu)
+    {
+        const uint64_t now = vu.m_cycle;
+        if (vu.m_state.branchPending | vu.m_state.ebit | vu.m_state.haltAfterDelaySlot)
+            return false;
+        if (vu.m_fdiv.valid && vu.m_fdiv.readyCycle > now)
+            return false;
+        if (vu.m_efuResourceReady > now)
+            return false;
+        for (const VU1Interpreter::ScalarPipelineEntry &entry : vu.m_efu)
+            if (entry.valid && entry.readyCycle > now)
+                return false;
+        return vu.m_accReady[3] <= now;
+    }
+
     // A branch, E bit or halt is pending: the next pair needs postPair's handling.
     static VU_FAST_INLINE bool pendingControl(const VU1Interpreter &vu)
     {
@@ -1384,6 +1597,17 @@ struct Vu1AotProgram
     Vu1Aot::Fn fn;
     uint32_t pairs;   // compiled pairs (for the log)
     uint32_t entries; // entry points it was generated from
+};
+
+// Static tier: the same, with operand normalization only where the generator needs it.
+template <const Vu1Aot::Pair &P, uint8_t Norm>
+struct Vu1AotStaticExecN
+{
+    static VU_FAST_INLINE void upper(VU1Interpreter &vu, const Vu1Aot::Pair &pair) { Vu1Aot::upperStatic<P.upKind, Norm>(vu, pair); }
+    static VU_FAST_INLINE void lower(VU1Interpreter &vu, const Vu1Aot::Pair &pair, uint8_t *vuData, uint32_t dataSize)
+    {
+        Vu1Aot::lowerKind<P.loKind>(vu, pair, vuData, dataSize);
+    }
 };
 
 // Execution policy for a compile-time constant pair: only its own upper and lower kinds are

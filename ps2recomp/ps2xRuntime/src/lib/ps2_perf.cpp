@@ -589,6 +589,8 @@ namespace ps2perf
         std::mutex g_profileMutex;
         std::unordered_map<std::string, uint64_t> g_profileCounts; // label -> samples
         uint64_t g_profileSamples = 0;
+        std::unordered_map<std::string, uint64_t> g_vuProfileCounts; // the VU1 thread's samples (Windows)
+        uint64_t g_vuProfileSamples = 0;
         std::atomic<bool> g_samplerRunning{false};
         uint64_t g_imageBase = 0;
         uint64_t g_imageSize = 0;
@@ -649,7 +651,7 @@ namespace ps2perf
             std::string name = it->name;
             // Group the generated code: compiled VU1 blocks, recompiled game functions stay named.
             if (name.rfind("vu1aot_", 0) == 0)
-                return "compiled VU1 microprograms";
+                return "compiled VU microprograms";
             // Drop the parameter list (the last balanced "(...)", plus a trailing " const"), keeping
             // template arguments such as <(vufast::UpKind)3>.
             if (name.size() > 6 && name.compare(name.size() - 6, 6, " const") == 0)
@@ -676,8 +678,8 @@ namespace ps2perf
         // Broad groups for the profile summary line.
         const char *categoryOf(const std::string &label)
         {
-            if (label == "compiled VU1 microprograms")
-                return "compiled VU1";
+            if (label == "compiled VU microprograms")
+                return "compiled VU code";
             if (label.find("VU1Interpreter") != std::string::npos || label.find("VU0") != std::string::npos ||
                 label.find("Vu1Aot") != std::string::npos || label.find("vufast") != std::string::npos || label.find("Vu0") != std::string::npos)
                 return "VU interpreter";
@@ -701,15 +703,16 @@ namespace ps2perf
             return "other runtime";
         }
 
-        void recordSample(const std::string &label)
+        void recordSample(const std::string &label, bool vuThread = false)
         {
             std::lock_guard<std::mutex> lock(g_profileMutex);
-            ++g_profileCounts[label];
-            ++g_profileSamples;
+            ++(vuThread ? g_vuProfileCounts : g_profileCounts)[label];
+            ++(vuThread ? g_vuProfileSamples : g_profileSamples);
         }
 
 #if defined(_WIN32)
         HANDLE g_sampledThread = nullptr;
+        HANDLE vuThreadHandle(); // the VU1 thread, once it has registered (below, with the watchdog)
 
         // Samples outside TMHO.exe: "[module] export" when the address sits right after an exported
         // function's start (the syscall stubs in ntdll.dll show what a waiting thread waits on),
@@ -773,24 +776,37 @@ namespace ps2perf
             return symbols.label;
         }
 
+        // Where a thread is right now; false when it could not be paused.
+        bool sampleThread(HANDLE thread, uint64_t &rip)
+        {
+            if (!thread || SuspendThread(thread) == static_cast<DWORD>(-1))
+                return false;
+            CONTEXT context{};
+            context.ContextFlags = CONTEXT_CONTROL;
+            const BOOL ok = GetThreadContext(thread, &context);
+            ResumeThread(thread);
+            rip = context.Rip;
+            return ok != FALSE;
+        }
+
+        std::string labelForAddress(uint64_t rip)
+        {
+            if (rip >= g_imageBase && rip < g_imageBase + g_imageSize)
+                return labelForRva(rip - g_imageBase);
+            return moduleLabel(rip);
+        }
+
         void samplerMain()
         {
             while (g_samplerRunning.load(std::memory_order_relaxed))
             {
                 Sleep(2);
-                if (SuspendThread(g_sampledThread) == static_cast<DWORD>(-1))
-                    continue;
-                CONTEXT context{};
-                context.ContextFlags = CONTEXT_CONTROL;
-                const BOOL ok = GetThreadContext(g_sampledThread, &context);
-                ResumeThread(g_sampledThread);
-                if (!ok)
-                    continue;
-                const uint64_t rip = context.Rip;
-                if (rip >= g_imageBase && rip < g_imageBase + g_imageSize)
-                    recordSample(labelForRva(rip - g_imageBase));
-                else
-                    recordSample(moduleLabel(rip));
+                uint64_t rip = 0;
+                if (sampleThread(g_sampledThread, rip))
+                    recordSample(labelForAddress(rip));
+                // The VU1 thread too: VIF1, the VU1 microprograms and the PATH1 packets they send.
+                if (sampleThread(vuThreadHandle(), rip))
+                    recordSample(labelForAddress(rip), true);
             }
         }
 #else
@@ -885,7 +901,7 @@ namespace ps2perf
             std::atomic<uint64_t> stretches[2048];
             std::atomic<uint64_t> pairs[2048];
         };
-        Vu1MissImage g_vu1Miss[4];
+        Vu1MissImage g_vu1Miss[8]; // VU1 and VU0 code images
 
         void writeVu1MissesLocked(FILE *file)
         {
@@ -917,7 +933,7 @@ namespace ps2perf
                 return;
             std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.pairs > b.pairs; });
             char line[256];
-            std::snprintf(line, sizeof(line), "           VU1 pairs interpreted inside compiled images: %llu - entry points the compiled code lacks:",
+            std::snprintf(line, sizeof(line), "           VU pairs interpreted inside compiled images (VU1 and VU0): %llu - entry points the compiled code lacks:",
                           static_cast<unsigned long long>(totalPairs));
             writeLine(file, line);
             for (size_t i = 0; i < rows.size() && i < 16u; ++i)
@@ -929,23 +945,26 @@ namespace ps2perf
             }
         }
 
-        // Every 10 s: the busiest places on the game thread.
-        void writeProfileLocked(FILE *file, double seconds)
+        // Every 10 s: the busiest places on the game thread (and on Windows the VU1 thread).
+        void writeProfileTableLocked(FILE *file, double seconds, bool vuThread)
         {
             std::vector<std::pair<std::string, uint64_t>> rows;
             uint64_t total = 0;
             {
                 std::lock_guard<std::mutex> lock(g_profileMutex);
-                rows.assign(g_profileCounts.begin(), g_profileCounts.end());
-                total = g_profileSamples;
-                g_profileCounts.clear();
-                g_profileSamples = 0;
+                auto &counts = vuThread ? g_vuProfileCounts : g_profileCounts;
+                uint64_t &samples = vuThread ? g_vuProfileSamples : g_profileSamples;
+                rows.assign(counts.begin(), counts.end());
+                total = samples;
+                counts.clear();
+                samples = 0;
             }
             if (!file || total == 0)
                 return;
             std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
             char line[1024];
-            std::snprintf(line, sizeof(line), "           ---- where the game thread spent the last %.0f s (%llu samples%s) ----", seconds,
+            std::snprintf(line, sizeof(line), "           ---- where the %s spent the last %.0f s (%llu samples%s) ----",
+                          vuThread ? "VU1 thread" : "game thread", seconds,
                           static_cast<unsigned long long>(total), g_symbols.empty() ? ", no symbol map" : "");
             writeLine(file, line);
             {
@@ -971,12 +990,18 @@ namespace ps2perf
                     summary.pop_back();
                 writeLine(file, summary.c_str());
             }
-            for (size_t i = 0; i < rows.size() && i < 25u; ++i)
+            for (size_t i = 0; i < rows.size() && i < (vuThread ? 15u : 25u); ++i)
             {
                 std::snprintf(line, sizeof(line), "           %5.1f%%  %s", 100.0 * static_cast<double>(rows[i].second) / static_cast<double>(total),
                               rows[i].first.c_str());
                 writeLine(file, line);
             }
+        }
+
+        void writeProfileLocked(FILE *file, double seconds)
+        {
+            writeProfileTableLocked(file, seconds, false);
+            writeProfileTableLocked(file, seconds, true);
         }
 
         // Resident memory of the whole process (RAM the game occupies right now).
@@ -1093,6 +1118,7 @@ namespace ps2perf
         HANDLE g_watchHandles[3] = {};   // game, VU1, window: suspend + context rights
         uint64_t g_watchStackTop[3] = {}; // their stack bases (highest address)
         const NT_TIB *g_watchTib[3] = {}; // their thread blocks (StackLimit = lowest committed stack byte)
+        HANDLE vuThreadHandle() { return g_watchHandles[1]; }
 
         // Call stack of a thread, symbolized: our functions from TMHO.sym, others as [module] export.
         // While the thread is paused only its registers and the top 256 KB of its stack are copied;
@@ -1482,9 +1508,30 @@ namespace ps2perf
 
     uint64_t nowNs() noexcept
     {
+#if defined(_WIN32)
+        // QueryPerformanceCounter directly: steady_clock::now() goes through winpthreads'
+        // clock_gettime, which costs several times more, and every perf scope calls this twice
+        // (tens of thousands of VU0 microprograms a second in a big battle).
+        struct Clock
+        {
+            int64_t start;
+            double nsPerTick;
+        };
+        static const Clock clock = []()
+        {
+            LARGE_INTEGER frequency{}, start{};
+            QueryPerformanceFrequency(&frequency);
+            QueryPerformanceCounter(&start);
+            return Clock{start.QuadPart, 1e9 / static_cast<double>(frequency.QuadPart ? frequency.QuadPart : 1)};
+        }();
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        return static_cast<uint64_t>(static_cast<double>(now.QuadPart - clock.start) * clock.nsPerTick);
+#else
         return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - g_epoch)
                                          .count());
+#endif
     }
 
     void add(Bucket bucket, uint64_t ns) noexcept

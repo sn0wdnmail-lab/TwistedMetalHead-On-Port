@@ -13,11 +13,18 @@
 
 #include "../../src/lib/vu/ps2_vu_fast_inl.h"
 
+#include <cctype>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <array>
+#include <iterator>
+#include <bitset>
 #include <filesystem>
+#include <functional>
+#include <tuple>
 #include <fstream>
 #include <map>
 #include <set>
@@ -30,8 +37,10 @@ using namespace vufast;
 
 namespace
 {
-    constexpr uint32_t kCodeSize = 16384u;
-    constexpr uint32_t kPcMask = 0x3FFFu;
+    // The code image being compiled: VU1 (16 KB) or VU0 (4 KB, recorded with PS2X_VU0_CAPTURE=1).
+    uint32_t kCodeSize = 16384u;
+    uint32_t kPcMask = 0x3FFFu;
+    bool g_vu0 = false; // VU0: the EE reads the flags after the program, so every flag is kept
 
     struct Image
     {
@@ -118,6 +127,12 @@ namespace
         return o.str();
     }
 
+}
+
+#include "vu1aot_static.inc"
+
+namespace
+{
     bool readFile(const fs::path &path, std::vector<uint8_t> &out)
     {
         std::ifstream in(path, std::ios::binary);
@@ -305,7 +320,7 @@ namespace
                 if (p.loKind == FL_FSEQ || p.loKind == FL_FSOR || (p.loKind == FL_FSAND && (p.loImm24 & 0xFC0u) != 0u))
                     stickyRead = true;
             }
-            if (!stickyRead)
+            if (!stickyRead && !g_vu0)
             {
                 auto isFmac = [](const Vu1Aot::Pair &p)
                 {
@@ -374,6 +389,27 @@ namespace
             }
         }
 
+        // ---- static tier ----
+        bool needMacStatus = false; // same scan as runFast: MAC/status flags only matter if FS*/FM* read them
+        for (uint32_t pc = 0; pc + 8u <= kCodeSize && !needMacStatus; pc += 8u)
+        {
+            uint32_t lowerWord = 0, upperWord = 0;
+            std::memcpy(&lowerWord, image.code.data() + pc, 4);
+            std::memcpy(&upperWord, image.code.data() + pc + 4, 4);
+            if (upperWord & 0x80000000u)
+                continue;
+            const uint32_t opHi = (lowerWord >> 25) & 0x7Fu;
+            needMacStatus = opHi == 0x14u || opHi == 0x16u || opHi == 0x17u || opHi == 0x18u || opHi == 0x1Au || opHi == 0x1Bu;
+        }
+        if (g_vu0)
+            needMacStatus = true; // VU0's MAC/status/clip flags are read by the EE (CFC2) afterwards
+        std::set<uint32_t> cleanStarts;
+        for (uint32_t pc : blockStarts)
+            if (labels.count(pc))
+                cleanStarts.insert(pc);
+        const std::function<const Vu1Aot::Pair &(uint32_t)> decodeFn = [&](uint32_t pc) -> const Vu1Aot::Pair & { return decode(pc); };
+        const StaticTier tier(decodeFn, pruned, labels, blockStarts, cleanStarts, needMacStatus);
+
         char name[64];
         std::snprintf(name, sizeof(name), "vu1aot_%016" PRIx64, image.hash);
 
@@ -421,7 +457,7 @@ namespace
         for (size_t c = 0; c < chunks.size(); ++c)
         {
             const std::vector<uint32_t> &chunk = chunks[c];
-            out << "static VU_AOT_BLOCK int " << name << "_c" << c
+            out << "//@@MOVE\nVU_AOT_BLOCK int " << name << "_c" << c
                 << "(VU1Interpreter &vu, uint8_t *__restrict vuData, uint32_t dataSize, uint64_t budgetEnd, uint64_t &pairs)\n{\n";
             out << "    switch (Vu1Aot::pc(vu))\n    {\n";
             for (uint32_t pc : chunk)
@@ -444,6 +480,12 @@ namespace
                 {
                     out << "    Vu1Aot::setPc(vu, " << pcText << ");\n    return Vu1Aot::kUnhandled; // reserved: the interpreter reports it\n}\n";
                     continue;
+                }
+                if (auto clean = tier.clean().find(pc); clean != tier.clean().end())
+                {
+                    // Nothing in flight here: the static tier continues (if the block fits the budget).
+                    out << "    if (Vu1Aot::cycle(vu) + " << tier.versions()[clean->second].pairs.back().issue
+                        << "u < budgetEnd && Vu1Aot::quiescent(vu)) { Vu1Aot::setPc(vu, " << pcText << "); return Vu1Aot::kContinue; }\n";
                 }
                 ++compiled;
                 char ftText[16];
@@ -474,7 +516,7 @@ namespace
                     out << "    Vu1Aot::setPc(vu, " << pcText << ");\n";
                 out << "    if (!Vu1Aot::pairCoreWith<Vu1AotStaticExec<k>>(vu, k, vuData, dataSize, budgetEnd, pairs)) { Vu1Aot::setPc(vu, "
                     << pcText << "); return Vu1Aot::kBudget; }\n";
-                const std::string post = "if (Vu1Aot::postPair(vu, k, 16384u)) return Vu1Aot::kEnded; if (Vu1Aot::pc(vu) != " +
+                const std::string post = "if (Vu1Aot::postPair(vu, k, " + std::to_string(kCodeSize) + "u)) return Vu1Aot::kEnded; if (Vu1Aot::pc(vu) != " +
                                          std::string(ftText) + ") { " + dispatch + " }";
                 if (alwaysPost)
                     out << "    " << post << "\n";
@@ -489,31 +531,154 @@ namespace
                 out << "}\n";
             }
             char tail[96];
-            std::snprintf(tail, sizeof(tail), "    Vu1Aot::setPc(vu, 0x%04xu);\n    return Vu1Aot::kContinue;\n}\n\n",
+            std::snprintf(tail, sizeof(tail), "    Vu1Aot::setPc(vu, 0x%04xu);\n    return Vu1Aot::kContinue;\n}\n//@@END\n\n",
                           next(chunk.back()));
             out << tail;
         }
 
         out << "static int " << name
-            << "(VU1Interpreter &vu, uint8_t *__restrict vuData, uint32_t dataSize, uint64_t budgetEnd, uint64_t &pairs)\n{\n";
-        out << "    for (;;)\n    {\n        int result;\n        switch (Vu1Aot::pc(vu))\n        {\n";
+            << "_dyn(VU1Interpreter &vu, uint8_t *__restrict vuData, uint32_t dataSize, uint64_t budgetEnd, uint64_t &pairs)\n{\n";
+        out << "    switch (Vu1Aot::pc(vu))\n    {\n";
         for (size_t c = 0; c < chunks.size(); ++c)
         {
             for (uint32_t pc : chunks[c])
             {
                 char line[48];
-                std::snprintf(line, sizeof(line), "        case 0x%04xu:\n", pc);
+                std::snprintf(line, sizeof(line), "    case 0x%04xu:\n", pc);
                 out << line;
             }
-            out << "            result = " << name << "_c" << c << "(vu, vuData, dataSize, budgetEnd, pairs);\n            break;\n";
+            out << "        return " << name << "_c" << c << "(vu, vuData, dataSize, budgetEnd, pairs);\n";
         }
-        out << "        default:\n            return Vu1Aot::kUnhandled;\n        }\n";
-        out << "        if (result != Vu1Aot::kContinue)\n            return result;\n    }\n}\n\n";
+        out << "    default:\n        return Vu1Aot::kUnhandled;\n    }\n}\n\n";
+        emitStaticTier(out, image.hash, name, tier, pruned);
         std::fprintf(stderr, "vu1aot_gen: image %016" PRIx64 ": %zu functions, %u branches stay inside a function, %u runtime control checks kept\n",
                      image.hash, chunks.size(), localJumps, pendingChecks);
         std::fprintf(stderr, "vu1aot_gen: image %016" PRIx64 ": stall checks kept for %u lane reads, removed for %u; FMAC flags kept %u, elided %u\n",
                      image.hash, keptLanes, prunedLanes, liveFlags, deadFlags);
         return compiled;
+    }
+}
+
+namespace
+{
+    // Writes path only when its content changes, so an unchanged part is not compiled again.
+    bool writeIfChanged(const fs::path &path, const std::string &content)
+    {
+        std::string old;
+        {
+            std::ifstream in(path, std::ios::binary);
+            if (in)
+                old.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        if (old == content)
+            return true;
+        std::ofstream out(path, std::ios::binary);
+        out << content;
+        return static_cast<bool>(out);
+    }
+
+    // The block functions (between //@@MOVE and //@@END) go to <stem>_p<k>.cpp, balanced by size,
+    // each part with the S-tier pair constants its functions use. The main file keeps the
+    // dispatchers, the tables and a declaration in place of each moved function. One 12 MB file
+    // needed more than 7 GB of compiler memory; eight parts compile side by side in far less.
+    bool writeProgram(const std::string &text, const std::string &prologue, const fs::path &outPath, unsigned parts)
+    {
+        const fs::path dir = outPath.parent_path();
+        const std::string stem = outPath.stem().string();
+        std::string mainText = prologue, block;
+        std::map<std::string, std::string> pairLines; // kP_<hash>_<pc> -> its definition
+        std::vector<std::string> blocks, cleanDecls;
+        bool inBlock = false;
+        std::istringstream in(text);
+        std::string line;
+        while (std::getline(in, line))
+        {
+            if (inBlock)
+            {
+                if (line == "//@@END")
+                {
+                    inBlock = false;
+                    if (parts <= 1)
+                        mainText += block;
+                    else
+                    {
+                        mainText += block.substr(0, block.find('\n')) + ";\n"; // the declaration
+                        blocks.push_back(std::move(block));
+                    }
+                    block.clear();
+                }
+                else
+                    block += line + "\n";
+                continue;
+            }
+            if (line == "//@@MOVE")
+            {
+                inBlock = true;
+                continue;
+            }
+            if (parts > 1 && line.rfind("static constexpr Vu1Aot::Pair kP_", 0) == 0)
+            {
+                const size_t start = std::strlen("static constexpr Vu1Aot::Pair ");
+                pairLines[line.substr(start, line.find(' ', start) - start)] = line;
+                continue;
+            }
+            static const std::string kCleanDecl = "_clean(uint32_t pc);";
+            if (line.rfind("int vu1aot_", 0) == 0 && line.size() > kCleanDecl.size() &&
+                line.compare(line.size() - kCleanDecl.size(), kCleanDecl.size(), kCleanDecl) == 0)
+                cleanDecls.push_back(line);
+            mainText += line + "\n";
+        }
+        bool ok = writeIfChanged(outPath, mainText);
+        std::vector<std::string> partText(parts > 1 ? parts : 0);
+        if (parts > 1)
+        {
+            // Largest first into the smallest part; each part keeps the generated order.
+            std::vector<size_t> order(blocks.size());
+            for (size_t i = 0; i < order.size(); ++i)
+                order[i] = i;
+            std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return blocks[a].size() > blocks[b].size(); });
+            std::vector<size_t> load(parts, 0);
+            std::vector<std::vector<size_t>> members(parts);
+            for (size_t index : order)
+            {
+                const size_t target = static_cast<size_t>(std::min_element(load.begin(), load.end()) - load.begin());
+                load[target] += blocks[index].size();
+                members[target].push_back(index);
+            }
+            for (unsigned k = 0; k < parts; ++k)
+            {
+                std::sort(members[k].begin(), members[k].end());
+                std::set<std::string> used;
+                for (size_t index : members[k])
+                {
+                    const std::string &body = blocks[index];
+                    for (size_t at = body.find("kP_"); at != std::string::npos; at = body.find("kP_", at + 3))
+                    {
+                        size_t end = at + 3;
+                        while (end < body.size() && (std::isxdigit(static_cast<unsigned char>(body[end])) || body[end] == '_'))
+                            ++end;
+                        used.insert(body.substr(at, end - at));
+                    }
+                }
+                std::string part = prologue;
+                for (const std::string &name : used)
+                    if (auto it = pairLines.find(name); it != pairLines.end())
+                        part += it->second + "\n";
+                part += "\n";
+                for (const std::string &decl : cleanDecls)
+                    part += decl + "\n";
+                part += "\n";
+                for (size_t index : members[k])
+                    part += blocks[index] + "\n";
+                ok = writeIfChanged(dir / (stem + "_p" + std::to_string(k) + ".cpp"), part) && ok;
+            }
+        }
+        // Parts left over from a run with more parts would define the same functions twice.
+        std::error_code ec;
+        for (unsigned k = parts > 1 ? parts : 0; k < 256; ++k)
+            fs::remove(dir / (stem + "_p" + std::to_string(k) + ".cpp"), ec);
+        fs::remove(dir / (stem + "_pairs.h"), ec); // written by an earlier version of this tool
+        return ok;
     }
 }
 
@@ -523,11 +688,14 @@ int main(int argc, char **argv)
     std::vector<fs::path> dirs;
     std::vector<fs::path> extraFiles; // extra entry points: "<hash> <pc>" lines, or performancelogs.txt "vu1-miss" lines
     uint64_t minRuns = 1;
+    unsigned parts = 8;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc)
             outPath = argv[++i];
+        else if (arg == "--parts" && i + 1 < argc)
+            parts = static_cast<unsigned>(std::strtoul(argv[++i], nullptr, 10));
         else if (arg == "--extra" && i + 1 < argc)
             extraFiles.emplace_back(argv[++i]);
         else if (arg == "--min-runs" && i + 1 < argc)
@@ -603,13 +771,14 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "vu1aot_gen: %u extra entry points from %s\n", added, file.string().c_str());
     }
 
-    std::ofstream out(outPath);
-    out << "// Generated by tools/vu1aot/vu1aot_gen from recorded VU1 code images - do not edit.\n"
-           "// Each function runs one 16 KB VU1 code image with the fast core's own pair semantics.\n\n"
-           "#include \"ps2_vu_fast_inl.h\"\n#include <bit>\n\n"
-           "// Blocks stay separate functions: inlined into one dispatcher they spill everything.\n"
-           "#if defined(__GNUC__) || defined(__clang__)\n#define VU_AOT_BLOCK __attribute__((noinline))\n#else\n#define VU_AOT_BLOCK __declspec(noinline)\n#endif\n\n"
-           "#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC diagnostic ignored \"-Wunused-label\"\n#endif\n\n";
+    const std::string prologue =
+        "// Generated by tools/vu1aot/vu1aot_gen from recorded VU1 code images - do not edit.\n"
+        "// Each function runs one 16 KB VU1 code image with the fast core's own pair semantics.\n\n"
+        "#include \"ps2_vu_fast_inl.h\"\n#include <bit>\n\n"
+        "// Blocks stay separate functions: inlined into one dispatcher they spill everything.\n"
+        "#if defined(__GNUC__) || defined(__clang__)\n#define VU_AOT_BLOCK __attribute__((noinline))\n#else\n#define VU_AOT_BLOCK __declspec(noinline)\n#endif\n\n"
+        "#if defined(__GNUC__) && !defined(__clang__)\n#pragma GCC diagnostic ignored \"-Wunused-label\"\n#endif\n\n";
+    std::ostringstream out;
 
     std::vector<std::pair<const Image *, uint32_t>> emitted;
     for (auto &[hash, image] : images)
@@ -619,7 +788,7 @@ int main(int argc, char **argv)
         bool found = false;
         for (const fs::path &dir : dirs)
         {
-            if (readFile(dir / name, image.code) && image.code.size() == kCodeSize)
+            if (readFile(dir / name, image.code) && (image.code.size() == 16384u || image.code.size() == 4096u))
             {
                 found = true;
                 break;
@@ -637,6 +806,9 @@ int main(int argc, char **argv)
         }
         if (image.runs < minRuns && image.runs != 0)
             continue;
+        kCodeSize = static_cast<uint32_t>(image.code.size());
+        kPcMask = kCodeSize - 1u;
+        g_vu0 = kCodeSize == 4096u;
         const uint32_t compiled = emitImage(out, image);
         emitted.emplace_back(&image, compiled);
         std::fprintf(stderr, "vu1aot_gen: image %016" PRIx64 ": %zu entries, %u pairs\n", hash, image.entries.size(), compiled);
@@ -653,6 +825,11 @@ int main(int argc, char **argv)
     if (emitted.empty())
         out << "    {0ull, nullptr, 0u, 0u},\n";
     out << "};\nextern const size_t g_vu1AotProgramCount = " << emitted.size() << ";\n";
-    std::fprintf(stderr, "vu1aot_gen: wrote %s (%zu images)\n", outPath.c_str(), emitted.size());
+    if (!writeProgram(out.str(), prologue, fs::path(outPath), emitted.empty() ? 1u : parts))
+    {
+        std::fprintf(stderr, "vu1aot_gen: could not write %s\n", outPath.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "vu1aot_gen: wrote %s (%zu images, %u parts)\n", outPath.c_str(), emitted.size(), emitted.empty() ? 1u : parts);
     return 0;
 }

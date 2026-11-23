@@ -389,6 +389,9 @@ function(ps2x_stage_ffmpeg_runtime_dlls target_name)
     )
 endfunction()
 
+# vu1aot_gen writes the compiled VU1 programs as vu1_aot_programs.cpp plus parts _p0.._pN
+# (none in the source release, which ships an empty program table).
+file(GLOB PS2X_VU1_AOT_PARTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/vu/vu1_aot_programs_p*.cpp)
 add_library(ps2_runtime STATIC
     src/lib/game_overrides.cpp
     src/lib/gs/ps2_gif_arbiter.cpp
@@ -410,6 +413,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu_fast.cpp
     src/lib/vu/vu1_aot.cpp
     src/lib/vu/vu1_aot_programs.cpp
+    ${PS2X_VU1_AOT_PARTS}
     src/lib/ps2_perf.cpp
     src/lib/ps2_mtvu.cpp
     src/lib/ps2_host_wait.cpp
@@ -550,9 +554,9 @@ endif()
 # VU1 ahead-of-time compiler tools (host tools, not part of the game build):
 #   vu1aot_gen  - recorded code images (PS2X_VU1_CAPTURE=1) -> src/lib/vu/vu1_aot_programs.cpp
 #   vu1_replay  - replays recorded runs, checks both VU1 paths against the recording and times them
-add_executable(vu1aot_gen EXCLUDE_FROM_ALL tools/vu1aot/vu1aot_gen.cpp)
+add_executable(vu1aot_gen EXCLUDE_FROM_ALL tools/vu1aot/vu1aot_gen.cpp tools/vu1aot/tool_stubs.cpp tools/vu1aot/gen_stubs.cpp)
 target_link_libraries(vu1aot_gen PRIVATE ps2_runtime)
-add_executable(vu1_replay EXCLUDE_FROM_ALL tools/vu1aot/vu1_replay.cpp)
+add_executable(vu1_replay EXCLUDE_FROM_ALL tools/vu1aot/vu1_replay.cpp tools/vu1aot/tool_stubs.cpp)
 target_link_libraries(vu1_replay PRIVATE ps2_runtime)
 
 # GPU GS renderer: paraLLEl-GS (Vulkan compute GS emulator, Arntzen Software AS, LGPLv3+),
