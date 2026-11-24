@@ -64,7 +64,15 @@ Video (F2 > Video) - all of it changes straight away, no restart needed
                        The picture is then about one frame later.
 
 On a slower PC: Resolution 480p or 720p, Frame rate 60 fps, and keep
-F2 > Game > VU1 thread on (the default).
+F2 > Game > VU1 thread and IOP thread on (the defaults).
+
+CPU cores (F2 > Game, both apply on the next start)
+  VU1 thread           The PS2's 3D math unit and the graphics feed run on a
+                       CPU core of their own.
+  IOP thread           The PS2's I/O processor - the sound driver, disc and
+                       memory card - runs on a CPU core of its own, mostly
+                       while the game waits for its next frame, instead of on
+                       the game's core. Off only to compare.
 
 Sharper font (Vulkan renderer)
   A picture named font_atlas.png in a "textures" folder next to TMHO.exe

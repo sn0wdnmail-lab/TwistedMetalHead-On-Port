@@ -1,3 +1,4 @@
+#include "ps2x/iop/iop_audio.h"
 #include "runtime/ps2_present.h"
 #include <cfenv>
 #include <cstdlib>
@@ -2236,6 +2237,16 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
 
 void EeScheduler::waitForEvent()
 {
+    // IOP thread (iop_thread=1): before the game waits, the IOP is brought up to the EE's time and
+    // what the IOP thread did to the EE's side (EE memory writes, SIF commands) is done here - as
+    // when the IOP ran on this thread. If that was anything, a game thread may be ready now.
+    {
+        ps2perf::Scope perfScope(ps2perf::Iop);
+        if (ps2x::iop::catchUpIopBeforeIdle())
+        {
+            return;
+        }
+    }
     std::unique_lock lock(m_eventMutex);
     if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
     {
@@ -2275,6 +2286,13 @@ void EeScheduler::waitForEvent()
             deadlineCycle = m_eeCycle + timerCycles;
             hostDeadline = timerHostDeadline;
         }
+    }
+
+    // Nothing happens on the EE until deadlineCycle (unless an event comes first): the IOP thread
+    // runs the IOP's work for that time while this thread waits, instead of after.
+    if (deadlineCycle > m_eeCycle)
+    {
+        ps2x::iop::runIopAheadWhileIdle(deadlineCycle - m_eeCycle);
     }
 
     const auto waitStart = std::chrono::steady_clock::now();

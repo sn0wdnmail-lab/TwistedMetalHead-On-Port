@@ -37,6 +37,7 @@ namespace ps2settings
         int renderer = 0;       // 0 Vulkan GPU (falls back to software), 1 software (CPU)
         int internalScale = 0;  // older files only (internal_res): 0 Auto, 1 1x, 2 2x, 3 4x
         bool vu1Thread = true;  // GPU renderer: VIF1/VU1/GS feed on their own core (next start)
+        bool iopThread = true;  // the I/O processor (sound driver, disc, memory card) on its own core (next start)
         bool recordFrames = false; // a screenshot every 0.5 s into Logs\frames (ps2_capture)
         int fovDegrees = 0;        // battle camera horizontal field of view, 0 = the game's own (tmho_game)
         int cameraDistance = 100;  // chase camera distance in percent of the game's own (tmho_game)

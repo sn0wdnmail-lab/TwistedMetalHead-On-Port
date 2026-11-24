@@ -144,6 +144,31 @@ A controller works too; the keyboard keeps working alongside it.
 - The performance log's profiler samples the VU1 thread as well as the game thread, and its
   timers use QueryPerformanceCounter directly (cheaper than the C runtime clock it used before).
 
+#### Version 7.1: the I/O processor on its own core
+The PS2's I/O processor (it runs the 989snd sound driver and the SPU2 mixing, the disc and the
+memory cards) used to run on the game thread. It now runs on a thread of its own, and mostly
+while the game thread is waiting for its next VBlank: when the game goes idle, the I/O processor
+is brought up to the game's time and then runs ahead into the idle time, up to the next VBlank
+or timer. Whenever the game talks to it (an RPC, a SIF transfer, I/O processor memory), it is
+caught up to the game's exact time first, and what the I/O processor thread writes to the EE's
+side is applied on the game thread between two pieces of game code, so the game sees the same
+order of events as before. F2 > Game > **IOP thread** (on by default) turns it off.
+
+Measured on the same PC as above, the same five-opponent Challenge on Big Blue Stadium (same
+opponents), 2160p, frame rate Monitor (170 Hz), the same build with the IOP thread off and on,
+about 2.5 minutes of battle each:
+
+| | IOP thread off | IOP thread on |
+|---|---|---|
+| Game speed / window | 100% / 170 fps | 100% / 170 fps |
+| I/O processor work on the game thread | 80 ms per second (up to 126) | 2 ms per second (up to 7) |
+| Game thread busy | 527 ms per second on average, 768 at the peak | 460 ms per second on average, 643 at the peak |
+| IOP thread | – | 66 ms per second, 61 of them while the game waited for its next frame |
+| Sound | tempo within ±0.35%, no dry-outs | tempo within ±0.5%, no dry-outs |
+
+- The settings menu packs a tab's rows a little closer when it has many of them, so the help
+  text under the last row stays on screen.
+
 #### Version 7: full speed at 4K, and lighter on the CPU
 Measured on a Ryzen 7 3700X with an RTX 2080 SUPER, Challenge on Big Blue Stadium against five
 opponents, 16:9, **2160p** resolution, frame rate **Monitor (170 Hz)**:
@@ -215,7 +240,8 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - **Video**: display mode, resolution, aspect ratio, scaling, V-Sync, renderer, frame rate.
 - **Audio**: master volume, mute in the background.
 - **Game**: pause while the menu is open, pause in the background, FPS counter, screenshot
-  recording, screenshot, VU1 thread, game disc, field of view, camera distance, quit.
+  recording, screenshot, VU1 thread, IOP thread, game disc, field of view, camera distance,
+  quit.
 - **HUD**: the HUD editor, radar and weapon panel sizes, snap to screen edges, reset.
 - The **setup screen** (F2 > Game > Game disc > Setup, or "Show this screen at start") has the
   disc, Build game and Build shaders.
@@ -241,8 +267,9 @@ resolution), from the port's own performance log (CPU time of every thread of th
 
 ## Known issues
 
-- **The heaviest five-opponent moments need about 1.3 cores** (VU1 thread ~0.55, game thread
-  ~0.55, GS feed ~0.25 on a Ryzen 7 3700X). A CPU about half that fast per core is at its limit
+- **The heaviest five-opponent moments need about 1.6 cores, spread over four threads** (game
+  thread up to ~0.65, VU1 thread ~0.55, GS feed ~0.35, IOP thread ~0.1 on a Ryzen 7 3700X). The
+  game thread is the busiest single one: a CPU about half that fast per core is at its limit
   there; lower resolutions help the GPU but not these threads.
 - **The software (CPU) renderer's text looks rough**: it samples textures without filtering, so
   thin strokes of the small HUD font can drop out. The Vulkan renderer filters them.
@@ -260,9 +287,9 @@ resolution), from the port's own performance log (CPU time of every thread of th
 
 ## Coming in the future
 
-- **More headroom in the heaviest battles**: the I/O processor on a thread of its own, faster
-  VIF1 unpacking, cheaper MAC/status flags in compiled VU code, and overlapping more of each
-  frame's VU1 work with the game's own work, so slower CPUs stay at 60 fps too.
+- **More headroom in the heaviest battles**: faster VIF1 unpacking, cheaper MAC/status flags in
+  compiled VU code, and overlapping more of each frame's VU1 work with the game's own work, so
+  slower CPUs stay at 60 fps too.
 - **Native 120 fps**: running the game's frame timing, physics steps and animations at 120 Hz
   without speeding the game up and without in-between frames.
 - **Widescreen menus**: the 2D menu screens kept at their shape (pillarboxed) or adapted to 16:9.

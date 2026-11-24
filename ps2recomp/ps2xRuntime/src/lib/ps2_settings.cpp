@@ -203,6 +203,8 @@ namespace ps2settings
             out << "renderer=" << s.renderer << "\n";
             out << "# vu1_thread (GPU renderer): 1 = VIF1 and VU1 microcode run on their own CPU core, 0 = on the game thread. Next start.\n";
             out << "vu1_thread=" << (s.vu1Thread ? 1 : 0) << "\n";
+            out << "# iop_thread: 1 = the I/O processor (sound driver, disc, memory card) runs on its own CPU core, 0 = on the game thread. Next start.\n";
+            out << "iop_thread=" << (s.iopThread ? 1 : 0) << "\n";
         }
 
         void load()
@@ -266,6 +268,7 @@ namespace ps2settings
                 else if (key == "internal_resolution") s.internalScale = number <= 0 ? 0 : std::clamp(number + 1, 2, 3); // older files
                 else if (key == "internal_res") s.internalScale = std::clamp(number, 0, 3);
                 else if (key == "vu1_thread") s.vu1Thread = number != 0;
+                else if (key == "iop_thread") s.iopThread = number != 0;
                 else if (key == "resolution") s.resolution = std::clamp(number, 0, 4);
                 else if (key == "frame_rate") s.frameRate = std::clamp(number, 0, 2);
             }
@@ -660,6 +663,9 @@ namespace ps2settings
                 Row vu1{"VU1 thread", "Runs the PS2's 3D math unit (VU1) and the graphics feed on their own CPU core, so busy scenes stay at full speed. Applies on the next start.",
                         RowKind::Toggle, [&s] { return s.vu1Thread ? 1 : 0; }, [&s, changed](int v) { s.vu1Thread = v != 0; changed(); }};
                 rows.push_back(vu1);
+                Row iop{"IOP thread", "Runs the PS2's I/O processor (the sound driver, disc and memory card) on its own CPU core, alongside the game instead of inside it. Applies on the next start.",
+                        RowKind::Toggle, [&s] { return s.iopThread ? 1 : 0; }, [&s, changed](int v) { s.iopThread = v != 0; changed(); }};
+                rows.push_back(iop);
                 Row setup{"Game disc", g_setupNote.empty() ? "Opens the game setup screen (choose another disc, build again) the next time you start TMHO.exe."
                                                            : g_setupNote.c_str(),
                           RowKind::Action, [] { return 0; }, [](int)
@@ -841,7 +847,9 @@ namespace ps2settings
             float tabHeight;
         };
 
-        Layout computeLayout()
+        // rowCount: the rows of the open tab. A tab with many rows packs them a little closer, so its
+        // help text still fits between the last row and the footer.
+        Layout computeLayout(size_t rowCount = 0)
         {
             Layout l{};
             const float sw = static_cast<float>(GetScreenWidth());
@@ -854,6 +862,13 @@ namespace ps2settings
             l.tabHeight = 40.0f * l.scale;
             l.rowTop = l.tabTop + l.tabHeight + 18.0f * l.scale;
             l.rowHeight = 50.0f * l.scale;
+            if (rowCount > 0)
+            {
+                const float footerLine = l.drawer.height - 54.0f * l.scale; // the footer's separator
+                const float helpRoom = (10.0f + 2.0f * 14.0f * 1.35f + 14.0f + 6.0f) * l.scale; // three help lines
+                const float fit = (footerLine - helpRoom - l.rowTop) / static_cast<float>(rowCount);
+                l.rowHeight = std::clamp(fit, 36.0f * l.scale, 50.0f * l.scale);
+            }
             return l;
         }
 
@@ -899,8 +914,8 @@ namespace ps2settings
 
         void handleMenuInput()
         {
-            const Layout layout = computeLayout();
             std::vector<Row> rows = buildRows(g_tab);
+            const Layout layout = computeLayout(rows.size());
             g_focus = std::clamp(g_focus, 0, static_cast<int>(rows.size()) - 1);
 
             if (g_editingHex)
@@ -1077,7 +1092,8 @@ namespace ps2settings
 
         void drawDrawer()
         {
-            const Layout l = computeLayout();
+            const std::vector<Row> rows = buildRows(g_tab);
+            const Layout l = computeLayout(rows.size());
             const float s = l.scale;
             const uint32_t accent = accentRgb();
             const Color accentColor = rgb(accent);
@@ -1117,7 +1133,6 @@ namespace ps2settings
                           static_cast<int>(l.drawer.width - 2.0f * l.padding), 1, Color{255, 255, 255, 28});
 
             // Rows.
-            const std::vector<Row> rows = buildRows(g_tab);
             for (size_t i = 0; i < rows.size(); ++i)
             {
                 const Row &row = rows[i];

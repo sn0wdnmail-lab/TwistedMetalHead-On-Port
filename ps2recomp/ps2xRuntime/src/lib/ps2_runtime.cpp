@@ -2897,6 +2897,16 @@ void PS2Runtime::run()
 
     std::atomic<bool> gameThreadFinished{false};
 
+    // The I/O processor on a thread of its own (settings iop_thread; PS2X_IOP_THREAD=0 keeps it on
+    // the game thread). It starts with the game's first step of IOP time.
+    ps2x::iop::setIopThreadEnabled(ps2settings::get().iopThread);
+    ps2x::iop::setIopThreadStartHook([]()
+                                     {
+                                         ps2perf::registerThread("IOP thread (sound driver, disc, memory card)");
+                                         ps2host::raiseThisThread();
+                                         ps2perf::performanceNote("           IOP thread: on - the I/O processor (sound driver, disc, memory card) runs on its own CPU core");
+                                     });
+
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");

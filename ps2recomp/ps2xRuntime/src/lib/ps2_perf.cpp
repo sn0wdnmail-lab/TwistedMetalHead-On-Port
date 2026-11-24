@@ -2181,6 +2181,20 @@ namespace ps2perf
                               static_cast<double>(mtvu.syncs[2]) * perSecondStats,
                               static_cast<double>(mtvu.frameWaitNs) * perSecondStats / 1e6, static_cast<double>(mtvu.fullWaitNs) * perSecondStats / 1e6);
             }
+            char li[400] = "";
+            {
+                static ps2x::iop::IopThreadStats lastIop{};
+                const ps2x::iop::IopThreadStats iop = ps2x::iop::iopThreadStats();
+                if (iop.running)
+                    std::snprintf(li, sizeof(li),
+                                  "           IOP thread ms/s: busy %.0f (of it %.0f while the game waited) in %.0f pieces/s | game thread caught it up %.0f times/s (waited %.1f ms/s, ran %.1f ms/s of it itself), it was too far behind %.0f times/s | IOP writes to the EE side %.0f/s",
+                                  msPerSecond(iop.busyNs - lastIop.busyNs), msPerSecond(iop.aheadNs - lastIop.aheadNs),
+                                  static_cast<double>(iop.batches - lastIop.batches) * perSecond,
+                                  static_cast<double>(iop.syncs - lastIop.syncs) * perSecond, msPerSecond(iop.syncWaitNs - lastIop.syncWaitNs),
+                                  msPerSecond(iop.inlineNs - lastIop.inlineNs), static_cast<double>(iop.lagCatchUps - lastIop.lagCatchUps) * perSecond,
+                                  static_cast<double>(iop.effects - lastIop.effects) * perSecond);
+                lastIop = iop;
+            }
             char l8[256] = "";
             if (g_feedSeen.load(std::memory_order_relaxed))
             {
@@ -2296,6 +2310,8 @@ namespace ps2perf
                         writeLine(g_perfFile, l7);
                     if (l8[0] != '\0')
                         writeLine(g_perfFile, l8);
+                    if (li[0] != '\0')
+                        writeLine(g_perfFile, li);
                     writeLine(g_perfFile, l3);
                     writeLine(g_perfFile, lp);
                     writeLine(g_perfFile, la);
