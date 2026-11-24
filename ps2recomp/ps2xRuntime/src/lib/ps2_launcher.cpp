@@ -1,6 +1,7 @@
 // Game setup screen - see include/runtime/ps2_launcher.h.
 
 #include "runtime/ps2_launcher.h"
+#include "runtime/ps2_android.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/gs/gs_gpu_renderer.h"
 #include "ps2_settings_ui.h"
@@ -655,6 +656,16 @@ namespace ps2launcher
             std::mutex checkMutex;
             bool checkReady = false;
             DiscResult checkResult;
+            // Android: disc images found on the phone ("Next disc" steps through them).
+            std::vector<fs::path> found;
+            size_t foundIndex = 0;
+            std::unique_ptr<std::thread> searcher;
+            std::atomic<bool> searching{false};
+            std::mutex searchMutex;
+            bool searchReady = false;
+            std::vector<fs::path> searchResult;
+            bool storageAccess = true;
+            double storageCheckedAt = -10.0;
         };
 
         fs::path appDirectory()
@@ -747,6 +758,8 @@ namespace ps2launcher
             }
         }
 
+        std::vector<IsoFile> filesToBuild(const std::vector<IsoFile> &files, const GameInfo &game);
+
         bool canBuild(const Screen &screen)
         {
             const bool running = screen.build && screen.build->state == Build::Running;
@@ -764,13 +777,17 @@ namespace ps2launcher
             }
             if (screen.worker && screen.worker->joinable())
                 screen.worker->join();
+            const std::vector<IsoFile> files = filesToBuild(screen.discFiles, *screen.game);
+            uint64_t bytes = 0;
+            for (const IsoFile &file : files)
+                bytes += file.size;
             screen.build = std::make_unique<Build>();
-            screen.build->total = screen.discBytes;
-            screen.build->fileCount = static_cast<uint32_t>(screen.discFiles.size());
+            screen.build->total = bytes;
+            screen.build->fileCount = static_cast<uint32_t>(files.size());
             screen.build->state = Build::Running;
             screen.built = false;
-            screen.worker = std::make_unique<std::thread>(runBuild, screen.disc, screen.discFiles, gameDir(), savesDir(),
-                                                          std::string(screen.game->bootFile), screen.reuseDir, screen.build.get());
+            screen.worker = std::make_unique<std::thread>(runBuild, screen.disc, files, gameDir(), savesDir(), std::string(screen.game->bootFile),
+                                                          ps2android::active() ? fs::path() : screen.reuseDir, screen.build.get());
         }
 
         void pollBuild(Screen &screen)
@@ -827,6 +844,81 @@ namespace ps2launcher
             if (path.empty() || (screen.build && screen.build->state == Build::Running))
                 return;
             startCheck(screen, utf8Path(path));
+        }
+
+        // Android: disc images (.iso, over 64 MB) in the app's own folder and, with storage access,
+        // anywhere on the phone's storage or SD card (four folders deep; not Android/ or hidden folders).
+        std::vector<fs::path> searchDiscImages(const fs::path &appDir, bool storageAccess)
+        {
+            std::vector<fs::path> images;
+            std::error_code ec;
+            auto scan = [&images](const fs::path &dir, int depth, auto &&self) -> void
+            {
+                if (depth > 4 || images.size() >= 32)
+                    return;
+                std::error_code iterEc;
+                for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, iterEc), end; !iterEc && it != end; it.increment(iterEc))
+                {
+                    const fs::path entry = it->path();
+                    const std::string name = entry.filename().string();
+                    if (name.empty() || name[0] == '.')
+                        continue;
+                    std::error_code typeEc;
+                    if (it->is_directory(typeEc))
+                    {
+                        if (depth == 0 && name == "Android")
+                            continue; // other apps' folders
+                        self(entry, depth + 1, self);
+                    }
+                    else if (upper(entry.extension().string()) == ".ISO" && it->file_size(typeEc) > (64ull << 20))
+                        images.push_back(entry);
+                }
+            };
+            scan(appDir, 1, scan);
+            if (storageAccess)
+            {
+                for (const std::string &root : ps2android::storageRoots())
+                    scan(utf8Path(root), 0, scan);
+            }
+            std::sort(images.begin(), images.end());
+            images.erase(std::unique(images.begin(), images.end()), images.end());
+            (void)ec;
+            return images;
+        }
+
+        void startSearch(Screen &screen)
+        {
+            if (screen.searching.load())
+                return;
+            if (screen.searcher && screen.searcher->joinable())
+                screen.searcher->join();
+            screen.searching = true;
+            Screen *target = &screen;
+            const fs::path appDir = g_appDir;
+            const bool storageAccess = screen.storageAccess; // asked on this thread: Java is called from the main thread only
+            screen.searcher = std::make_unique<std::thread>([target, appDir, storageAccess]()
+                                                            {
+                                                                std::vector<fs::path> images = searchDiscImages(appDir, storageAccess);
+                                                                std::lock_guard<std::mutex> lock(target->searchMutex);
+                                                                target->searchResult = std::move(images);
+                                                                target->searchReady = true;
+                                                                target->searching = false; });
+        }
+
+        // Android keeps no copy of the game's files: Build copies only the game program, SYSTEM.CNF and
+        // the I/O processor's modules; everything else is read straight from the disc image.
+        std::vector<IsoFile> filesToBuild(const std::vector<IsoFile> &files, const GameInfo &game)
+        {
+            if (!ps2android::active())
+                return files;
+            std::vector<IsoFile> kept;
+            for (const IsoFile &file : files)
+            {
+                const std::string path = upper(file.path);
+                if (path == upper(game.bootFile) || path == "SYSTEM.CNF" || path.rfind("MOD/", 0) == 0)
+                    kept.push_back(file);
+            }
+            return kept;
         }
 
         // First start: look for a single .iso near the executable (also ..\..\Game Rom).
@@ -995,15 +1087,45 @@ namespace ps2launcher
         }
         if (screen.discState == Disc::None)
         {
-            const fs::path found = findDisc(game);
-            if (!found.empty())
-                startCheck(screen, found);
+            if (ps2android::active())
+            {
+                screen.storageAccess = ps2android::hasStorageAccess();
+                startSearch(screen); // the app's folder always; the whole phone with storage access
+            }
+            else
+            {
+                const fs::path found = findDisc(game);
+                if (!found.empty())
+                    startCheck(screen, found);
+            }
         }
         if (const char *pick = std::getenv("PS2X_SETUP_DISC"); pick && *pick) // tests: as if chosen with Browse
             selectDisc(screen, pick);
 
         while (!WindowShouldClose() && !ps2settings::quitRequested())
         {
+            if (ps2android::active())
+            {
+                {
+                    std::lock_guard<std::mutex> lock(screen.searchMutex);
+                    if (screen.searchReady)
+                    {
+                        screen.searchReady = false;
+                        screen.found = std::move(screen.searchResult);
+                        screen.foundIndex = 0;
+                        if (!screen.found.empty() && screen.discState == Disc::None)
+                            startCheck(screen, screen.found.front());
+                    }
+                }
+                // Storage access is given on a system page: look again once it is allowed.
+                if (!screen.storageAccess && GetTime() - screen.storageCheckedAt > 1.0)
+                {
+                    screen.storageCheckedAt = GetTime();
+                    screen.storageAccess = ps2android::hasStorageAccess();
+                    if (screen.storageAccess && screen.disc.empty())
+                        startSearch(screen);
+                }
+            }
             pollCheck(screen);
             pollBuild(screen);
             pollShaderBuild(screen);
@@ -1067,7 +1189,13 @@ namespace ps2launcher
             DrawRectangle(static_cast<int>(left), static_cast<int>(y), static_cast<int>(4.0f * s), static_cast<int>(58.0f * s), look.accentColor);
             ui::text("GAME SETUP", left + 16.0f * s, y - 2.0f * s, 13.0f * s, look.accentColor, true);
             ui::text(game.title, left + 16.0f * s, y + 14.0f * s, 30.0f * s, WHITE, true);
-            const std::string subtitle = std::string(game.subtitle) + " " + ps2settings::kPortVersion;
+            std::string subtitle = std::string(game.subtitle) + " " + ps2settings::kPortVersion;
+            if (ps2android::active())
+            {
+                const size_t pc = subtitle.find("PC port");
+                if (pc != std::string::npos)
+                    subtitle.replace(pc, 7, "Android port");
+            }
             ui::text(subtitle.c_str(), left + 16.0f * s, y + 46.0f * s, 15.0f * s, kMuted, false);
             const char *f2 = "F2  SETTINGS";
             const float f2Size = 12.0f * s;
@@ -1089,8 +1217,20 @@ namespace ps2launcher
             stepBadge(look, left, y, 1, !discOk, discOk);
             ui::text("Game disc", textLeft, y + 2.0f * s, 18.0f * s, kBody, true);
             {
-                const std::string where = screen.disc.empty() ? std::string("Choose your disc image (.iso), or drag it onto this window.")
-                                                              : fitPath(pathText(screen.disc), 14.0f * s, textWidth);
+                std::string where = screen.disc.empty() ? std::string("Choose your disc image (.iso), or drag it onto this window.")
+                                                        : fitPath(pathText(screen.disc), 14.0f * s, textWidth);
+                if (ps2android::active() && screen.disc.empty())
+                {
+                    if (screen.searching.load())
+                        where = "Looking for your disc image (.iso) on this phone...";
+                    else if (!screen.storageAccess)
+                        where = "Allow access to your files, so the game can find your disc image (.iso).";
+                    else
+                        where = "No disc image found. Copy your .iso to this phone (for example into Download), then tap Search.";
+                }
+                else if (ps2android::active() && screen.found.size() > 1)
+                    where = fitPath(pathText(screen.disc) + "  (" + std::to_string(screen.foundIndex + 1) + " of " + std::to_string(screen.found.size()) + ")",
+                                    14.0f * s, textWidth);
                 ui::text(where.c_str(), textLeft, y + 26.0f * s, 14.0f * s, kMuted, false);
                 if (screen.discState != Disc::None)
                 {
@@ -1111,7 +1251,19 @@ namespace ps2launcher
                 }
             }
             const Rectangle browseRect{right - buttonW, y + 4.0f * s, buttonW, buttonH};
-            if (button(look, browseRect, screen.disc.empty() ? "Browse..." : "Change...", screen.focus == ItemBrowse, !buildRunning && !menuOpen, false))
+            const char *browseLabel = screen.disc.empty() ? "Browse..." : "Change...";
+            if (ps2android::active())
+            {
+                if (!screen.storageAccess && screen.disc.empty())
+                    browseLabel = "Allow access";
+                else if (screen.searching.load())
+                    browseLabel = "Searching";
+                else if (screen.found.size() > 1)
+                    browseLabel = "Next disc";
+                else
+                    browseLabel = screen.disc.empty() ? "Search" : "Search again";
+            }
+            if (button(look, browseRect, browseLabel, screen.focus == ItemBrowse, !buildRunning && !menuOpen && !screen.searching.load(), false))
                 activate[ItemBrowse] = true;
             if (!menuOpen && CheckCollisionPointRec(GetMousePosition(), browseRect) && (GetMouseDelta().x != 0.0f || GetMouseDelta().y != 0.0f))
                 screen.focus = ItemBrowse;
@@ -1145,7 +1297,8 @@ namespace ps2launcher
                 {
                     statusIcon(look, textLeft, y + 27.0f * s, kGood, true);
                     ui::text("Built - ready to play.", textLeft + 24.0f * s, y + 26.0f * s, 14.0f * s, kGood, false);
-                    const std::string where = "Saved in the \"game\" folder beside TMHO.exe.";
+                    const std::string where = ps2android::active() ? std::string("The game reads everything else straight from your disc image.")
+                                                                   : std::string("Saved in the \"game\" folder beside TMHO.exe.");
                     ui::text(fitPath(where, 14.0f * s, textWidth).c_str(), textLeft, y + 47.0f * s, 14.0f * s, kMuted, false);
                 }
                 else if (failed)
@@ -1166,6 +1319,8 @@ namespace ps2launcher
                     line += " and gets them ready to play.";
                     if (discOk && !screen.reuseDir.empty())
                         line = "Reuses the files of your last build, so it takes no extra disk space.";
+                    if (ps2android::active())
+                        line = "Gets the game program ready (a few MB); the rest is read straight from your disc image.";
                     ui::text(fitPath(line, 14.0f * s, textWidth).c_str(), textLeft, y + 26.0f * s, 14.0f * s, kMuted, false);
                     if (screen.discState == Disc::Different && screen.confirmDifferent)
                         ui::text("Click again to build this version anyway.", textLeft, y + 47.0f * s, 14.0f * s, kWarn, false);
@@ -1283,7 +1438,8 @@ namespace ps2launcher
                 screen.focus = ItemPlay;
 
             // Footer hints.
-            const char *hint = "\xE2\x86\x91\xE2\x86\x93  select     Enter  choose     F2  settings";
+            const char *hint = ps2android::active() ? "Tap to choose     Back  settings"
+                                                    : "\xE2\x86\x91\xE2\x86\x93  select     Enter  choose     F2  settings";
             const float hintSize = 12.5f * s;
             ui::text(hint, card.x + (card.width - ui::textWidth(hint, hintSize, false)) * 0.5f, card.y + card.height + 10.0f * s, hintSize,
                      Color{100, 108, 122, 255}, false);
@@ -1292,7 +1448,24 @@ namespace ps2launcher
             EndDrawing();
 
             // ---- actions (after drawing: the file dialog blocks)
-            if (activate[ItemBrowse] && !buildRunning)
+            if (activate[ItemBrowse] && !buildRunning && ps2android::active())
+            {
+                if (!screen.storageAccess && screen.disc.empty())
+                    ps2android::requestStorageAccess();
+                else if (screen.found.size() > 1)
+                {
+                    screen.foundIndex = (screen.foundIndex + 1) % screen.found.size();
+                    selectDisc(screen, pathText(screen.found[screen.foundIndex]));
+                }
+                else
+                {
+                    screen.disc.clear();
+                    screen.discState = Disc::None;
+                    screen.storageAccess = ps2android::hasStorageAccess();
+                    startSearch(screen);
+                }
+            }
+            else if (activate[ItemBrowse] && !buildRunning)
             {
                 const std::string picked = openDiscImageDialog(GetWindowHandle());
                 selectDisc(screen, picked);
@@ -1318,6 +1491,8 @@ namespace ps2launcher
 
         if (screen.checker && screen.checker->joinable())
             screen.checker->join();
+        if (screen.searcher && screen.searcher->joinable())
+            screen.searcher->join();
         if (screen.worker && screen.worker->joinable())
             screen.worker->join(); // closing the window while building: let the copy finish its file
         if (screen.shaderWorker && screen.shaderWorker->joinable())

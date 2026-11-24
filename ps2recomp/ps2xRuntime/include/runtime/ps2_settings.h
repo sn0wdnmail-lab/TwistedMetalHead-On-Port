@@ -15,7 +15,7 @@ struct Rectangle;
 namespace ps2settings
 {
     // This port's version, shown on the setup screen and in the window title.
-    inline constexpr const char *kPortVersion = "V8";
+    inline constexpr const char *kPortVersion = "V9";
 
     struct Settings
     {
@@ -56,6 +56,7 @@ namespace ps2settings
         int gsDownloadPrediction = 1; // tuning (hidden): answer small per-frame GS downloads from the frame before
         // V8
         int brightness = 100;       // picture brightness in percent (70..150): a gamma curve, 100 = the game's own
+        int sharpening = 0;         // V9: picture sharpening in percent (0 = off)
         int musicVolume = 100;      // 0..100: the SPU2's sound data input (streamed music) outside movies
         int effectsVolume = 100;    // 0..100: the SPU2's voices (engines, guns, explosions, voices)
         int movieVolume = 100;      // 0..100: the sound data input while a movie plays
@@ -64,6 +65,16 @@ namespace ps2settings
         bool pauseOnPadLoss = true; // pause (open this menu) when the controller in use disconnects
         int windowX = -1, windowY = -1; // windowed mode: where the window was left (-1 = centred)
         int windowW = 0, windowH = 0;   // windowed mode: its size (0 = from the resolution)
+        // V9
+        int touchControls = 0;      // on-screen controls: 0 auto (touch screens, hidden while a controller is used), 1 always, 2 off
+        int touchOpacity = 60;      // 20..100 (%)
+        int touchSize = 100;        // 60..150 (%)
+        bool touchVibrate = true;   // a short vibration when an on-screen button is pressed (phones)
+        int touchLeft = 0;          // left thumb: 0 D-pad, 1 analog stick
+        // V9: button remapping, by ps2settings::PadBind. keyMap: a raylib key (0 = the default
+        // keys); padMap: a raylib gamepad button + 1 (0 = the controller's own button).
+        int keyMap[16] = {};
+        int padMap[16] = {};
     };
 
     // Lines of each picture resolution (F2 > Video > Resolution).
@@ -125,6 +136,20 @@ namespace ps2settings
     // windowed or borderless); see ps2present::afterPresent.
     bool compositorSync() noexcept;
     void fixFrameCopy(unsigned char *pixels, size_t pixelCount) noexcept;
+
+    // Opens the drawer (the on-screen settings button, Android's Back). Window thread.
+    void openMenu() noexcept;
+
+    // V9: the PS2 controller's buttons, in the order of Settings::keyMap / padMap.
+    enum PadBind
+    {
+        BindUp, BindDown, BindLeft, BindRight, BindCross, BindCircle, BindSquare, BindTriangle,
+        BindL1, BindR1, BindL2, BindR2, BindStart, BindSelect, BindL3, BindR3, BindCount
+    };
+    // Any thread (the pad is read on the game thread): the keyboard key(s) for a PS2 button are
+    // held, and the controller button that stands for it (raylib's numbering).
+    bool bindKeyDown(int bind) noexcept;
+    int bindPadButton(int bind) noexcept;
 
     // A short message at the top of the window for a few seconds ("Screenshot saved: ...").
     // Window thread.

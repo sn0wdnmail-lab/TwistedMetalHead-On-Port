@@ -1,5 +1,7 @@
 #include "runtime/ps2_vfs.h"
 
+#include "ps2_runtime.h" // the disc image, for cdrom0: files that were not copied out of it
+#include "runtime/ps2_disc_image.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_rom_device.h"
 
@@ -105,6 +107,74 @@ namespace
         size_t m_position = 0u;
     };
 
+    // A cdrom0: file read straight from the disc image (the Android version keeps no copy of the
+    // game's files): a window of the image, read only.
+    class DiscImageOpenFile final : public IPS2OpenFile
+    {
+    public:
+        DiscImageOpenFile(FILE *image, uint64_t base, uint64_t size) : m_image(image), m_base(base), m_size(size) {}
+        ~DiscImageOpenFile() override
+        {
+            if (m_image)
+                std::fclose(m_image);
+        }
+
+        int64_t read(void *destination, size_t size) override
+        {
+            if ((!destination && size != 0u) || !m_image)
+                return -1;
+            const uint64_t available = m_position < m_size ? m_size - m_position : 0u;
+            const size_t count = static_cast<size_t>(std::min<uint64_t>(size, available));
+            if (count == 0u)
+                return 0;
+#if defined(_WIN32)
+            if (_fseeki64(m_image, static_cast<long long>(m_base + m_position), SEEK_SET) != 0)
+#else
+            if (fseeko(m_image, static_cast<off_t>(m_base + m_position), SEEK_SET) != 0)
+#endif
+                return -1;
+            const size_t got = std::fread(destination, 1u, count, m_image);
+            m_position += got;
+            return static_cast<int64_t>(got);
+        }
+
+        int64_t write(const void *, size_t) override
+        {
+            return -1;
+        }
+
+        int64_t seek(int64_t offset, int whence) override
+        {
+            int64_t base = 0;
+            if (whence == SEEK_CUR)
+                base = static_cast<int64_t>(m_position);
+            else if (whence == SEEK_END)
+                base = static_cast<int64_t>(m_size);
+            else if (whence != SEEK_SET)
+                return -1;
+            const int64_t position = base + offset;
+            if (position < 0 || static_cast<uint64_t>(position) > m_size)
+                return -1;
+            m_position = static_cast<uint64_t>(position);
+            return position;
+        }
+
+    private:
+        FILE *m_image = nullptr;
+        uint64_t m_base = 0;
+        uint64_t m_size = 0;
+        uint64_t m_position = 0;
+    };
+
+    // The disc image's entry for a cdrom0: path, when that file is not in the game folder.
+    bool discImageEntry(const ps2x::iop::ParsedPs2Path &parsed, ps2disc::Entry &entry)
+    {
+        if (parsed.device != ps2x::iop::Ps2PathDevice::Cdrom)
+            return false;
+        const std::filesystem::path &image = PS2Runtime::getIoPaths().cdImage;
+        return !image.empty() && ps2disc::find(image, parsed.path, entry);
+    }
+
     const char *hostMode(uint32_t flags)
     {
         const bool read = (flags & PS2_FIO_O_RDONLY) != 0u || (flags & PS2_FIO_O_RDWR) == PS2_FIO_O_RDWR;
@@ -184,6 +254,25 @@ int32_t PS2Vfs::open(std::string_view path, uint32_t flags, const PS2VfsMounts &
             return -1;
         }
 
+        ps2disc::Entry entry;
+        if (!exists && (flags & PS2_FIO_O_RDWR) == PS2_FIO_O_RDONLY && discImageEntry(parsed, entry))
+        {
+#if defined(_WIN32)
+            FILE *image = ::_wfopen(PS2Runtime::getIoPaths().cdImage.c_str(), L"rb");
+#else
+            FILE *image = std::fopen(PS2Runtime::getIoPaths().cdImage.string().c_str(), "rb");
+#endif
+            if (!image)
+                return -1;
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_nextDescriptor < 3)
+                m_nextDescriptor = 3;
+            const int32_t descriptor = m_nextDescriptor++;
+            m_descriptors.emplace(descriptor, OpenDescriptor{std::make_unique<DiscImageOpenFile>(image, entry.offset, entry.size),
+                                                             parsed.deviceName, std::string(path)});
+            return descriptor;
+        }
+
         FILE *stream = std::fopen(hostPath.string().c_str(), hostMode(flags));
         const uint32_t access = flags & PS2_FIO_O_RDWR;
         if (!stream && !exists && (flags & PS2_FIO_O_CREAT) != 0u &&
@@ -252,7 +341,14 @@ bool PS2Vfs::stat(std::string_view path, const PS2VfsMounts &mounts, const PS2Ro
     std::error_code error;
     const auto status = std::filesystem::status(hostPath, error);
     if (error || !std::filesystem::exists(status))
-        return false;
+    {
+        ps2disc::Entry entry;
+        if (!discImageEntry(parsed, entry))
+            return false;
+        result.size = entry.size; // in the disc image, not in the game folder
+        result.readOnly = true;
+        return true;
+    }
     result.directory = std::filesystem::is_directory(status);
     if (!result.directory)
     {

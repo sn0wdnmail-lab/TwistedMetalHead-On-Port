@@ -1,3 +1,5 @@
+#include "runtime/ps2_disc_image.h"
+
 #include <algorithm>
 #include <cctype>
 
@@ -9,6 +11,7 @@ namespace
     struct CdFileEntry
     {
         std::filesystem::path hostPath;
+        uint64_t hostOffset = 0; // where the file starts in hostPath (the disc image when read from it)
         uint32_t sizeBytes = 0;
         uint32_t baseLbn = 0;
         uint32_t sectors = 0;
@@ -372,8 +375,26 @@ namespace
                     }
                     else
                     {
-                        g_lastCdError = -1;
-                        return false;
+                        // Not in the game folder (the Android version keeps no copy of the
+                        // disc's files): read it straight from the disc image.
+                        ps2disc::Entry discEntry;
+                        const std::filesystem::path image = getCdImagePath();
+                        if (image.empty() || !ps2disc::find(image, normalizeCdPathNoPrefix(ps2Path), discEntry))
+                        {
+                            g_lastCdError = -1;
+                            return false;
+                        }
+                        CdFileEntry entry;
+                        entry.hostPath = image;
+                        entry.hostOffset = discEntry.offset;
+                        entry.sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(discEntry.size, 0xFFFFFFFFu));
+                        entry.baseLbn = g_nextPseudoLbn;
+                        entry.sectors = sectorsForBytes(discEntry.size);
+                        g_nextPseudoLbn += entry.sectors + 1;
+                        g_cdFilesByKey.emplace(key, entry);
+                        entryOut = entry;
+                        g_lastCdError = 0;
+                        return true;
                     }
                 }
             }
@@ -444,7 +465,7 @@ namespace
 
             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
             const uint64_t offset = relativeLbn * kCdSectorSize;
-            return readHostRange(entry.hostPath, offset, dst, byteCount);
+            return readHostRange(entry.hostPath, entry.hostOffset + offset, dst, byteCount);
         }
 
         const std::filesystem::path cdImage = getCdImagePath();

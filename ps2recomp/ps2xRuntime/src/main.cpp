@@ -1,5 +1,6 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#include "runtime/ps2_android.h"
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_perf.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -10,9 +11,11 @@
 #include "ps2_log.h"
 #endif
 
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <filesystem>
+#include <thread>
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
@@ -35,6 +38,11 @@ extern "C" __declspec(dllimport) int __stdcall TerminateProcess(void *process, u
     std::fflush(nullptr);
 #if defined(_WIN32)
     TerminateProcess(GetCurrentProcess(), static_cast<unsigned int>(code));
+#endif
+#if defined(__ANDROID__)
+    // Close the app's screen first, or Android may start it again when the process ends.
+    ps2android::finishActivity();
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
 #endif
     std::_Exit(code);
 }

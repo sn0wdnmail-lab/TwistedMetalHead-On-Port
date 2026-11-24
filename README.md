@@ -1,7 +1,7 @@
 # Twisted Metal: Head-On – Extra Twisted Edition — PC Port
 
 A native Windows port of **Twisted Metal: Head-On – Extra Twisted Edition** (PlayStation 2,
-SCUS-97621, NTSC-U).
+SCUS-97621, NTSC-U) — since V9 also for **Android** (with on-screen controls) and **Linux**.
 
 This is not an emulator running the game. The game's own PS2 program (`SCUS_976.21`, about 7,260
 functions) is **statically recompiled to C++** with [PS2Recomp](https://github.com/ran-j/PS2Recomp)
@@ -49,6 +49,47 @@ A controller works too; the keyboard keeps working alongside it. With an Xbox or
 controller the game's own **vibration** works (V8).
 
 ---
+
+## Android and Linux (V9)
+
+### Android
+- An APK for 64-bit ARM phones and tablets (Android 9 or newer), built from the same code. The
+  game's graphics run on Vulkan (paraLLEl-GS), the picture is shown with OpenGL ES 3.
+- **On-screen controls**: D-pad or analog stick, the four face buttons, L1/L2/R1/R2, Select,
+  Start and a settings button. In "Auto" they hide while a controller is used and come back on
+  the next touch; size, opacity, left-thumb style and a short vibration per press are in
+  F2 > Controls. Bluetooth and USB controllers work as on PC. The phone's Back button opens the
+  settings.
+- **No 4 GB copy**: the setup screen finds the player's `.iso` on the phone (after "Allow
+  access" - all files access, Android 11+) and Build only prepares the game program; every other
+  file - and the music and movies - is read straight from the disc image.
+- Starts at 720p and 16:9; pauses and goes quiet when the app leaves the screen; settings,
+  saves, logs and screenshots live in `Android/data/io.github.sn0wdnmaillab.tmhoport/files`.
+- Built without Gradle: `port/android/build_apk.sh` (aapt2, javac + d8, zipalign, apksigner).
+  The signing key is kept private, outside the repository.
+- **Not tested on a phone yet** (no Android device was available while it was made): reports
+  with the three log files are very welcome.
+
+### Linux
+- `TMHO-Linux.tar.gz`: the same program for x86-64 Linux (`port/package/package_linux.sh`),
+  with FFmpeg and the C++ runtime linked in, so it needs only glibc 2.38+ (Ubuntu 24.04, Fedora
+  39, Debian 13, Arch, SteamOS 3.6+), OpenGL, X11 (or XWayland) and a Vulkan driver.
+
+### Also new in V9 (all versions)
+- **Button remapping** (F2 > Controls): every PS2 button's keyboard key and controller button;
+  select a row and press the new key or button. The drawer scrolls when a tab has more rows than
+  fit.
+- **Sharpening** (F2 > Video), 0-100 %: contrast-adaptive, strongest on soft detail and gentle on
+  edges that are already hard.
+- **Import PCSX2 save** (F2 > Game): copies this game's saves from a PCSX2 memory card (`.ps2`
+  file with or without ECC, or a folder card) into the port's card; saves of the same name go to
+  a dated backup folder first.
+- **PlayStation controller rumble on Windows**: DualShock 4 and DualSense, over USB or Bluetooth
+  (HID output reports), when no XInput controller is connected.
+- **Shaders built in the background are saved as soon as they are all built** (not only at quit),
+  so a crash or a phone closing the app keeps them.
+- A click or tap on a slider sets it where it lands; paraLLEl-GS's texture cache is capped on
+  GPUs that share the system's memory (phones, integrated GPUs).
 
 ## What the PC port includes
 
@@ -275,11 +316,13 @@ resolution), from the port's own performance log (CPU time of every thread of th
 
 ### Settings menu (F2)
 - **Video**: display mode, resolution, aspect ratio, scaling, V-Sync, renderer, frame rate,
-  brightness.
+  brightness, sharpening (V9).
 - **Audio**: master, music, effects and movie volume, mute in the background.
 - **Game**: pause while the menu is open, pause in the background, FPS counter, skip intro
   movies, controller vibration, pause on controller loss, screenshot recording, screenshot, VU1
-  thread, IOP thread, game disc, field of view, camera distance, quit.
+  thread, IOP thread, game disc, import PCSX2 save (V9), field of view, camera distance, quit.
+- **Controls** (V9): on-screen controls (Android), and remapping of every PS2 button's key and
+  controller button.
 - **HUD**: the HUD editor, radar and weapon panel sizes, snap to screen edges, reset.
 - The **setup screen** (F2 > Game > Game disc > Setup, or "Show this screen at start") has the
   disc, Build game and Build shaders.
@@ -325,6 +368,10 @@ resolution), from the port's own performance log (CPU time of every thread of th
   switched the game's floating-point maths to the PS2's own rounding, the most likely cause; if
   it still happens, please report where.
 - **Reverb** of the SPU2 is not emulated yet, so a few sounds are drier than on a PS2.
+- **Android is untested on real phones so far**; phones whose Vulkan driver lacks what
+  paraLLEl-GS needs (descriptor indexing, 8/16-bit storage, subgroup operations) fall back to the
+  much slower software renderer.
+- **The Linux build needs glibc 2.38 or newer** (it is built on Ubuntu 24.04).
 
 ## Coming in the future
 
@@ -338,8 +385,11 @@ resolution), from the port's own performance log (CPU time of every thread of th
   to keep their shape.
 - **More accurate sound**: SPU2 reverb.
 - **Collision follow-up**: tracking down any remaining fall-through spots.
-- **Controls menu**: remapping keys and controller buttons in F2.
-- **Linux release** (the code already builds and runs on Linux).
+- **Android tuning** once it has been tried on phones: performance, the on-screen layout, phone
+  vibration for the game's rumble.
+- **4:3 menus with side bars in widescreen**: the widescreen mode changes the game's projection
+  tables and text layout globally, so keeping only the 2D menus at 4:3 needs a reliable
+  menu/battle switch for all of those - planned, not in V9.
 
 ---
 

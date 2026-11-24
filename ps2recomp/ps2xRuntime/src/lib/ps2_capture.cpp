@@ -1,3 +1,4 @@
+#include "runtime/ps2_launcher.h"
 #include "ps2_capture.h"
 
 #include "runtime/ps2_perf.h"
@@ -300,7 +301,7 @@ namespace ps2capture
 #endif
             char stamp[48];
             std::strftime(stamp, sizeof(stamp), "TMHO %Y-%m-%d %H-%M-%S", &local);
-            const std::filesystem::path folder = pathFromUtf8(GetApplicationDirectory()) / "Screenshots";
+            const std::filesystem::path folder = pathFromUtf8(ps2launcher::executableDirectory().c_str()) / "Screenshots";
             std::error_code error;
             std::filesystem::create_directories(folder, error);
             if (error)

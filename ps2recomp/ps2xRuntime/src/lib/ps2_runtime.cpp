@@ -8,6 +8,9 @@
 #include "ps2_gs_download.h"
 #include "ps2_capture.h"
 #include "runtime/ps2_mtvu.h"
+#include "runtime/ps2_touch.h"
+#include "runtime/ps2_gl_shader.h"
+#include "runtime/ps2_launcher.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/gs/gs_gpu_renderer.h"
 #include "runtime/ps2_host_wait.h"
@@ -469,7 +472,7 @@ static const char *const kBgraFragmentShader =
 
 static void LoadBgraShader()
 {
-    Shader shader = LoadShaderFromMemory(nullptr, kBgraFragmentShader);
+    Shader shader = LoadShaderFromMemory(nullptr, ps2gl::fragmentSource(kBgraFragmentShader).c_str());
     // A shader that fails to build comes back as raylib's default one: keep the CPU conversion then.
     if (shader.id != 0u && shader.id != rlGetShaderIdDefault())
     {
@@ -674,7 +677,7 @@ namespace ps2perf
 // 1 software), else the GPU. A GPU that cannot start falls back to the software renderer.
 static void startGsRenderer(GSRegisters &privRegs)
 {
-    const std::string iniPath = std::string(GetApplicationDirectory()) + "settings.ini";
+    const std::string iniPath = ps2launcher::executableDirectory() + "settings.ini";
     ps2settings::loadEarly(iniPath.c_str());
     ps2perf::applyCpuLimit(ps2settings::get().cpuLimitPercent);
     bool wantGpu = ps2settings::get().renderer == 0;
@@ -1030,7 +1033,11 @@ bool PS2Runtime::initialize(const char *title)
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         SetTraceLogCallback(rayLogToGraphics);
         const std::string versionedTitle = std::string(title ? title : "") + "  (PC port " + ps2settings::kPortVersion + ")";
+#if defined(__ANDROID__)
+        InitWindow(0, 0, versionedTitle.c_str()); // the whole screen, at its own resolution
+#else
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, versionedTitle.c_str());
+#endif
         describePresenter();
         if (!ps2gpu::active())
         {
@@ -1046,7 +1053,7 @@ bool PS2Runtime::initialize(const char *title)
         // Esc belongs to the game and the F2 settings drawer, not to closing the window.
         SetExitKey(KEY_NULL);
         // F2 settings drawer: loads settings.ini and applies window mode, V-Sync and volume.
-        ps2settings::initialize((std::string(GetApplicationDirectory()) + "settings.ini").c_str());
+        ps2settings::initialize((ps2launcher::executableDirectory() + "settings.ini").c_str());
         // SPU2 output: a 48 kHz stereo stream pulled from the IOP's sound processor.
         if (IsAudioDeviceReady() && !std::getenv("PS2X_NO_AUDIO"))
         {
@@ -3111,6 +3118,7 @@ void PS2Runtime::run()
         UploadFrame(frameTex, this, presentWidth, presentHeight, uploaded);
         // F2 drawer: toggling, menu input, window mode / V-Sync / scaling filter / volume.
         ps2settings::update(&frameTex);
+        ps2touch::update(); // on-screen controls (touch screens)
         // Minimized: nothing is shown, so the picture is neither scaled nor drawn (the game keeps
         // running and playing its sound); the window only checks its messages about 60 times a
         // second until it is restored (FLAG_WINDOW_ALWAYS_RUN keeps raylib from parking here).
@@ -3159,6 +3167,7 @@ void PS2Runtime::run()
             }
             ps2capture::afterPicture(dstX, dstY, dstWidth, dstHeight); // F12, before the FPS counter and menus
         }
+        ps2touch::draw();
         ps2settings::draw(ps2perf::lastSpeedPercent());
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {

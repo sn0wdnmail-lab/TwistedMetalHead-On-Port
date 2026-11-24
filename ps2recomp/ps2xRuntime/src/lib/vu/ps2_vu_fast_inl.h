@@ -270,6 +270,17 @@ namespace vufast
             _mm_setcsr((saved & ~0x6000u) | 0x6000u /*RZ*/ | 0x8000u /*FTZ*/ | 0x0040u /*DAZ*/ | 0x1F80u /*masks*/);
         }
         ~VuFpEnvironment() { _mm_setcsr(saved); }
+#elif defined(__aarch64__)
+        // FPCR: RMode (bits 23:22) = 11 round toward zero, FZ (bit 24) flushes denormal inputs and
+        // results; NEON arithmetic follows FPCR on AArch64, so sse2neon's vector maths does too.
+        uint64_t saved;
+        VuFpEnvironment()
+        {
+            __asm__ volatile("mrs %0, fpcr" : "=r"(saved));
+            const uint64_t mode = (saved & ~(3ull << 22)) | (3ull << 22) | (1ull << 24);
+            __asm__ volatile("msr fpcr, %0" : : "r"(mode));
+        }
+        ~VuFpEnvironment() { __asm__ volatile("msr fpcr, %0" : : "r"(saved)); }
 #else
         int saved;
         VuFpEnvironment() : saved(std::fegetround()) { std::fesetround(FE_TOWARDZERO); }

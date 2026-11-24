@@ -2922,7 +2922,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
                 rapidReads = 0;
             }
         }
-        const bool path3Masked = std::atomic_ref<bool>(const_cast<bool &>(m_path3Masked)).load(std::memory_order_acquire);
+        const bool path3Masked = __atomic_load_n(&m_path3Masked, __ATOMIC_ACQUIRE);
         if (g_eeTimerBatch.fqcLive && g_eeTimerBatch.pendingCycles > g_eeTimerBatch.fqcSetAt)
         {
             auto gifStatIt = m_ioRegisters.find(kGifStatRegister);

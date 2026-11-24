@@ -375,7 +375,7 @@ index 9f05da8..ead4b49 100644
  
  	void update_texture_page_rects();
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
-index dbe032d..8a48702 100644
+index dbe032d..3b410a8 100644
 --- a/gs/gs_renderer.cpp
 +++ b/gs/gs_renderer.cpp
 @@ -4,6 +4,9 @@
@@ -450,7 +450,24 @@ index dbe032d..8a48702 100644
  			}
  		});
  
-@@ -888,6 +917,16 @@ void GSRenderer::check_flush_stats()
+@@ -860,6 +889,16 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
+ 		}
+ 	}
+ 
++	// A GPU that shares the system's memory (phones, integrated and software GPUs) reports most of
++	// the RAM as its budget. A third of that as texture cache leaves the rest of the system short
++	// (a phone closes the app): keep the cache to a size that fits a PS2 game easily.
++	if (device->get_gpu_properties().deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
++	{
++		max_image_slab_size = std::min<VkDeviceSize>(max_image_slab_size, VkDeviceSize(512) * 1024 * 1024);
++		max_allocated_image_memory_per_flush =
++				std::min<VkDeviceSize>(max_allocated_image_memory_per_flush, VkDeviceSize(128) * 1024 * 1024);
++	}
++
+ 	LOGI("Using image slab size of %llu MiB.\n",
+ 	     static_cast<unsigned long long>(max_image_slab_size / (1024 * 1024)));
+ 	LOGI("Using max allocated image memory per flush of %llu MiB.\n",
+@@ -888,6 +927,16 @@ void GSRenderer::check_flush_stats()
  	    stats.num_copies >= MaxPendingCopies ||
  	    stats.num_palette_updates >= MaxPendingPaletteUploads)
  	{
@@ -467,7 +484,7 @@ index dbe032d..8a48702 100644
  #ifdef PARALLEL_GS_DEBUG
  		LOGI("Too much pending work, flushing:\n");
  		LOGI("  %u primitives\n", stats.num_primitives);
-@@ -1117,6 +1156,12 @@ void GSRenderer::flush_submit(uint64_t value)
+@@ -1117,6 +1166,12 @@ void GSRenderer::flush_submit(uint64_t value)
  {
  	if (!device)
  		return;
@@ -480,7 +497,7 @@ index dbe032d..8a48702 100644
  
  	Vulkan::QueryPoolHandle start_ts, end_ts;
  	if (enable_timestamps)
-@@ -1126,6 +1171,7 @@ void GSRenderer::flush_submit(uint64_t value)
+@@ -1126,6 +1181,7 @@ void GSRenderer::flush_submit(uint64_t value)
  	total_stats.allocated_image_memory += stats.allocated_image_memory;
  	total_stats.num_copies += stats.num_copies;
  	total_stats.num_primitives += stats.num_primitives;
@@ -488,7 +505,7 @@ index dbe032d..8a48702 100644
  	total_stats.num_palette_updates += stats.num_palette_updates;
  	total_stats.num_render_passes += stats.num_render_passes;
  	total_stats.num_copy_barriers += stats.num_copy_barriers;
-@@ -1212,7 +1258,22 @@ void GSRenderer::flush_submit(uint64_t value)
+@@ -1212,7 +1268,22 @@ void GSRenderer::flush_submit(uint64_t value)
  
  	// If we have a timeline trace, we'd like it to be somewhat readable.
  	// Only do garbage collection at frame boundaries.
@@ -512,7 +529,7 @@ index dbe032d..8a48702 100644
  		device->next_frame_context();
  
  	log_timestamps();
-@@ -1326,6 +1387,7 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
+@@ -1326,6 +1397,7 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
  	info.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
  	info.misc |= Vulkan::IMAGE_MISC_FORCE_ARRAY_BIT;
  
@@ -520,7 +537,7 @@ index dbe032d..8a48702 100644
  	auto copy_img = device->create_image(info);
  	device->set_name(*copy_img, "Sharp Backbuffer");
  
-@@ -1353,6 +1415,27 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
+@@ -1353,6 +1425,27 @@ Vulkan::ImageHandle GSRenderer::copy_cached_texture(const Vulkan::Image &img, co
  	return copy_img;
  }
  
@@ -548,7 +565,7 @@ index dbe032d..8a48702 100644
  Vulkan::ImageHandle GSRenderer::create_cached_texture(const TextureDescriptor &desc)
  {
  	if (!device)
-@@ -3393,6 +3476,8 @@ void GSRenderer::move_image_handles_to_slab()
+@@ -3393,6 +3486,8 @@ void GSRenderer::move_image_handles_to_slab()
  
  	if (total_image_slab_size > image_slab_high_water_mark)
  	{
@@ -557,7 +574,7 @@ index dbe032d..8a48702 100644
  #ifdef PARALLEL_GS_DEBUG
  		LOGW("New high watermark for image slab: %llu MiB.\n",
  		     static_cast<unsigned long long>(total_image_slab_size / (1024 * 1024)));
-@@ -4648,6 +4733,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+@@ -4648,6 +4743,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
  				image_info.width *= 2;
  				image_info.height *= 2;
  			}
@@ -565,7 +582,7 @@ index dbe032d..8a48702 100644
  			circuit1 = device->create_image(image_info);
  			sample_crtc_circuit(cmd, *circuit1, priv.dispfb1, rect, super_samples, promoted1);
  			device->set_name(*circuit1, "Circuit1");
-@@ -4706,6 +4792,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+@@ -4706,6 +4802,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
  				image_info.width *= 2;
  				image_info.height *= 2;
  			}
@@ -573,7 +590,7 @@ index dbe032d..8a48702 100644
  			circuit2 = device->create_image(image_info);
  			sample_crtc_circuit(cmd, *circuit2, priv.dispfb2, rect, super_samples, promoted2);
  			device->set_name(*circuit2, "Circuit2");
-@@ -4857,6 +4944,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
+@@ -4857,6 +4954,7 @@ ScanoutResult GSRenderer::vsync(const PrivRegisterState &priv, const VSyncInfo &
  		image_info.height--;
  	}
  
@@ -581,7 +598,7 @@ index dbe032d..8a48702 100644
  	auto merged = device->create_image(image_info);
  
  	device->set_name(*merged, "Merged field");
-@@ -5159,6 +5247,7 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd,
+@@ -5159,6 +5257,7 @@ Vulkan::ImageHandle GSRenderer::fastmad_deinterlace(Vulkan::CommandBuffer &cmd,
  	image_info.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
  	image_info.misc |= Vulkan::IMAGE_MISC_MUTABLE_SRGB_BIT;
  

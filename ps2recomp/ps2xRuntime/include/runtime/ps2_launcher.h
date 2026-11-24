@@ -40,6 +40,14 @@ namespace ps2launcher
     // Memory cards folder used by the setup screen ("saves" next to the executable).
     std::filesystem::path savesFolder();
 
+    // The folder the game keeps its files in (settings.ini, saves, Logs, Screenshots, the shader
+    // cache), as UTF-8 with a trailing separator: the executable's folder, or on Android the app's
+    // own folder on the phone's storage.
+    std::string executableDirectory();
+
+    // V9: a file dialog for a PCSX2 memory card (empty when cancelled, or on Android).
+    std::string openMemoryCardDialog(void *ownerWindow);
+
     // Windows: the game has no console window, so unless its output is already redirected (a .bat
     // with "> file"), stdout and stderr go to <logFolder>/console.txt; returns that file, or an
     // empty path when nothing was changed. PS2X_CONSOLE=1 opens a console window instead.

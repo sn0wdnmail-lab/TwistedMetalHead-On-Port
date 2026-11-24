@@ -57,6 +57,44 @@ The script builds the recompiler, recompiles the executable with `port/tmho.toml
 7,260 generated files takes a while; the runtime's unity build (32 files per compile unit) keeps
 it manageable.
 
+## 4a. Linux release build (V9)
+
+For a Linux program that runs without the system's FFmpeg, build the same small static FFmpeg as
+for Windows (configure without the cross-compile options and with `--enable-pic`), then
+configure with
+
+```sh
+-DPS2X_FFMPEG_STATIC_ROOT=$HOME/ffmpeg-linux-static -DPS2X_LINUX_PORTABLE=ON
+```
+
+(`PS2X_LINUX_PORTABLE` links libstdc++ and libgcc in) and package it with
+`port/package/package_linux.sh <build>/ps2xRuntime/ps2EntryRunner <out>`.
+
+## 4b. Android build (V9)
+
+Needs the Android SDK (build-tools 35, platforms/android-35), the NDK r28 and a JDK 11+.
+
+1. A static FFmpeg for `aarch64-linux-android28` (same options, built with the NDK's clang,
+   `--target-os=android --arch=aarch64 --enable-neon --enable-pic`).
+2. Configure the recompiled program for Android (the generated code is the same as for the PC):
+
+   ```sh
+   cmake -S . -B out/android-arm64 -G Ninja \
+       -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+       -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 -DANDROID_STL=c++_static \
+       -DCMAKE_BUILD_TYPE=Release -DPS2X_ENABLE_FFMPEG=ON \
+       -DPS2X_FFMPEG_STATIC_ROOT=$HOME/ffmpeg-android-arm64 -DPS2X_ENABLE_PGS=ON \
+       -DPS2X_ENABLE_LTO=OFF -DPS2X_ENABLE_DEBUG_UI=OFF
+   ninja -C out/android-arm64 ps2EntryRunner
+   ```
+
+   raylib is built for OpenGL ES 3 there (the CMake file also makes raylib ask EGL for an ES 3
+   context); SSE code goes through sse2neon.
+3. Package and sign: `port/android/build_apk.sh <libps2EntryRunner.so> <out.apk> <keystore.jks>
+   <alias>` (password in `TMHO_KEYSTORE_PASS`). Make your own keystore with
+   `keytool -genkeypair -keystore my.jks -alias tmho -keyalg RSA -keysize 4096 -validity 10000`
+   and keep it out of the repository.
+
 ## 5. Optional: VU1 and VU0 programs compiled ahead of time
 
 `ps2recomp/ps2xRuntime/src/lib/vu/vu1_aot_programs.cpp` is an empty table here, because the real

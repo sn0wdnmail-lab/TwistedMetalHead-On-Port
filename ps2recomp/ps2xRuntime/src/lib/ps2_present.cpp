@@ -1,4 +1,6 @@
 #include "runtime/ps2_present.h"
+#include "runtime/ps2_gl_shader.h"
+#include "runtime/ps2_android.h"
 
 #include "runtime/ps2_settings.h"
 
@@ -106,6 +108,33 @@ void main()
     if (gamma != 1.0)
         color.rgb = pow(max(color.rgb, vec3(0.0)), vec3(gamma));
     finalColor = vec4(color.rgb, 1.0);
+}
+)";
+
+        // Sharpening (F2 > Video): each pixel against its four neighbours, strongest on soft detail
+        // and gentle where the picture already has hard edges (no bright halos around text).
+        const char *const kSharpenFs = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec2 size;
+uniform float amount;
+out vec4 finalColor;
+vec3 px(ivec2 p) { return texelFetch(texture0, clamp(p, ivec2(0), ivec2(size) - 1), 0).rgb; }
+void main()
+{
+    ivec2 p = ivec2(gl_FragCoord.xy);
+    vec3 c = px(p);
+    vec3 n = px(p + ivec2(0, 1));
+    vec3 s = px(p - ivec2(0, 1));
+    vec3 e = px(p + ivec2(1, 0));
+    vec3 w = px(p - ivec2(1, 0));
+    vec3 lo = min(c, min(min(n, s), min(e, w)));
+    vec3 hi = max(c, max(max(n, s), max(e, w)));
+    vec3 room = clamp(min(lo, vec3(1.0) - hi) / max(hi, vec3(1e-4)), 0.0, 1.0);
+    vec3 lobe = -sqrt(room) * mix(0.08, 0.2, amount);
+    vec3 result = (c + (n + s + e + w) * lobe) / (vec3(1.0) + 4.0 * lobe);
+    finalColor = vec4(clamp(result, 0.0, 1.0), 1.0);
 }
 )";
 
@@ -296,6 +325,7 @@ void main()
         };
 
         enum ResampleLoc { RsSrcSize, RsDstSize, RsDir, RsScale, RsNearest, RsSwap, RsGamma };
+        enum SharpenLoc { ShSize, ShAmount };
         enum LumaLoc { LmSrcSize, LmDstSize };
         enum HalfLoc { HfSrcSize };
         enum FlowLoc { FlLumaA, FlCoarse, FlSize, FlCoarseSize, FlCoarsest, FlSearch, FlPatch, FlSubpixel };
@@ -303,12 +333,14 @@ void main()
         enum InterpLoc { InColorA, InFlow, InFlowSize, InT };
 
         Program g_resample, g_luma, g_half, g_flow, g_median, g_interp;
+        Program g_sharpen; // optional: without it the picture is just not sharpened
+        bool g_sharpenReady = false;
         bool g_ready = false;
         bool g_failed = false;
 
         bool build(Program &p, const char *fs, std::initializer_list<const char *> names)
         {
-            p.shader = LoadShaderFromMemory(nullptr, fs);
+            p.shader = LoadShaderFromMemory(nullptr, ps2gl::fragmentSource(fs).c_str());
             if (p.shader.id == 0 || p.shader.id == rlGetShaderIdDefault())
                 return false;
             int i = 0;
@@ -402,6 +434,7 @@ void main()
         uint64_t g_sequence = 0;
         uint64_t g_pictures = 0;      // new game pictures seen
         RenderTexture2D g_wide{};     // horizontal pass output
+        RenderTexture2D g_tall{};     // vertical pass output when the picture is sharpened after it
         RenderTexture2D g_flowLevel[kLevels]{};
         int g_pictureWidth = 0, g_pictureHeight = 0;
         int g_lumaWidth[kLevels]{}, g_lumaHeight[kLevels]{};
@@ -552,7 +585,12 @@ void main()
             EndShaderMode();
             EndTextureMode();
 
-            BeginTextureMode(target);
+            const int sharpening = std::clamp(ps2settings::get().sharpening, 0, 100);
+            const bool sharpen = g_sharpenReady && sharpening > 0;
+            if (sharpen)
+                ensure(g_tall, target.texture.width, target.texture.height, false);
+            RenderTexture2D &vertical = (sharpen && g_tall.id != 0) ? g_tall : target;
+            BeginTextureMode(vertical);
             BeginShaderMode(g_resample.shader);
             setVec2(g_resample, RsSrcSize, static_cast<float>(g_wide.texture.width), static_cast<float>(g_wide.texture.height));
             setVec2(g_resample, RsDstSize, static_cast<float>(target.texture.width), static_cast<float>(target.texture.height));
@@ -562,9 +600,20 @@ void main()
             setInt(g_resample, RsSwap, 0);
             // F2 > Video > Brightness: a gamma curve on the finished picture (100% = 1.0).
             setFloat(g_resample, RsGamma, std::pow(100.0f / static_cast<float>(std::clamp(ps2settings::get().brightness, 70, 150)), 1.3f));
-            pass(target, g_wide.texture);
+            pass(vertical, g_wide.texture);
             EndShaderMode();
             EndTextureMode();
+
+            if (&vertical == &g_tall)
+            {
+                BeginTextureMode(target);
+                BeginShaderMode(g_sharpen.shader);
+                setVec2(g_sharpen, ShSize, static_cast<float>(target.texture.width), static_cast<float>(target.texture.height));
+                setFloat(g_sharpen, ShAmount, static_cast<float>(sharpening) / 100.0f);
+                pass(target, g_tall.texture);
+                EndShaderMode();
+                EndTextureMode();
+            }
         }
 
         void buildLuma(Keyframe &k)
@@ -659,6 +708,7 @@ void main()
         ok = ok && build(g_flow, kFlowFs, {"lumaA", "coarse", "size", "coarseSize", "coarsest", "searchRadius", "patchRadius", "subpixel"});
         ok = ok && build(g_median, kMedianFs, {"size"});
         ok = ok && build(g_interp, kInterpFs, {"colorA", "flow", "flowSize", "t"});
+        g_sharpenReady = ok && build(g_sharpen, kSharpenFs, {"size", "amount"});
         if (!ok)
         {
             std::fprintf(stderr, "[present] shaders unavailable: the picture is drawn directly (no scaling filter, no in-between frames)\n");
@@ -678,9 +728,10 @@ void main()
             release(k.flow);
         }
         release(g_wide);
+        release(g_tall);
         for (RenderTexture2D &t : g_flowLevel)
             release(t);
-        for (Program *p : {&g_resample, &g_luma, &g_half, &g_flow, &g_median, &g_interp})
+        for (Program *p : {&g_resample, &g_luma, &g_half, &g_flow, &g_median, &g_interp, &g_sharpen})
             if (p->shader.id != 0 && p->shader.id != rlGetShaderIdDefault())
                 UnloadShader(p->shader);
         g_ready = false;
@@ -844,7 +895,7 @@ void main()
     int targetFps() noexcept
     {
         const int mode = ps2settings::get().frameRate;
-        if (mode == 1)
+        if (mode == 1 || (mode == 2 && ps2android::active())) // a phone has no "Monitor" choice
             return 120;
         if (mode == 2)
         {

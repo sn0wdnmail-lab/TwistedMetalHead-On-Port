@@ -251,6 +251,14 @@ namespace
         std::fesetround(FE_TOWARDZERO); // the x87 control word as well, for library code that uses it
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
         _mm_setcsr(0xFFC0u);
+#elif defined(__aarch64__)
+        {
+            // FPCR: round toward zero (RMode 11) and flush-to-zero (FZ), for scalar and NEON maths.
+            uint64_t fpcr = 0;
+            __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+            fpcr = (fpcr & ~(3ull << 22)) | (3ull << 22) | (1ull << 24);
+            __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+        }
 #endif
         std::fprintf(stderr, "[ee] FPU rounding: toward zero, denormals as zero (as on the PS2)\n");
     }

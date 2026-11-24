@@ -1,3 +1,4 @@
+#include "runtime/ps2_disc_image.h"
 #include "ps2_iop_host.h"
 
 #include "ps2_runtime.h"
@@ -293,6 +294,15 @@ std::string PS2IopHostAdapter::translateGuestPath(std::string_view path) const
     std::filesystem::path hostPath;
     if (!m_runtime.vfs().resolveHostPath(path, mounts, hostPath))
         return {};
+    // Not in the game folder (the Android version keeps no copy of the game's files): the I/O
+    // processor's modules and other cdrom0: files it opens are copied out of the disc image once.
+    std::error_code ec;
+    if (!paths.cdImage.empty() && !std::filesystem::exists(hostPath, ec))
+    {
+        const ps2x::iop::ParsedPs2Path parsed = ps2x::iop::parsePs2Path(path);
+        if (parsed && parsed.device == ps2x::iop::Ps2PathDevice::Cdrom)
+            ps2disc::extract(paths.cdImage, parsed.path, hostPath);
+    }
     return hostPath.string();
 }
 

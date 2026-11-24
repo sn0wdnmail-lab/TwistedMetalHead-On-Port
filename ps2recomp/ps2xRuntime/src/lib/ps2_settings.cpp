@@ -12,6 +12,9 @@
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_present.h"
 #include "ps2_capture.h"
+#include "runtime/ps2_android.h"
+#include "runtime/ps2_touch.h"
+#include "runtime/ps2_mc_import.h"
 
 #include "raylib.h"
 
@@ -50,6 +53,96 @@ namespace ps2settings
 {
     namespace
     {
+        // ---- V9 button remapping: the PS2 buttons, their names in settings.ini, the default keys
+        // (two per button where the port always had two) and the default controller button.
+        struct BindInfo
+        {
+            const char *name;     // in settings.ini (key_<name>, pad_<name>)
+            const char *label;    // in F2
+            int key1, key2;       // default keys (0 = none)
+            int pad;              // default raylib gamepad button
+        };
+        const BindInfo kBinds[BindCount] = {
+            {"up", "Up", KEY_UP, KEY_W, GAMEPAD_BUTTON_LEFT_FACE_UP},
+            {"down", "Down", KEY_DOWN, KEY_S, GAMEPAD_BUTTON_LEFT_FACE_DOWN},
+            {"left", "Left", KEY_LEFT, KEY_A, GAMEPAD_BUTTON_LEFT_FACE_LEFT},
+            {"right", "Right", KEY_RIGHT, KEY_D, GAMEPAD_BUTTON_LEFT_FACE_RIGHT},
+            {"cross", "Cross", KEY_X, KEY_SPACE, GAMEPAD_BUTTON_RIGHT_FACE_DOWN},
+            {"circle", "Circle", KEY_C, KEY_ESCAPE, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT},
+            {"square", "Square", KEY_Z, KEY_KP_0, GAMEPAD_BUTTON_RIGHT_FACE_LEFT},
+            {"triangle", "Triangle", KEY_V, KEY_KP_1, GAMEPAD_BUTTON_RIGHT_FACE_UP},
+            {"l1", "L1", KEY_Q, 0, GAMEPAD_BUTTON_LEFT_TRIGGER_1},
+            {"r1", "R1", KEY_E, 0, GAMEPAD_BUTTON_RIGHT_TRIGGER_1},
+            {"l2", "L2", KEY_LEFT_SHIFT, 0, GAMEPAD_BUTTON_LEFT_TRIGGER_2},
+            {"r2", "R2", KEY_RIGHT_SHIFT, 0, GAMEPAD_BUTTON_RIGHT_TRIGGER_2},
+            {"start", "Start", KEY_ENTER, 0, GAMEPAD_BUTTON_MIDDLE_RIGHT},
+            {"select", "Select", KEY_TAB, 0, GAMEPAD_BUTTON_MIDDLE_LEFT},
+            {"l3", "L3", 0, 0, GAMEPAD_BUTTON_LEFT_THUMB},
+            {"r3", "R3", 0, 0, GAMEPAD_BUTTON_RIGHT_THUMB},
+        };
+
+        std::string keyName(int key)
+        {
+            if (key >= KEY_A && key <= KEY_Z)
+                return std::string(1, static_cast<char>('A' + (key - KEY_A)));
+            if (key >= KEY_ZERO && key <= KEY_NINE)
+                return std::string(1, static_cast<char>('0' + (key - KEY_ZERO)));
+            if (key >= KEY_KP_0 && key <= KEY_KP_9)
+                return "Num " + std::string(1, static_cast<char>('0' + (key - KEY_KP_0)));
+            if (key >= KEY_F1 && key <= KEY_F12)
+                return "F" + std::to_string(key - KEY_F1 + 1);
+            switch (key)
+            {
+            case 0: return "-";
+            case KEY_SPACE: return "Space";
+            case KEY_ENTER: return "Enter";
+            case KEY_TAB: return "Tab";
+            case KEY_ESCAPE: return "Esc";
+            case KEY_UP: return "Up";
+            case KEY_DOWN: return "Down";
+            case KEY_LEFT: return "Left";
+            case KEY_RIGHT: return "Right";
+            case KEY_LEFT_SHIFT: return "L Shift";
+            case KEY_RIGHT_SHIFT: return "R Shift";
+            case KEY_LEFT_CONTROL: return "L Ctrl";
+            case KEY_RIGHT_CONTROL: return "R Ctrl";
+            case KEY_LEFT_ALT: return "L Alt";
+            case KEY_RIGHT_ALT: return "R Alt";
+            case KEY_INSERT: return "Insert";
+            case KEY_HOME: return "Home";
+            case KEY_END: return "End";
+            case KEY_PAGE_UP: return "Page Up";
+            case KEY_PAGE_DOWN: return "Page Down";
+            case KEY_CAPS_LOCK: return "Caps Lock";
+            case KEY_KP_ENTER: return "Num Enter";
+            case KEY_KP_ADD: return "Num +";
+            case KEY_KP_SUBTRACT: return "Num -";
+            case KEY_KP_MULTIPLY: return "Num *";
+            case KEY_KP_DIVIDE: return "Num /";
+            case KEY_KP_DECIMAL: return "Num .";
+            case KEY_COMMA: return ",";
+            case KEY_PERIOD: return ".";
+            case KEY_SLASH: return "/";
+            case KEY_SEMICOLON: return ";";
+            case KEY_APOSTROPHE: return "'";
+            case KEY_LEFT_BRACKET: return "[";
+            case KEY_RIGHT_BRACKET: return "]";
+            case KEY_BACKSLASH: return "\\";
+            case KEY_MINUS: return "-";
+            case KEY_EQUAL: return "=";
+            case KEY_GRAVE: return "`";
+            default: return "Key " + std::to_string(key);
+            }
+        }
+
+        const char *padName(int button)
+        {
+            static const char *const kNames[] = {"-", "D-pad Up", "D-pad Right", "D-pad Down", "D-pad Left", "Y/Triangle", "B/Circle",
+                                                 "A/Cross", "X/Square", "LB/L1", "LT/L2", "RB/R1", "RT/R2", "Back/Select", "Guide",
+                                                 "Start", "L-stick press", "R-stick press"};
+            return button >= 0 && button < 18 ? kNames[button] : "?";
+        }
+
         // ---- quick taps (see above)
         GLFWmousebuttonfun g_raylibMouseButton = nullptr;
         GLFWkeyfun g_raylibKey = nullptr;
@@ -90,6 +183,11 @@ namespace ps2settings
 
         void installTapCapture()
         {
+#if defined(__ANDROID__) || defined(PLATFORM_VITA)
+            // No GLFW there: raylib's own input handling only.
+            (void)onMouseButton;
+            (void)onKey;
+#else
             static bool installed = false;
             if (installed)
                 return;
@@ -99,6 +197,7 @@ namespace ps2settings
             installed = true;
             g_raylibMouseButton = glfwSetMouseButtonCallback(window, onMouseButton);
             g_raylibKey = glfwSetKeyCallback(window, onKey);
+#endif
         }
 
         // Once per frame: what was pressed since the previous frame.
@@ -167,10 +266,24 @@ namespace ps2settings
             out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
             out << "# brightness: percent, 100 = the game's own picture (a gamma curve: dark areas lighten most)\n";
             out << "brightness=" << s.brightness << "\n";
+            out << "sharpening=" << s.sharpening << "\n";
             out << "show_fps=" << (s.showFps ? 1 : 0) << "\n";
             out << "skip_intro=" << (s.skipIntro ? 1 : 0) << "\n";
             out << "vibration=" << (s.vibration ? 1 : 0) << "\n";
             out << "pause_on_controller_loss=" << (s.pauseOnPadLoss ? 1 : 0) << "\n";
+            out << "# on-screen controls (F2 > Controls): 0 = auto (touch screens), 1 = always, 2 = off; left thumb 0 = D-pad, 1 = analog stick\n";
+            out << "touch_controls=" << s.touchControls << "\n";
+            out << "touch_left=" << s.touchLeft << "\n";
+            for (int b = 0; b < BindCount; ++b)
+            {
+                if (s.keyMap[b] != 0)
+                    out << "key_" << kBinds[b].name << "=" << s.keyMap[b] << "\n";
+                if (s.padMap[b] != 0)
+                    out << "pad_" << kBinds[b].name << "=" << s.padMap[b] << "\n";
+            }
+            out << "touch_size=" << s.touchSize << "\n";
+            out << "touch_opacity=" << s.touchOpacity << "\n";
+            out << "touch_vibrate=" << (s.touchVibrate ? 1 : 0) << "\n";
             if (s.windowW > 0 && s.windowH > 0)
             {
                 out << "# where the window was left in windowed mode\n";
@@ -279,9 +392,27 @@ namespace ps2settings
                 else if (key == "effects_volume") s.effectsVolume = std::clamp(number, 0, 100);
                 else if (key == "movie_volume") s.movieVolume = std::clamp(number, 0, 100);
                 else if (key == "brightness") s.brightness = std::clamp(number, 70, 150);
+                else if (key == "sharpening") s.sharpening = std::clamp(number, 0, 100);
                 else if (key == "skip_intro") s.skipIntro = number != 0;
                 else if (key == "vibration") s.vibration = number != 0;
                 else if (key == "pause_on_controller_loss") s.pauseOnPadLoss = number != 0;
+                else if (key == "touch_controls") s.touchControls = std::clamp(number, 0, 2);
+                else if (key == "touch_left") s.touchLeft = std::clamp(number, 0, 1);
+                else if (key.rfind("key_", 0) == 0 || key.rfind("pad_", 0) == 0)
+                {
+                    for (int b = 0; b < BindCount; ++b)
+                    {
+                        if (key.compare(4, std::string::npos, kBinds[b].name) != 0)
+                            continue;
+                        if (key[0] == 'k')
+                            s.keyMap[b] = std::clamp(number, 0, 400);
+                        else
+                            s.padMap[b] = std::clamp(number, 0, 18);
+                    }
+                }
+                else if (key == "touch_size") s.touchSize = std::clamp(number, 60, 150);
+                else if (key == "touch_opacity") s.touchOpacity = std::clamp(number, 20, 100);
+                else if (key == "touch_vibrate") s.touchVibrate = number != 0;
                 else if (key == "window_x") s.windowX = std::clamp(number, -32000, 32000);
                 else if (key == "window_y") s.windowY = std::clamp(number, -32000, 32000);
                 else if (key == "window_w") s.windowW = std::clamp(number, 0, 16384);
@@ -382,6 +513,8 @@ namespace ps2settings
         // monitor's own size and mode (the picture is scaled to it).
         void applyWindowMode()
         {
+            if (ps2android::active())
+                return; // always the whole screen
             const Settings &s = g_settings;
             const bool windowedChanged = s.windowMode == 0 &&
                                          (s.resolution != g_appliedResolution || s.aspect != g_appliedAspectForWindow);
@@ -458,6 +591,8 @@ namespace ps2settings
         // and then the window ran at thousands of frames a second.
         void applyVsync()
         {
+            if (ps2android::active())
+                return; // Android always waits for the screen's refresh
             const int refresh = GetMonitorRefreshRate(GetCurrentMonitor());
             const int target = ps2present::targetFps();
             const bool fastEnough = target == 0 || refresh <= 0 || target * 100 >= refresh * 95;
@@ -595,6 +730,7 @@ namespace ps2settings
             Swatches,
             HexColor,
             Action,
+            Binding, // V9: a PS2 button's keyboard key and controller button (press to change)
         };
 
         struct Row
@@ -612,6 +748,7 @@ namespace ps2settings
             std::function<bool()> enabled = [] { return true; };
             const char *disabledNote = "";
             const char *actionLabel = "Reset"; // Action: the button's text
+            int bind = -1;                     // Binding: the PS2 button (PadBind)
         };
 
         int g_tab = 0;
@@ -621,9 +758,12 @@ namespace ps2settings
         bool g_editingHex = false;
         std::string g_hexBuffer;
         bool g_draggingSlider = false;
+        int g_captureBind = -1;       // a Binding row waits for a key or controller button
+        double g_captureSince = 0.0;
+        int g_firstRow = 0;           // the drawer scrolls when a tab has more rows than fit
 
-        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "HUD", "UI"};
-        constexpr int kTabCount = 5;
+        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "CONTROLS", "HUD", "UI"};
+        constexpr int kTabCount = 6;
 
         // ---------------------------------------------------------------- HUD editor state
         bool g_hudEditor = false;          // the layout editor covers the screen instead of the drawer
@@ -641,6 +781,55 @@ namespace ps2settings
         bool g_hudPreviewLive = false;     // the game picture behind the editor shows the HUD now
         void openHudEditor();
 
+        // V9: F2 > Game > Import PCSX2 save.
+        void importPcsx2Save()
+        {
+            namespace fs = std::filesystem;
+            fs::path card;
+            if (ps2android::active())
+            {
+                // The newest card file (8 MB, .ps2 / .mcd) in the app's folder or in Download.
+                std::vector<fs::path> folders{fs::u8path(ps2launcher::executableDirectory())};
+                if (ps2android::hasStorageAccess())
+                    folders.push_back("/storage/emulated/0/Download");
+                fs::file_time_type newest{};
+                for (const fs::path &folder : folders)
+                {
+                    std::error_code ec;
+                    for (const fs::directory_entry &entry : fs::directory_iterator(folder, ec))
+                    {
+                        std::string ext = entry.path().extension().string();
+                        for (char &c : ext)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        std::error_code sizeError;
+                        const uintmax_t size = entry.file_size(sizeError);
+                        if ((ext != ".ps2" && ext != ".mcd" && ext != ".mc2") || sizeError || size < (8u << 20) || size > (9u << 20))
+                            continue;
+                        const fs::file_time_type when = entry.last_write_time(sizeError);
+                        if (card.empty() || when > newest)
+                        {
+                            card = entry.path();
+                            newest = when;
+                        }
+                    }
+                }
+                if (card.empty())
+                {
+                    notify("No PCSX2 memory card found. Copy your .ps2 card file into Download on this phone, then try again.");
+                    return;
+                }
+            }
+            else
+            {
+                const std::string picked = ps2launcher::openMemoryCardDialog(GetWindowHandle());
+                if (picked.empty())
+                    return;
+                card = fs::u8path(picked);
+            }
+            const ps2mcimport::Result result = ps2mcimport::importCard(card, ps2launcher::savesFolder() / "mc0", "BASCUS-97621");
+            notify(result.message.c_str());
+        }
+
         std::vector<Row> buildRows(int tab)
         {
             Settings &s = g_settings;
@@ -651,7 +840,8 @@ namespace ps2settings
                 Row mode{"Display mode", "Windowed, borderless full screen, or exclusive full screen. F11 or Alt+Enter switches between windowed and full screen at any time.", RowKind::Choice,
                          [&s] { return s.windowMode; }, [&s, changed](int v) { s.windowMode = v; s.resWidth = 0; s.resHeight = 0; changed(); },
                          {"Windowed", "Borderless", "Fullscreen"}};
-                rows.push_back(mode);
+                if (!ps2android::active()) // a phone is always full screen
+                    rows.push_back(mode);
                 Row resolution{"Resolution",
                                "The game picture's resolution, whatever your screen is. Higher is sharper; lower is lighter on the graphics card. "
                                "One above your screen's is drawn big and shrunk to fit, for smoother edges. Changes straight away.",
@@ -675,7 +865,8 @@ namespace ps2settings
                 rows.push_back(filter);
                 Row vsync{"V-Sync", "Waits for the monitor's refresh to avoid tearing.", RowKind::Toggle,
                           [&s] { return s.vsync ? 1 : 0; }, [&s, changed](int v) { s.vsync = v != 0; changed(); }};
-                rows.push_back(vsync);
+                if (!ps2android::active())
+                    rows.push_back(vsync);
                 Row renderer{"Renderer", g_rendererHelp.c_str(), RowKind::Choice,
                              [&s] { return s.renderer; }, [&s, changed](int v) { s.renderer = v; changed(); },
                              {"Vulkan (GPU)", "Software (CPU)"}};
@@ -683,12 +874,19 @@ namespace ps2settings
                 renderer.disabledNote = "This build has no Vulkan renderer";
                 rows.push_back(renderer);
                 char monitorRate[48];
-                std::snprintf(monitorRate, sizeof(monitorRate), "Monitor  (%d fps)", std::max(60, GetMonitorRefreshRate(GetCurrentMonitor())));
+                if (!ps2android::active())
+                    std::snprintf(monitorRate, sizeof(monitorRate), "Monitor  (%d fps)", std::max(60, GetMonitorRefreshRate(GetCurrentMonitor())));
                 Row rate{"Frame rate",
-                         "60 fps shows the game's own frames. 120 fps and Monitor add in-between frames made from the two newest game frames, "
-                         "so motion is smoother; the game itself keeps its normal speed. In-between frames show the picture about one frame later.",
-                         RowKind::Choice, [&s] { return s.frameRate; }, [&s, changed](int v) { s.frameRate = v; changed(); },
-                         {"60 fps", "120 fps", monitorRate}};
+                         ps2android::active()
+                             ? "60 fps shows the game's own frames. 120 fps adds in-between frames made from the two newest game frames, so motion is "
+                               "smoother on a 120 Hz screen; the game itself keeps its normal speed. Uses more battery."
+                             : "60 fps shows the game's own frames. 120 fps and Monitor add in-between frames made from the two newest game frames, "
+                               "so motion is smoother; the game itself keeps its normal speed. In-between frames show the picture about one frame later.",
+                         RowKind::Choice, [&s] { return ps2android::active() ? std::min(s.frameRate, 1) : s.frameRate; },
+                         [&s, changed](int v) { s.frameRate = v; changed(); },
+                         {"60 fps", "120 fps"}};
+                if (!ps2android::active())
+                    rate.choices.push_back(monitorRate);
                 rows.push_back(rate);
                 Row brightness{"Brightness",
                                "Lightens or darkens the picture. Dark parts of the picture change most, so night arenas get easier to see "
@@ -699,6 +897,15 @@ namespace ps2settings
                 brightness.step = 5;
                 brightness.suffix = "%";
                 rows.push_back(brightness);
+                Row sharpen{"Sharpening",
+                            "Makes fine detail and text crisper after the picture is scaled. Strongest on soft detail, gentle on edges that are "
+                            "already sharp. 0% leaves the picture as it is.",
+                            RowKind::Slider, [&s] { return s.sharpening; }, [&s, changed](int v) { s.sharpening = v; changed(); }};
+                sharpen.minimum = 0;
+                sharpen.maximum = 100;
+                sharpen.step = 10;
+                sharpen.suffix = "%";
+                rows.push_back(sharpen);
             }
             else if (tab == 1)
             {
@@ -711,7 +918,8 @@ namespace ps2settings
                 rows.push_back(volume);
                 Row mute{"Mute in background", "Silences the game while its window is not focused.", RowKind::Toggle,
                          [&s] { return s.muteUnfocused ? 1 : 0; }, [&s, changed](int v) { s.muteUnfocused = v != 0; changed(); }};
-                rows.push_back(mute);
+                if (!ps2android::active()) // a phone app always pauses (and goes quiet) in the background
+                    rows.push_back(mute);
                 struct Part
                 {
                     const char *name;
@@ -742,23 +950,28 @@ namespace ps2settings
                 rows.push_back(pause);
                 Row background{"Pause in background", "Stops the game while its window is not focused (another program in front), and carries on when you come back.", RowKind::Toggle,
                                [&s] { return s.pauseUnfocused ? 1 : 0; }, [&s, changed](int v) { s.pauseUnfocused = v != 0; changed(); }};
-                rows.push_back(background);
+                if (!ps2android::active())
+                    rows.push_back(background);
                 Row fps{"FPS counter", "Shows FPS in the corner: pictures on screen per second (with in-between frames on, those count too).", RowKind::Toggle,
                         [&s] { return s.showFps ? 1 : 0; }, [&s, changed](int v) { s.showFps = v != 0; changed(); }};
                 rows.push_back(fps);
                 Row skip{"Skip intro movies", "Skips the logo movies and the intro movie when the game starts, straight to the menus. The intro can still be watched from the game's own menus.",
                          RowKind::Toggle, [&s] { return s.skipIntro ? 1 : 0; }, [&s, changed](int v) { s.skipIntro = v != 0; changed(); }};
                 rows.push_back(skip);
-                Row rumble{"Controller vibration", "Lets the game rumble your controller (Xbox and other XInput controllers) when you hit or get hit, as on the PS2.",
+                Row rumble{"Controller vibration", "Lets the game rumble your controller (Xbox and other XInput controllers, and PlayStation DualShock 4 / DualSense on Windows) when you hit or get hit, as on the PS2.",
                            RowKind::Toggle, [&s] { return s.vibration ? 1 : 0; }, [&s, changed](int v) { s.vibration = v != 0; changed(); }};
                 rows.push_back(rumble);
                 Row padLoss{"Pause on controller loss", "Opens this menu and pauses the game when the controller you are playing with disconnects (a flat battery, a pulled cable).",
                             RowKind::Toggle, [&s] { return s.pauseOnPadLoss ? 1 : 0; }, [&s, changed](int v) { s.pauseOnPadLoss = v != 0; changed(); }};
                 rows.push_back(padLoss);
-                Row record{"Record screenshots", "Saves a picture of the game every half second in Logs\\frames, for bug reports. About 6 MB a minute; pictures older than 10 minutes are deleted.",
+                Row record{"Record screenshots", ps2android::active() ? "Saves a picture of the game every half second in Logs/frames, for bug reports. About 6 MB a minute; pictures older than 10 minutes are deleted."
+                                                                      : "Saves a picture of the game every half second in Logs\\frames, for bug reports. About 6 MB a minute; pictures older than 10 minutes are deleted.",
                            RowKind::Toggle, [&s] { return s.recordFrames ? 1 : 0; }, [&s, changed](int v) { s.recordFrames = v != 0; changed(); }};
                 rows.push_back(record);
-                Row shot{"Screenshot", "Saves the game picture (without menus or the FPS counter) as a PNG in the Screenshots folder next to TMHO.exe. F12 does the same at any time.",
+                static const std::string shotHelp = ps2android::active()
+                                                        ? "Saves the game picture (without menus or the on-screen controls) as a PNG in " + ps2android::displayPath(ps2android::dataDirectory() + "Screenshots") + "."
+                                                        : std::string("Saves the game picture (without menus or the FPS counter) as a PNG in the Screenshots folder next to TMHO.exe. F12 does the same at any time.");
+                Row shot{"Screenshot", shotHelp.c_str(),
                          RowKind::Action, [] { return 0; }, [](int) { ps2capture::requestScreenshot(); }};
                 shot.actionLabel = "Take";
                 rows.push_back(shot);
@@ -768,15 +981,26 @@ namespace ps2settings
                 Row iop{"IOP thread", "Runs the PS2's I/O processor (the sound driver, disc and memory card) on its own CPU core, alongside the game instead of inside it. Applies on the next start.",
                         RowKind::Toggle, [&s] { return s.iopThread ? 1 : 0; }, [&s, changed](int v) { s.iopThread = v != 0; changed(); }};
                 rows.push_back(iop);
-                Row setup{"Game disc", g_setupNote.empty() ? "Opens the game setup screen (choose another disc, build again) the next time you start TMHO.exe."
+                Row setup{"Game disc", g_setupNote.empty() ? (ps2android::active() ? "Opens the game setup screen (choose another disc, build again) the next time you start the app."
+                                                                                    : "Opens the game setup screen (choose another disc, build again) the next time you start TMHO.exe.")
                                                            : g_setupNote.c_str(),
                           RowKind::Action, [] { return 0; }, [](int)
                           {
                               ps2launcher::requestSetupAtNextStart();
-                              g_setupNote = "The setup screen will open the next time you start TMHO.exe.";
+                              g_setupNote = ps2android::active() ? "The setup screen will open the next time you start the app (close it from the recent apps list)."
+                                                                 : "The setup screen will open the next time you start TMHO.exe.";
                           }};
                 setup.actionLabel = "Setup";
                 rows.push_back(setup);
+                Row import{"Import PCSX2 save",
+                           ps2android::active()
+                               ? "Copies your Twisted Metal: Head-On saves from a PCSX2 memory card (a .ps2 file) you copied into Download or the app's "
+                                 "folder. Saves of the same name already here are kept in a backup folder. Load them from the game's own menu."
+                               : "Copies your Twisted Metal: Head-On saves from a PCSX2 memory card: a .ps2 card file, or a folder card's "
+                                 "_pcsx2_superblock file. Saves of the same name already here are moved to a backup folder in saves.",
+                           RowKind::Action, [] { return 0; }, [](int) { importPcsx2Save(); }};
+                import.actionLabel = "Import";
+                rows.push_back(import);
                 Row fov{"Field of view", "How wide the battle camera sees, across the picture. The game's own view is 65\xC2\xB0 at 4:3 and 81\xC2\xB0 at 16:9.",
                         RowKind::Slider,
                         [&s] { return s.fovDegrees > 0 ? s.fovDegrees : static_cast<int>(std::lround(tmho::defaultHorizontalFov())); },
@@ -813,6 +1037,54 @@ namespace ps2settings
                 rows.push_back(quit);
             }
             else if (tab == 3)
+            {
+                // On-screen controls (touch screens; the mouse drives them with PS2X_TOUCH=1).
+                Row touch{"On-screen controls",
+                          "Buttons drawn over the game for touch screens. Auto shows them on a phone or tablet and hides them while a controller is being used; touch the screen to bring them back.",
+                          RowKind::Choice, [&s] { return s.touchControls; }, [&s, changed](int v) { s.touchControls = v; changed(); },
+                          {"Auto", "Always", "Off"}};
+                rows.push_back(touch);
+                Row left{"Left thumb", "A D-pad (eight directions) or an analog stick that steers gradually.", RowKind::Choice,
+                         [&s] { return s.touchLeft; }, [&s, changed](int v) { s.touchLeft = v; changed(); }, {"D-pad", "Analog stick"}};
+                rows.push_back(left);
+                Row size{"Control size", "Size of the on-screen buttons.", RowKind::Slider, [&s] { return s.touchSize; },
+                         [&s, changed](int v) { s.touchSize = v; changed(); }};
+                size.minimum = 60;
+                size.maximum = 150;
+                size.step = 5;
+                size.suffix = "%";
+                rows.push_back(size);
+                Row opacity{"Control opacity", "How solid the on-screen buttons look.", RowKind::Slider, [&s] { return s.touchOpacity; },
+                            [&s, changed](int v) { s.touchOpacity = v; changed(); }};
+                opacity.minimum = 20;
+                opacity.maximum = 100;
+                opacity.step = 5;
+                opacity.suffix = "%";
+                rows.push_back(opacity);
+                Row buzz{"Vibrate on press", "A short vibration of the phone when an on-screen button is pressed.", RowKind::Toggle,
+                         [&s] { return s.touchVibrate ? 1 : 0; }, [&s, changed](int v) { s.touchVibrate = v != 0; changed(); }};
+                rows.push_back(buzz);
+                // Button remapping: the keyboard key | the controller button for each PS2 button.
+                for (int b = 0; b < BindCount; ++b)
+                {
+                    Row bind{kBinds[b].label,
+                             "Keyboard key | controller button for this PS2 button. Select it, then press the new key or controller button "
+                             "(the one you press sets that one). Backspace while it waits puts back the default.",
+                             RowKind::Binding, [] { return 0; }, [](int) {}};
+                    bind.bind = b;
+                    rows.push_back(bind);
+                }
+                Row resetBinds{"Reset buttons", "Puts every key and controller button back to the defaults (arrows/WASD, X, C, Z, V, Q, E, Shift, Enter, Tab).",
+                               RowKind::Action, [] { return 0; },
+                               [&s, changed](int)
+                               {
+                                   for (int b = 0; b < BindCount; ++b)
+                                       s.keyMap[b] = s.padMap[b] = 0;
+                                   changed();
+                               }};
+                rows.push_back(resetBinds);
+            }
+            else if (tab == 4)
             {
                 Row edit{"Edit HUD layout", "Move and resize the battle HUD over your own game picture: drag a piece, scroll or drag a corner to resize. Best opened during a battle.",
                          RowKind::Action, [] { return 0; }, [](int) { openHudEditor(); }};
@@ -926,6 +1198,11 @@ namespace ps2settings
                 row.setValue(row.getValue() ? 0 : 1);
             else if (row.kind == RowKind::Action)
                 row.setValue(1);
+            else if (row.kind == RowKind::Binding)
+            {
+                g_captureBind = row.bind;
+                g_captureSince = GetTime();
+            }
             else if (row.kind == RowKind::HexColor)
             {
                 char hex[8];
@@ -947,6 +1224,9 @@ namespace ps2settings
             float padding;
             float tabTop;
             float tabHeight;
+            int firstRow = 0;     // the rows shown: firstRow .. firstRow + visibleRows - 1
+            int visibleRows = 0;
+            int rowCount = 0;
         };
 
         // rowCount: the rows of the open tab. A tab with many rows packs them a little closer, so its
@@ -964,19 +1244,42 @@ namespace ps2settings
             l.tabHeight = 40.0f * l.scale;
             l.rowTop = l.tabTop + l.tabHeight + 18.0f * l.scale;
             l.rowHeight = 50.0f * l.scale;
+            l.rowCount = static_cast<int>(rowCount);
+            l.visibleRows = l.rowCount;
             if (rowCount > 0)
             {
                 const float footerLine = l.drawer.height - 54.0f * l.scale; // the footer's separator
                 const float helpRoom = (10.0f + 2.0f * 14.0f * 1.35f + 14.0f + 6.0f) * l.scale; // three help lines
-                const float fit = (footerLine - helpRoom - l.rowTop) / static_cast<float>(rowCount);
+                const float room = footerLine - helpRoom - l.rowTop;
+                const float fit = room / static_cast<float>(rowCount);
                 l.rowHeight = std::clamp(fit, 36.0f * l.scale, 50.0f * l.scale);
+                if (fit < 36.0f * l.scale)
+                {
+                    // More rows than fit: show a window of them that follows the focused row.
+                    l.visibleRows = std::max(1, static_cast<int>(room / (36.0f * l.scale)));
+                    l.rowHeight = room / static_cast<float>(l.visibleRows);
+                    const int focus = std::clamp(g_focus, 0, l.rowCount - 1);
+                    if (focus < g_firstRow)
+                        g_firstRow = focus;
+                    if (focus >= g_firstRow + l.visibleRows)
+                        g_firstRow = focus - l.visibleRows + 1;
+                    g_firstRow = std::clamp(g_firstRow, 0, l.rowCount - l.visibleRows);
+                    l.firstRow = g_firstRow;
+                }
+                else
+                    g_firstRow = 0;
             }
             return l;
         }
 
+        bool rowShown(const Layout &l, int index)
+        {
+            return index >= l.firstRow && index < l.firstRow + l.visibleRows;
+        }
+
         Rectangle rowRect(const Layout &l, int index)
         {
-            return Rectangle{l.drawer.x + 10.0f * l.scale, l.rowTop + static_cast<float>(index) * l.rowHeight,
+            return Rectangle{l.drawer.x + 10.0f * l.scale, l.rowTop + static_cast<float>(index - l.firstRow) * l.rowHeight,
                              l.drawer.width - 20.0f * l.scale, l.rowHeight - 6.0f * l.scale};
         }
 
@@ -1014,11 +1317,64 @@ namespace ps2settings
             return false;
         }
 
+        // A Binding row is waiting: the next key or controller button becomes that PS2 button's.
+        void handleCapture()
+        {
+            Settings &s = g_settings;
+            const int bind = g_captureBind;
+            const bool armed = GetTime() - g_captureSince > 0.2; // not the press that opened it
+            bool done = false;
+            for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
+            {
+                if (!armed || done)
+                    continue;
+                if (key == KEY_ESCAPE)
+                    done = true;
+                else if (key == KEY_BACKSPACE || key == KEY_DELETE)
+                {
+                    s.keyMap[bind] = 0;
+                    s.padMap[bind] = 0;
+                    done = true;
+                    save();
+                }
+                else if (key == KEY_F1 || key == KEY_F2 || key == KEY_F11 || key == KEY_F12 || key == KEY_BACK || key == KEY_MENU)
+                    continue; // the port's own keys stay as they are
+                else
+                {
+                    s.keyMap[bind] = key;
+                    done = true;
+                    save();
+                }
+            }
+            if (armed && !done && IsGamepadAvailable(0))
+            {
+                for (int button = GAMEPAD_BUTTON_LEFT_FACE_UP; button <= GAMEPAD_BUTTON_RIGHT_THUMB; ++button)
+                {
+                    if (button == GAMEPAD_BUTTON_MIDDLE || !IsGamepadButtonPressed(0, button))
+                        continue; // the Guide / PS button opens this menu
+                    s.padMap[bind] = button + 1;
+                    done = true;
+                    save();
+                    break;
+                }
+            }
+            if (armed && g_clickThisFrame)
+                done = true; // a click elsewhere cancels
+            if (done || GetTime() - g_captureSince > 10.0)
+                g_captureBind = -1;
+        }
+
         void handleMenuInput()
         {
             std::vector<Row> rows = buildRows(g_tab);
-            const Layout layout = computeLayout(rows.size());
             g_focus = std::clamp(g_focus, 0, static_cast<int>(rows.size()) - 1);
+            const Layout layout = computeLayout(rows.size());
+
+            if (g_captureBind >= 0)
+            {
+                handleCapture();
+                return;
+            }
 
             if (g_editingHex)
             {
@@ -1050,7 +1406,14 @@ namespace ps2settings
             {
                 g_tab = (g_tab + tabDelta + kTabCount) % kTabCount;
                 g_focus = 0;
+                g_firstRow = 0;
                 return;
+            }
+            if (layout.visibleRows < layout.rowCount)
+            {
+                const float wheel = GetMouseWheelMove();
+                if (wheel != 0.0f)
+                    g_focus = std::clamp(g_focus + (wheel > 0.0f ? -1 : 1), 0, static_cast<int>(rows.size()) - 1);
             }
 
             if (keyPressed(KEY_UP) || keyPressed(KEY_W) || padPressed(GAMEPAD_BUTTON_LEFT_FACE_UP))
@@ -1080,6 +1443,8 @@ namespace ps2settings
                 }
                 for (size_t i = 0; i < rows.size(); ++i)
                 {
+                    if (!rowShown(layout, static_cast<int>(i)))
+                        continue;
                     const Rectangle r = rowRect(layout, static_cast<int>(i));
                     if (!CheckCollisionPointRec(mouse, r))
                         continue;
@@ -1087,7 +1452,20 @@ namespace ps2settings
                     const Row &row = rows[i];
                     const Rectangle value = valueRect(layout, r);
                     if (row.kind == RowKind::Slider && CheckCollisionPointRec(mouse, value))
+                    {
+                        // A click (or a tap on a phone) sets the value where it lands; holding
+                        // the button then drags it.
                         g_draggingSlider = row.enabled();
+                        if (g_draggingSlider)
+                        {
+                            const float trackW = value.width - 52.0f * layout.scale;
+                            const float t = std::clamp((mouse.x - value.x) / std::max(1.0f, trackW), 0.0f, 1.0f);
+                            int v = row.minimum + static_cast<int>(std::lround(t * static_cast<float>(row.maximum - row.minimum) / static_cast<float>(row.step))) * row.step;
+                            v = std::clamp(v, row.minimum, row.maximum);
+                            if (v != row.getValue())
+                                row.setValue(v);
+                        }
+                    }
                     else if (row.kind == RowKind::Swatches && CheckCollisionPointRec(mouse, value))
                     {
                         const float cell = value.width / static_cast<float>(kSwatchCount + 1);
@@ -1187,7 +1565,13 @@ namespace ps2settings
             const float padY = 3.0f * scale;
             const float width = textWidth(label, size, true) + 2.0f * padX;
             const float height = size + 2.0f * padY;
-            const Rectangle box{static_cast<float>(GetScreenWidth()) - width - 8.0f * scale, 8.0f * scale, width, height};
+            Rectangle box{static_cast<float>(GetScreenWidth()) - width - 8.0f * scale, 8.0f * scale, width, height};
+            float left = 0.0f, centreY = 0.0f;
+            if (ps2touch::besideMenuButton(left, centreY)) // the corner belongs to R2 then
+            {
+                box.x = left;
+                box.y = centreY - height * 0.5f;
+            }
             DrawRectangleRounded(box, 0.3f, 6, Color{14, 17, 22, 170});
             text(label, box.x + padX, box.y + padY, size, Color{235, 240, 245, 255}, true);
         }
@@ -1237,6 +1621,8 @@ namespace ps2settings
             // Rows.
             for (size_t i = 0; i < rows.size(); ++i)
             {
+                if (!rowShown(l, static_cast<int>(i)))
+                    continue;
                 const Row &row = rows[i];
                 const Rectangle r = rowRect(l, static_cast<int>(i));
                 const bool focused = static_cast<int>(i) == g_focus;
@@ -1338,18 +1724,54 @@ namespace ps2settings
                     text(label, button.x + 14.0f * s, centerY - valueSize * 0.5f, valueSize, focused ? inkFor(accent) : WHITE, true);
                     break;
                 }
+                case RowKind::Binding:
+                {
+                    const int b = std::clamp(row.bind, 0, BindCount - 1);
+                    std::string keys;
+                    if (g_settings.keyMap[b] != 0)
+                        keys = keyName(g_settings.keyMap[b]);
+                    else
+                    {
+                        keys = keyName(kBinds[b].key1);
+                        if (kBinds[b].key2 != 0)
+                            keys += ", " + keyName(kBinds[b].key2);
+                    }
+                    const int pad = g_settings.padMap[b] != 0 ? g_settings.padMap[b] - 1 : kBinds[b].pad;
+                    const bool waiting = g_captureBind == b;
+                    const std::string label = waiting ? std::string("Press a key or button...") : keys + "  |  " + padName(pad);
+                    const float size = textWidth(label.c_str(), valueSize, true) > value.width ? valueSize * 0.8f : valueSize;
+                    const float w = textWidth(label.c_str(), size, true);
+                    text(label.c_str(), value.x + value.width - w, centerY - size * 0.5f, size, waiting ? accentColor : valueColor, true);
+                    break;
                 }
+                }
+            }
+
+            // Scrolling: a thin bar at the drawer's edge shows where the visible rows are.
+            if (l.visibleRows < l.rowCount && l.rowCount > 0)
+            {
+                const float top = l.rowTop;
+                const float height = static_cast<float>(l.visibleRows) * l.rowHeight - 6.0f * s;
+                const float x = l.drawer.x + l.drawer.width - 5.0f * s;
+                DrawRectangleRounded(Rectangle{x, top, 3.0f * s, height}, 1.0f, 4, Color{255, 255, 255, 25});
+                const float thumb = height * static_cast<float>(l.visibleRows) / static_cast<float>(l.rowCount);
+                const float at = top + (height - thumb) * static_cast<float>(l.firstRow) / static_cast<float>(std::max(1, l.rowCount - l.visibleRows));
+                DrawRectangleRounded(Rectangle{x, at, 3.0f * s, thumb}, 1.0f, 4, Color{255, 255, 255, 110});
             }
 
             // Help text for the focused row.
             if (!rows.empty())
             {
                 const Row &row = rows[static_cast<size_t>(std::clamp(g_focus, 0, static_cast<int>(rows.size()) - 1))];
-                const float y = l.rowTop + static_cast<float>(rows.size()) * l.rowHeight + 10.0f * s;
+                const float y = l.rowTop + static_cast<float>(l.visibleRows) * l.rowHeight + 10.0f * s;
                 // Wrap the help line to the drawer width.
                 const float size = 14.0f * s;
                 const float maxWidth = l.drawer.width - 2.0f * l.padding;
-                std::istringstream words(row.help);
+                std::string helpText = row.help;
+                if (g_captureBind >= 0 && row.kind == RowKind::Binding && row.bind == g_captureBind)
+                    helpText = std::string("Press the key or the controller button for ") + row.label +
+                               ". Esc cancels; Backspace puts back the default key and button.";
+                std::istringstream words(helpText);
                 std::string word, line;
                 float lineY = y;
                 while (words >> word)
@@ -1372,8 +1794,10 @@ namespace ps2settings
             const float footerY = l.drawer.height - 44.0f * s;
             DrawRectangle(static_cast<int>(l.drawer.x + l.padding), static_cast<int>(footerY - 10.0f * s),
                           static_cast<int>(l.drawer.width - 2.0f * l.padding), 1, Color{255, 255, 255, 28});
-            const char *footer = g_editingHex ? "Type 6 hex digits   Enter OK   Esc Cancel"
-                                              : "\xE2\x86\x91\xE2\x86\x93 Select   \xE2\x86\x90\xE2\x86\x92 Change   Q/E Tab   F2 Close";
+            const char *footer = g_editingHex           ? "Type 6 hex digits   Enter OK   Esc Cancel"
+                                 : g_captureBind >= 0    ? "Press a key or button   Esc Cancel   Backspace Default"
+                                 : ps2android::active() ? "Tap a row to change it   Back Close"
+                                                         : "\xE2\x86\x91\xE2\x86\x93 Select   \xE2\x86\x90\xE2\x86\x92 Change   Q/E Tab   F2 Close";
             text(footer, l.drawer.x + l.padding, footerY + 4.0f * s, 14.0f * s, Color{138, 147, 163, 255});
         }
 
@@ -1743,7 +2167,8 @@ namespace ps2settings
 
     bool emulationPaused() noexcept
     {
-        return g_paused.load(std::memory_order_relaxed);
+        // Android: the app is not in front (raylib's loop waits until it is back).
+        return g_paused.load(std::memory_order_relaxed) || ps2android::inBackground();
     }
 
     void loadEarly(const char *iniPath)
@@ -1792,6 +2217,13 @@ namespace ps2settings
                 s.resolution = 2;
             else if (s.internalScale == 3)
                 s.resolution = 3;
+            else if (ps2android::active())
+            {
+                // First start on a phone: 720p keeps it smooth and cool; widescreen fills more of a
+                // phone's wide screen.
+                s.resolution = 1;
+                s.aspect = 1;
+            }
             else
             {
                 const int lines = GetMonitorHeight(GetCurrentMonitor());
@@ -1815,6 +2247,8 @@ namespace ps2settings
     // put for a second.
     void rememberWindowPlacement()
     {
+        if (ps2android::active())
+            return;
         Settings &s = g_settings;
         if (s.windowMode != 0 || g_appliedWindowMode != 0 || IsWindowFullscreen() || IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ||
             IsWindowMinimized() || IsWindowMaximized())
@@ -1892,7 +2326,8 @@ namespace ps2settings
             g_hudLiveAtOpen = tmho::hudShownRecently(1.0);
             notify("Controller disconnected - the game is paused. Reconnect it and press B / Esc to carry on.");
         }
-        if (keyTap(KEY_F2) || padMenuButton())
+        const bool androidBack = ps2android::active() && IsKeyPressed(KEY_BACK);
+        if (keyTap(KEY_F2) || padMenuButton() || androidBack)
         {
             const bool open = !g_menuOpen.load(std::memory_order_relaxed);
             g_menuOpen.store(open, std::memory_order_relaxed);
@@ -2042,6 +2477,35 @@ namespace ps2settings
             applied = effective;
             appliedAt = GetTime();
         }
+    }
+
+    bool bindKeyDown(int bind) noexcept
+    {
+        if (bind < 0 || bind >= BindCount)
+            return false;
+        const int custom = g_settings.keyMap[bind];
+        if (custom != 0)
+            return IsKeyDown(custom);
+        return (kBinds[bind].key1 != 0 && IsKeyDown(kBinds[bind].key1)) || (kBinds[bind].key2 != 0 && IsKeyDown(kBinds[bind].key2));
+    }
+
+    int bindPadButton(int bind) noexcept
+    {
+        if (bind < 0 || bind >= BindCount)
+            return 0;
+        const int custom = g_settings.padMap[bind];
+        return custom != 0 ? custom - 1 : kBinds[bind].pad;
+    }
+
+    void openMenu() noexcept
+    {
+        if (g_menuOpen.load(std::memory_order_relaxed))
+            return;
+        g_menuOpen.store(true, std::memory_order_relaxed);
+        g_editingHex = false;
+        g_draggingSlider = false;
+        loadFonts();
+        g_hudLiveAtOpen = tmho::hudShownRecently(1.0);
     }
 
     void notify(const char *text) noexcept

@@ -1,3 +1,4 @@
+#include "runtime/ps2_android.h"
 #include "runtime/ps2_perf.h"
 #include "runtime/ps2_mtvu.h"
 #include "runtime/ps2_present.h"
@@ -11,6 +12,7 @@ namespace ps2settings
 }
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -40,6 +42,7 @@ namespace ps2settings
 #include <signal.h>
 #include <ucontext.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -175,7 +178,13 @@ namespace ps2perf
 
         std::string executablePath()
         {
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+            // The app's own folder on the phone's storage: Logs goes in there.
+            const std::string data = ps2android::dataDirectory();
+            if (!data.empty())
+                return data + "ps2EntryRunner";
+            return std::string("./ps2EntryRunner");
+#elif defined(_WIN32)
             std::wstring buffer(32768, L'\0');
             const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
             buffer.resize(length);
@@ -616,7 +625,11 @@ namespace ps2perf
         bool profilerEnabled()
         {
             const char *env = std::getenv("PS2X_PROFILE");
+#if defined(__ANDROID__)
+            return env && *env == '1'; // phones: no sampling unless asked for
+#else
             return !(env && *env == '0');
+#endif
         }
 
         void loadSymbols()
@@ -847,7 +860,7 @@ namespace ps2perf
                 CloseHandle(otherHandle);
         }
 #else
-        pthread_t g_sampledThread{};
+        pid_t g_sampledTid = 0; // a thread id, not a pthread_t: signalling it stays safe after the thread ended
         std::atomic<uint64_t> g_lastSampleRip{0};
         std::atomic<bool> g_sampleReady{false};
 
@@ -856,6 +869,8 @@ namespace ps2perf
             const ucontext_t *context = static_cast<const ucontext_t *>(contextPtr);
 #if defined(__x86_64__)
             g_lastSampleRip.store(static_cast<uint64_t>(context->uc_mcontext.gregs[REG_RIP]), std::memory_order_relaxed);
+#elif defined(__aarch64__)
+            g_lastSampleRip.store(static_cast<uint64_t>(context->uc_mcontext.pc), std::memory_order_relaxed);
 #endif
             g_sampleReady.store(true, std::memory_order_release);
         }
@@ -867,8 +882,14 @@ namespace ps2perf
                 timespec delay{0, 2000000};
                 nanosleep(&delay, nullptr);
                 g_sampleReady.store(false, std::memory_order_relaxed);
-                if (pthread_kill(g_sampledThread, SIGPROF) != 0)
+                // The game thread ends before the process does: a thread id that is gone just fails here
+                // (ESRCH), where pthread_kill on an ended thread can crash.
+                if (syscall(SYS_tgkill, getpid(), g_sampledTid, SIGPROF) != 0)
+                {
+                    if (errno == ESRCH)
+                        break;
                     continue;
+                }
                 for (int spin = 0; spin < 2000 && !g_sampleReady.load(std::memory_order_acquire); ++spin)
                     std::this_thread::yield();
                 if (!g_sampleReady.load(std::memory_order_acquire))
@@ -910,7 +931,7 @@ namespace ps2perf
                 return;
             }
 #else
-            g_sampledThread = pthread_self();
+            g_sampledTid = static_cast<pid_t>(syscall(SYS_gettid));
             dl_iterate_phdr([](dl_phdr_info *info, size_t, void *) -> int
                             {
                                 // the first object is the executable: load bias + highest segment end

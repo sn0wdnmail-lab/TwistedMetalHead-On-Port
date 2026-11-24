@@ -73,6 +73,8 @@ else()
 
     if(PS2X_IS_ANDROID)
         set(PLATFORM "Android" CACHE STRING "" FORCE)
+        # OpenGL ES 3: the picture shaders (scaling, frame smoothing) need GLSL ES 3.00.
+        set(OPENGL_VERSION "ES 3.0" CACHE STRING "" FORCE)
     endif()
 
     FetchContent_Declare(
@@ -82,6 +84,17 @@ else()
         GIT_PROGRESS TRUE
     )
     FetchContent_MakeAvailable(raylib)
+
+    if(PS2X_IS_ANDROID)
+        # raylib 5.5 picks an OpenGL ES 3 configuration but still asks EGL for a version 2 context.
+        set(PS2X_RAYLIB_ANDROID_C "${raylib_SOURCE_DIR}/src/platforms/rcore_android.c")
+        file(READ "${PS2X_RAYLIB_ANDROID_C}" PS2X_RAYLIB_ANDROID_TEXT)
+        string(REPLACE "EGL_CONTEXT_CLIENT_VERSION, 2," "EGL_CONTEXT_CLIENT_VERSION, (rlGetVersion() == RL_OPENGL_ES_30)? 3 : 2,"
+            PS2X_RAYLIB_ANDROID_PATCHED "${PS2X_RAYLIB_ANDROID_TEXT}")
+        if(NOT PS2X_RAYLIB_ANDROID_PATCHED STREQUAL PS2X_RAYLIB_ANDROID_TEXT)
+            file(WRITE "${PS2X_RAYLIB_ANDROID_C}" "${PS2X_RAYLIB_ANDROID_PATCHED}")
+        endif()
+    endif()
 
     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
         FetchContent_Declare(
@@ -238,7 +251,7 @@ else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 
     if(PS2X_IS_ANDROID)
-        target_link_libraries(ps2_host_backend INTERFACE log android)
+        target_link_libraries(ps2_host_backend INTERFACE log android GLESv3)
     endif()
 endif()
 
@@ -249,24 +262,33 @@ else()
 endif()
 
 option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENABLE_FFMPEG_DEFAULT})
-set(PS2X_FFMPEG_STATIC_ROOT "" CACHE PATH "Prefix of a static FFmpeg build (Windows/MinGW); skips the prebuilt download")
+set(PS2X_FFMPEG_STATIC_ROOT "" CACHE PATH "Prefix of a static FFmpeg build (Windows/MinGW, Android, Linux); skips the prebuilt download / system FFmpeg")
 
 if(NOT PS2X_ENABLE_FFMPEG)
     message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
     add_library(ffmpeg INTERFACE)
-elseif(WIN32 AND PS2X_FFMPEG_STATIC_ROOT)
-    # Static FFmpeg built for this toolchain (MinGW): headers and .a files under one prefix.
+elseif(PS2X_FFMPEG_STATIC_ROOT)
+    # Static FFmpeg built for this toolchain (MinGW, the Android NDK, or Linux for a release that
+    # runs without the system's FFmpeg): headers and .a files under one prefix (only the
+    # MPEG-1/2 video decoder is needed for the game's movies).
     add_library(ffmpeg INTERFACE)
-    target_include_directories(ffmpeg INTERFACE "${PS2X_FFMPEG_STATIC_ROOT}/include")
+    if(WIN32 OR PS2X_IS_ANDROID)
+        target_include_directories(ffmpeg INTERFACE "${PS2X_FFMPEG_STATIC_ROOT}/include")
+    else()
+        # Only the runtime's movie decoder includes FFmpeg (set on ps2_runtime below), so the
+        # recompiled game code keeps its compile flags.
+        set(PS2X_FFMPEG_PRIVATE_INCLUDE "${PS2X_FFMPEG_STATIC_ROOT}/include")
+    endif()
     target_link_libraries(ffmpeg INTERFACE
         "${PS2X_FFMPEG_STATIC_ROOT}/lib/libavformat.a"
         "${PS2X_FFMPEG_STATIC_ROOT}/lib/libavcodec.a"
         "${PS2X_FFMPEG_STATIC_ROOT}/lib/libswscale.a"
         "${PS2X_FFMPEG_STATIC_ROOT}/lib/libswresample.a"
         "${PS2X_FFMPEG_STATIC_ROOT}/lib/libavutil.a"
-        bcrypt
-        ws2_32
     )
+    if(WIN32)
+        target_link_libraries(ffmpeg INTERFACE bcrypt ws2_32)
+    endif()
 elseif(WIN32)
     include(ExternalProject)
 
@@ -405,6 +427,10 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_pad.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
+    src/lib/ps2_disc_image.cpp
+    src/lib/ps2_android.cpp
+    src/lib/ps2_touch.cpp
+    src/lib/ps2_mc_import.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
@@ -504,6 +530,13 @@ else()
     )
 endif()
 
+# Linux release: the C++ runtime linked in, so the program runs on distributions with an older
+# libstdc++ than the build machine's (the C library still has to be as new as the build's).
+option(PS2X_LINUX_PORTABLE "Link libstdc++ and libgcc statically (Linux release builds)" OFF)
+if(PS2X_LINUX_PORTABLE AND UNIX AND NOT APPLE AND NOT PS2X_IS_ANDROID)
+    target_link_options(ps2EntryRunner PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     set_target_properties(ps2EntryRunner PROPERTIES
         UNITY_BUILD ON
@@ -549,6 +582,19 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(PS2X_FFMPEG_PRIVATE_INCLUDE)
+    target_include_directories(ps2_runtime PRIVATE "${PS2X_FFMPEG_PRIVATE_INCLUDE}")
+endif()
+
+if(PS2X_IS_ANDROID)
+    # raylib builds the NDK's native_app_glue; ps2_android.cpp needs its header (activity, JNI, storage access).
+    set(PS2X_NDK_ROOT "${ANDROID_NDK}")
+    if(NOT PS2X_NDK_ROOT)
+        set(PS2X_NDK_ROOT "${CMAKE_ANDROID_NDK}")
+    endif()
+    set_source_files_properties(src/lib/ps2_android.cpp PROPERTIES
+        INCLUDE_DIRECTORIES "${PS2X_NDK_ROOT}/sources/android/native_app_glue")
+endif()
 if(WIN32)
     target_link_libraries(ps2_runtime PUBLIC winmm)
 endif()
@@ -571,7 +617,18 @@ option(PS2X_ENABLE_PGS "Build the Vulkan GPU GS renderer (paraLLEl-GS)" ON)
 if(PS2X_ENABLE_PGS AND EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND EXISTS "${PS2X_PGS_DIR}/Granite/third_party/volk/volk.c")
     set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
     set(GRANITE_VULKAN_DXGI_INTEROP OFF CACHE BOOL "" FORCE)
+    if(PS2X_IS_ANDROID)
+        # Only Granite's Vulkan core is used. Its own Android app layer (GameActivity, the APK
+        # asset file system) needs the Android Games SDK, so Granite is configured as for Linux;
+        # the code still builds for Android (the NDK defines __ANDROID__).
+        set(PS2X_SAVED_ANDROID ${ANDROID})
+        set(ANDROID OFF)
+        set(GRANITE_POSITION_INDEPENDENT ON CACHE BOOL "" FORCE)
+    endif()
     add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+    if(PS2X_IS_ANDROID)
+        set(ANDROID ${PS2X_SAVED_ANDROID})
+    endif()
     target_link_libraries(ps2_runtime PUBLIC parallel-gs)
     target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_PGS=1)
     message(STATUS "[gpu] Vulkan GS renderer (paraLLEl-GS) enabled from ${PS2X_PGS_DIR}")

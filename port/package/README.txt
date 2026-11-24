@@ -17,9 +17,10 @@ Getting started
      GPU shader variants now and saves them as shadercache.bin next to
      TMHO.exe (a few seconds; longer right after a graphics driver update),
      so starting the game doesn't have to compile them and no effect
-     stutters the first time it appears. The game also adds any new shaders
-     to that file itself when you quit. Build them again after a graphics
-     driver update.
+     stutters the first time it appears. Skipped, the game builds them in
+     the background while you play and (V9) saves the file as soon as they
+     are all built; any new ones are added when you quit. Build them again
+     after a graphics driver update.
   5. Click PLAY.
 
 From then on TMHO.exe shows the setup screen with PLAY ready; turn off
@@ -67,6 +68,9 @@ Video (F2 > Video) - all of it changes straight away, no restart needed
   Brightness           Lightens (or darkens) the picture, 70-150 %. Dark parts
                        change most, so night arenas get easier to see without
                        washing out explosions. 100 % is the game's own picture.
+  Sharpening           (V9) Makes fine detail and text crisper after the
+                       picture is scaled, 0-100 %. Strongest on soft detail,
+                       gentle on edges that are already sharp. 0 % is off.
 
 In windowed mode the window opens where you last left it, at the size you
 left it.
@@ -82,12 +86,29 @@ Sound (F2 > Audio)
                        the announcer.
   Movie volume         The intro and ending movies.
 
+Controls (F2 > Controls) - V9
+  Every PS2 button has a row showing its keyboard key | controller button.
+  Select a row, then press the new key or the new controller button (the one
+  you press is the one that changes). Backspace while it waits puts back the
+  default; Esc cancels. "Reset buttons" puts all of them back. F1, F2, F11 and
+  F12 and the controller's Guide / PS button keep their own jobs. (The first
+  rows are the on-screen controls of the Android version.)
+
 Game (F2 > Game)
   Skip intro movies    Skips the logo movies and the intro when the game
                        starts (on by default), straight to the menus.
-  Controller vibration Lets the game rumble an Xbox or other XInput controller
-                       when you hit or get hit, as on the PS2 (the game's own
-                       pause menu has a Vibration switch too).
+  Controller vibration Lets the game rumble your controller when you hit or
+                       get hit, as on the PS2: Xbox and other XInput
+                       controllers, and (V9) PlayStation DualShock 4 and
+                       DualSense controllers plugged in by USB or paired by
+                       Bluetooth (the game's own pause menu has a Vibration
+                       switch too).
+  Import PCSX2 save    (V9) Copies your Twisted Metal: Head-On saves from a
+                       PCSX2 memory card: pick the .ps2 card file (in PCSX2's
+                       "memcards" folder), or for a folder memory card its
+                       _pcsx2_superblock file. A save of the same name already
+                       here is moved to a "backup <date>" folder in saves
+                       first. Then load it from the game's own menu.
   Pause on controller loss  Opens the settings and pauses the game when the
                        controller you are playing with disconnects.
 

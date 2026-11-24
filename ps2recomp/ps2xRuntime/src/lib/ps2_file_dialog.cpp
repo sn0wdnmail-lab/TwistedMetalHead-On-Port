@@ -2,6 +2,7 @@
 // from raylib, whose names clash with <windows.h>.
 
 #include "runtime/ps2_launcher.h"
+#include "runtime/ps2_android.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +31,9 @@ namespace ps2launcher
     // Folder of the running executable as UTF-8, with a trailing separator.
     std::string executableDirectory()
     {
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+        return ps2android::dataDirectory();
+#elif defined(_WIN32)
         wchar_t path[32768];
         const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
         if (length == 0 || length >= sizeof(path) / sizeof(path[0]))
@@ -78,7 +81,10 @@ namespace ps2launcher
     // Returns the chosen file as UTF-8, or an empty string when cancelled / unavailable.
     std::string openDiscImageDialog(void *ownerWindow)
     {
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+        (void)ownerWindow;
+        return {}; // the setup screen lists the disc images it finds on the phone instead
+#elif defined(_WIN32)
         wchar_t file[4096] = L"";
         OPENFILENAMEW ofn{};
         ofn.lStructSize = sizeof(ofn);
@@ -103,6 +109,56 @@ namespace ps2launcher
         const char *commands[] = {
             "zenity --file-selection --title='Choose your Twisted Metal: Head-On disc image' --file-filter='PS2 disc images | *.iso *.ISO' 2>/dev/null",
             "kdialog --getopenfilename . '*.iso *.ISO' 2>/dev/null",
+        };
+        for (const char *command : commands)
+        {
+            FILE *pipe = popen(command, "r");
+            if (!pipe)
+                continue;
+            char buffer[4096];
+            std::string result;
+            while (std::fgets(buffer, sizeof(buffer), pipe))
+                result += buffer;
+            const int status = pclose(pipe);
+            while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+                result.pop_back();
+            if (status == 0 && !result.empty())
+                return result;
+        }
+        return {};
+#endif
+    }
+
+    std::string openMemoryCardDialog(void *ownerWindow)
+    {
+#if defined(__ANDROID__)
+        (void)ownerWindow;
+        return {}; // the import looks for the card file in the app's folder and Download instead
+#elif defined(_WIN32)
+        wchar_t file[4096] = L"";
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = static_cast<HWND>(ownerWindow);
+        ofn.lpstrFilter = L"PCSX2 memory cards (*.ps2, *.mcd, *.bin, _pcsx2_superblock)\0*.ps2;*.mcd;*.mc2;*.bin;_pcsx2_superblock\0All files (*.*)\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = static_cast<DWORD>(sizeof(file) / sizeof(file[0]));
+        ofn.lpstrTitle = L"Choose a PCSX2 memory card (for a folder card: its _pcsx2_superblock file)";
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_EXPLORER;
+        if (!GetOpenFileNameW(&ofn))
+            return {};
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, file, -1, nullptr, 0, nullptr, nullptr);
+        if (bytes <= 1)
+            return {};
+        std::string utf8(static_cast<size_t>(bytes - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8.data(), bytes, nullptr, nullptr);
+        return utf8;
+#else
+        (void)ownerWindow;
+        const char *commands[] = {
+            "zenity --file-selection --title='Choose a PCSX2 memory card (for a folder card: its _pcsx2_superblock file)' "
+            "--file-filter='PCSX2 memory cards | *.ps2 *.mcd *.mc2 *.bin _pcsx2_superblock' 2>/dev/null",
+            "kdialog --getopenfilename . '*.ps2 *.mcd *.mc2 *.bin _pcsx2_superblock' 2>/dev/null",
         };
         for (const char *command : commands)
         {

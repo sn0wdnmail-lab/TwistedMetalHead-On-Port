@@ -26,3 +26,9 @@ saves/
 *.zip
 settings.ini
 launcher.ini
+
+# Android signing keys: private, never commit them
+*.jks
+*.keystore
+*.pass
+*.apk

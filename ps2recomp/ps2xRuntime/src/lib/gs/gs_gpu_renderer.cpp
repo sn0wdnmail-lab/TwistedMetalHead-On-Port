@@ -1,5 +1,7 @@
 #include <deque>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <emmintrin.h>
+#endif
 #include <chrono>
 #include <filesystem>
 #include <condition_variable>
@@ -90,7 +92,9 @@ namespace ps2gpu
 
         // shadercache.bin: a Vulkan pipeline cache with Granite's header (GPU UUID + hash), so a
         // cache from another graphics card or driver is ignored and rebuilt.
-        size_t g_shaderCacheLoaded = 0; // bytes read at start: the game only writes the file back when it grew
+        std::atomic<size_t> g_shaderCacheLoaded{0}; // bytes in the file (read at start, or written since)
+        std::thread *g_cacheSaver = nullptr;        // V9: writes the cache once the background build is done (never
+                                                    // destroyed: a joinable std::thread at exit would end the process)
         std::atomic<uint32_t> g_stalledCompiles{0}; // shaders compiled while the game waited this session
 
         bool loadShaderCache(Device &device)
@@ -124,11 +128,11 @@ namespace ps2gpu
             // Shaders compiled during play go into the file even when the driver's cache data
             // did not grow in size, so the next start has them.
             const uint32_t compiled = g_stalledCompiles.load(std::memory_order_relaxed);
-            if (onlyIfGrown && size <= g_shaderCacheLoaded && compiled == 0u)
+            if (onlyIfGrown && size <= g_shaderCacheLoaded.load() && compiled == 0u)
                 return true; // no new shaders this run
             if (onlyIfGrown)
-                std::fprintf(stderr, "[gpu] shader cache: %.1f MB written at quit (was %.1f MB; %u shaders compiled during play)\n",
-                             static_cast<double>(size) / (1024.0 * 1024.0), static_cast<double>(g_shaderCacheLoaded) / (1024.0 * 1024.0),
+                std::fprintf(stderr, "[gpu] shader cache: %.1f MB written (was %.1f MB; %u shaders compiled during play)\n",
+                             static_cast<double>(size) / (1024.0 * 1024.0), static_cast<double>(g_shaderCacheLoaded.load()) / (1024.0 * 1024.0),
                              compiled);
             std::vector<uint8_t> data(size);
             if (!device.get_pipeline_cache_data(data.data(), size))
@@ -145,6 +149,11 @@ namespace ps2gpu
                 std::filesystem::rename(std::filesystem::u8path(temp), std::filesystem::u8path(path), ec);
             else
                 std::filesystem::remove(std::filesystem::u8path(temp), ec);
+            if (written && !ec)
+            {
+                g_shaderCacheLoaded.store(size);
+                g_stalledCompiles.store(0, std::memory_order_relaxed); // in the file now
+            }
             return written && !ec;
         }
 
@@ -1071,6 +1080,22 @@ namespace ps2gpu
                 ps2perf::setGauge(ps2perf::GpuMemoryBudgetBytes, budget);
             }
         }
+        // V9: the shader variants paraLLEl-GS builds in the background at start go into
+        // shadercache.bin as soon as they are all built (on a thread of its own: no hitch), not
+        // only at quit - a phone closing the app, or a crash, keeps them too.
+        {
+            static bool savedAfterBuild = false;
+            static uint32_t checkTick = 0;
+            if (!savedAfterBuild && (++checkTick % 60u) == 0u && s.iface.shader_compilation_finished())
+            {
+                savedAfterBuild = true;
+                if (!g_cacheSaver)
+                {
+                    Device *device = &s.device;
+                    g_cacheSaver = new std::thread([device] { saveShaderCache(*device, true); });
+                }
+            }
+        }
         static const bool debugFrames = std::getenv("PS2X_GPU_DEBUG") != nullptr;
         if (debugFrames)
         {
@@ -1223,6 +1248,8 @@ namespace ps2gpu
         std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
         g_active.store(false, std::memory_order_release);
+        if (g_cacheSaver && g_cacheSaver->joinable())
+            g_cacheSaver->join();
         s.device.wait_idle();
         saveShaderCache(s.device, true);
     }
