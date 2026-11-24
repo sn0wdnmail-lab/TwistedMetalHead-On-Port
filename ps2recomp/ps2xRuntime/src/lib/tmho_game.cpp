@@ -32,6 +32,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -733,8 +734,66 @@ namespace
     struct FontScale
     {
         uint8_t *record = nullptr;
-        uint16_t saved[4] = {};
+        uint32_t index = 0;
+        uint16_t scaled[4] = {};
     };
+
+    // A font record (one of eight) while calls draw with a size of ours in it.
+    struct FontRecordUse
+    {
+        uint16_t game[4] = {};    // the game's own width, height, line step and advance
+        uint16_t written[4] = {}; // what we last put in the record
+        uint32_t calls = 0;       // calls drawing with our size (more than one when one stopped part-way)
+    };
+    FontRecordUse g_fontUses[8];
+
+    // A text call that stopped part-way through its string for a checkpoint (a VBlank or timer
+    // interrupt) and resumes later inside the function. Its font keeps the size set for it until
+    // the call really returns; restored at once, the rest of the string came out at the game's own
+    // size and place - the corner counter glitching now and then.
+    struct PendingFont
+    {
+        const R5900Context *ctx = nullptr;
+        FontScale font;
+        double since = 0.0;
+    };
+    std::vector<PendingFont> g_pendingFonts;
+
+    // A call is done with its size: the record gets back the size of a call that is still
+    // drawing (stopped part-way), else the game's own - unless the game set a size meanwhile.
+    void restoreFont(const FontScale &font)
+    {
+        if (!font.record)
+            return;
+        FontRecordUse &use = g_fontUses[font.index];
+        if (use.calls > 0u)
+            --use.calls;
+        if (std::memcmp(font.record + 0x08, use.written, sizeof(use.written)) != 0)
+            return;
+        const uint16_t *back = use.game;
+        if (use.calls > 0u)
+            for (size_t i = g_pendingFonts.size(); i-- > 0;)
+                if (g_pendingFonts[i].font.record == font.record)
+                {
+                    back = g_pendingFonts[i].font.scaled;
+                    break;
+                }
+        std::memcpy(use.written, back, sizeof(use.written));
+        std::memcpy(font.record + 0x08, use.written, sizeof(use.written));
+    }
+
+    // A call that never came back (its thread ended) must not leave the font at its size for good.
+    void dropStalePendingFonts()
+    {
+        const double now = steadySeconds();
+        for (size_t i = g_pendingFonts.size(); i-- > 0;)
+            if (now - g_pendingFonts[i].since > 1.0)
+            {
+                const FontScale font = g_pendingFonts[i].font;
+                g_pendingFonts.erase(g_pendingFonts.begin() + static_cast<std::ptrdiff_t>(i));
+                restoreFont(font);
+            }
+    }
 
     FontScale layoutText(uint8_t *rdram, R5900Context *ctx)
     {
@@ -767,29 +826,48 @@ namespace
             widthScale *= layout.scale;
             heightScale *= layout.scale;
         }
-        if (widthScale == 1.0f && heightScale == 1.0f)
-            return font;
+        // Tests: PS2X_TEST_SCALE_TEXT=<factor> sizes every text call (menus too).
+        static const float testScale = []()
+        {
+            const char *env = std::getenv("PS2X_TEST_SCALE_TEXT");
+            return env ? static_cast<float>(std::atof(env)) : 0.0f;
+        }();
+        if (testScale > 0.0f)
+        {
+            widthScale *= testScale;
+            heightScale *= testScale;
+        }
         // The font's record for this one call: width +0x08, height +0x0A, line step +0x0C, advance +0x0E.
         const uint32_t index = GPR_U32(ctx, 4);
-        if (index < 8u)
-            font.record = getMemPtr(rdram, kFontTable + index * kFontRecordSize);
-        if (font.record)
+        if (index >= 8u)
+            return font;
+        FontRecordUse &use = g_fontUses[index];
+        const bool sized = widthScale != 1.0f || heightScale != 1.0f;
+        if (!sized && use.calls == 0u)
+            return font;
+        uint8_t *record = getMemPtr(rdram, kFontTable + index * kFontRecordSize);
+        if (!record)
+            return font;
+        uint16_t current[4];
+        std::memcpy(current, record + 0x08, sizeof(current));
+        // A call stopped part-way may have its size in the record: this call is sized from the
+        // game's own values all the same (and an unsized call draws at the game's size).
+        const bool oursInRecord = use.calls != 0u && std::memcmp(current, use.written, sizeof(current)) == 0;
+        if (!oursInRecord)
         {
-            std::memcpy(font.saved, font.record + 0x08, sizeof(font.saved));
-            const float factor[4] = {widthScale, heightScale, heightScale, widthScale};
-            for (int i = 0; i < 4; ++i)
-            {
-                const uint16_t scaled = static_cast<uint16_t>(std::clamp(std::lround(font.saved[i] * factor[i]), 1L, 65535L));
-                std::memcpy(font.record + 0x08 + i * 2, &scaled, 2);
-            }
+            if (!sized)
+                return font;
+            std::memcpy(use.game, current, sizeof(current));
         }
+        font.record = record;
+        font.index = index;
+        const float factor[4] = {widthScale, heightScale, heightScale, widthScale};
+        for (int i = 0; i < 4; ++i)
+            font.scaled[i] = static_cast<uint16_t>(std::clamp(std::lround(use.game[i] * factor[i]), 1L, 65535L));
+        std::memcpy(use.written, font.scaled, sizeof(use.written));
+        std::memcpy(record + 0x08, use.written, sizeof(use.written));
+        ++use.calls;
         return font;
-    }
-
-    void restoreFont(const FontScale &font)
-    {
-        if (font.record)
-            std::memcpy(font.record + 0x08, font.saved, sizeof(font.saved));
     }
 
     template <size_t N>
@@ -831,10 +909,51 @@ namespace
             }
             if (widescreen())
                 moveTextX(ctx, kTextMoves);
+            if (!g_pendingFonts.empty())
+                dropStalePendingFonts();
             font = layoutText(rdram, ctx);
+            // Tests: PS2X_TEST_TEXT_INTERRUPT=1 makes every moved HUD text stop part-way for a
+            // checkpoint (as a VBlank arriving during it does now and then).
+            static const bool interruptTexts = std::getenv("PS2X_TEST_TEXT_INTERRUPT") != nullptr;
+            if (interruptTexts && font.record)
+                runtime->eeScheduler().postEvent(EeEvent{EeEventType::ExternalWake, 0xFFFFFFFFu, ~0ull});
         }
-        g_drawText(rdram, ctx, runtime);
-        restoreFont(font);
+        try
+        {
+            g_drawText(rdram, ctx, runtime);
+        }
+        catch (...)
+        {
+            if (font.record)
+                g_pendingFonts.push_back({ctx, font, steadySeconds()});
+            throw;
+        }
+        if (runtime->eeScheduler().unwindingForCheckpoint())
+        {
+            // Stopped for a checkpoint; the string is finished when the call resumes.
+            if (font.record)
+            {
+                g_pendingFonts.push_back({ctx, font, steadySeconds()});
+                static uint32_t kept = 0;
+                if (++kept <= 3u || kept % 1000u == 0u)
+                    std::fprintf(stderr, "[tmho] HUD text interrupted part-way (%u so far): its size is kept until it finishes\n", kept);
+            }
+            return;
+        }
+        if (font.record)
+        {
+            restoreFont(font);
+            return;
+        }
+        // A resumed call that has now returned: its font goes back.
+        for (size_t i = g_pendingFonts.size(); i-- > 0;)
+            if (g_pendingFonts[i].ctx == ctx)
+            {
+                const FontScale pending = g_pendingFonts[i].font;
+                g_pendingFonts.erase(g_pendingFonts.begin() + static_cast<std::ptrdiff_t>(i));
+                restoreFont(pending);
+                break;
+            }
     }
 
     void drawPlayerText(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -904,6 +1023,17 @@ namespace
         return runtime.replaceFunction(address, wrapper);
     }
 
+    // As hook(), and a call that resumes inside the function after a checkpoint comes through the
+    // wrapper too (it finds the original from its label), so the wrapper sees the call finish.
+    bool hookWithResumes(PS2Runtime &runtime, uint32_t address, Fn wrapper, Fn &original)
+    {
+        if (!hook(runtime, address, wrapper, original))
+            return false;
+        for (uint32_t pc = address + 4u; runtime.hasFunction(pc) && runtime.lookupFunction(pc) == original; pc += 4u)
+            runtime.replaceFunction(pc, wrapper);
+        return true;
+    }
+
     void apply(PS2Runtime &runtime)
     {
         g_runtime = &runtime;
@@ -911,7 +1041,7 @@ namespace
         ok &= hook(runtime, kSetViewportFov, &setViewportFov, g_setViewportFov);
         ok &= hook(runtime, kPlaceHudModel, &placeHudModel, g_placeHudModel);
         ok &= hook(runtime, kPlaceHudInstance, &placeHudInstance, g_placeHudInstance);
-        ok &= hook(runtime, kDrawText, &drawText, g_drawText);
+        ok &= hookWithResumes(runtime, kDrawText, &drawText, g_drawText);
         ok &= hook(runtime, kDrawPlayerText, &drawPlayerText, g_drawPlayerText);
         ok &= hook(runtime, kSetFontSize, &setFontSize, g_setFontSize);
         ok &= hook(runtime, kCameraLookAt, &cameraLookAt, g_cameraLookAt);

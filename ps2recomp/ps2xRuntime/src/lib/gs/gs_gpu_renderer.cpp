@@ -205,6 +205,7 @@ namespace ps2gpu
             VkFormat format = VK_FORMAT_UNDEFINED;
             uint32_t displayFbp = 0;
             uint64_t tick = 0;
+            uint32_t phase = 0; // the interlace field it was scanned out as
             bool pending = false;
         };
 
@@ -284,6 +285,55 @@ namespace ps2gpu
             put(&p.siglblid, r.siglblid);
         }
 
+        // Diagnostics: PS2X_DUMP_SCANOUT=<folder> writes the top-left quarter of the scanned-out
+        // pictures of VBlanks PS2X_DUMP_SCANOUT_FROM .. +PS2X_DUMP_SCANOUT_COUNT (default 120) as
+        // PPM files, with their VBlank, field and buffer in scanout.txt.
+        void dumpScanoutLocked(State &s, const Readback &slot, bool rawBgra)
+        {
+            static const char *dir = std::getenv("PS2X_DUMP_SCANOUT");
+            if (!dir || !*dir)
+                return;
+            static const uint64_t from = []()
+            {
+                const char *v = std::getenv("PS2X_DUMP_SCANOUT_FROM");
+                return v ? std::strtoull(v, nullptr, 10) : 0ull;
+            }();
+            static const uint64_t count = []()
+            {
+                const char *v = std::getenv("PS2X_DUMP_SCANOUT_COUNT");
+                return v ? std::strtoull(v, nullptr, 10) : 120ull;
+            }();
+            if (slot.tick < from || slot.tick >= from + count || s.frame.empty())
+                return;
+            const uint32_t w = slot.width / 2u, h = slot.height / 2u;
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/scanout_%06llu.ppm", dir, static_cast<unsigned long long>(slot.tick));
+            if (std::FILE *f = std::fopen(path, "wb"))
+            {
+                std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+                std::vector<uint8_t> row(static_cast<size_t>(w) * 3u);
+                for (uint32_t y = 0; y < h; ++y)
+                {
+                    const uint8_t *src = s.frame.data() + static_cast<size_t>(y) * slot.width * 4u;
+                    for (uint32_t x = 0; x < w; ++x)
+                    {
+                        row[x * 3u + 0u] = src[x * 4u + (rawBgra ? 2u : 0u)];
+                        row[x * 3u + 1u] = src[x * 4u + 1u];
+                        row[x * 3u + 2u] = src[x * 4u + (rawBgra ? 0u : 2u)];
+                    }
+                    std::fwrite(row.data(), 1, row.size(), f);
+                }
+                std::fclose(f);
+            }
+            std::snprintf(path, sizeof(path), "%s/scanout.txt", dir);
+            if (std::FILE *f = std::fopen(path, "ab"))
+            {
+                std::fprintf(f, "tick %llu phase %u fbp %u size %ux%u\n", static_cast<unsigned long long>(slot.tick), slot.phase,
+                             slot.displayFbp, slot.width, slot.height);
+                std::fclose(f);
+            }
+        }
+
         // Moves a finished copy into the window thread's frame.
         void publishLocked(State &s, Readback &slot)
         {
@@ -319,6 +369,7 @@ namespace ps2gpu
                 s.frameTick = slot.tick;
                 s.frameRawBgra = raw;
                 s.frameFresh = true;
+                dumpScanoutLocked(s, slot, raw);
             }
             s.device.unmap_host_buffer(*slot.buffer, MEMORY_ACCESS_READ_BIT);
             slot.pending = false;
@@ -366,6 +417,7 @@ namespace ps2gpu
             slot.format = result.image->get_format();
             slot.displayFbp = displayFbp;
             slot.tick = tick;
+            slot.phase = result.interlace_phase;
 
             auto cmd = s.device.request_command_buffer();
             cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -961,8 +1013,34 @@ namespace ps2gpu
         info.anti_blur = antiBlurOverride != 0;
         info.adapt_to_internal_horizontal_resolution = true;
         info.high_resolution_scanout = s.superSampling > 1u;
+        // Field-rendered games: scan a buffer out as the field it was drawn for, so a frame the game
+        // shows late or twice does not jump a line (PS2X_PGS_FIELD_FOLLOW=0 goes by the CRTC field).
+        static const bool followDrawnField = []()
+        {
+            const char *env = std::getenv("PS2X_PGS_FIELD_FOLLOW");
+            return !(env && *env == '0');
+        }();
+        info.follow_drawn_field = followDrawnField;
+        // Tests: PS2X_TEST_FIELD_GLITCH=N scans every Nth VBlank out as the other field, as when the
+        // game shows a frame late.
+        static const uint64_t glitchEvery = []()
+        {
+            const char *env = std::getenv("PS2X_TEST_FIELD_GLITCH");
+            return env ? std::strtoull(env, nullptr, 10) : 0ull;
+        }();
+        if (glitchEvery != 0u && scanout.tick % glitchEvery == 0u)
+            info.phase ^= 1u;
         const ScanoutResult result = s.iface.vsync(info);
         ps2perf::count(ps2perf::GpuFrames);
+        {
+            static uint64_t lastFollows = 0;
+            const uint64_t follows = s.iface.get_field_follow_count();
+            if (follows != lastFollows)
+            {
+                ps2perf::count(ps2perf::GpuFieldFollows, follows - lastFollows);
+                lastFollows = follows;
+            }
+        }
         if (ps2perf::enabled())
         {
             static uint32_t budgetTick = 0;

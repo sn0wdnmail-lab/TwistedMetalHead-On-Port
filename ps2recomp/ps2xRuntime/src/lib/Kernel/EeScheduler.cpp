@@ -2091,6 +2091,11 @@ void EeScheduler::processEvent(const EeEvent &event)
             }
             // For the window's in-between frames: when this VBlank's picture belongs in time.
             ps2present::noteVBlank(m_vsyncTick, ps2present::now(), newPicture);
+            static const bool logFlips = std::getenv("PS2X_LOG_FLIPS") != nullptr; // diagnostics
+            if (logFlips)
+                std::fprintf(stderr, "[flip] tick %llu field %u fbp %u %s\n", static_cast<unsigned long long>(m_vsyncTick),
+                             unsigned((m_runtime.memory().gs().csr.load(std::memory_order_relaxed) >> 13) & 1u), shown,
+                             s_sameFor == 0u ? "new" : "same");
         }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

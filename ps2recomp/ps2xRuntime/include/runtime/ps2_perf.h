@@ -96,6 +96,7 @@ namespace ps2perf
         GpuFrames,
         GpuReadbacks,
         GpuDroppedReadbacks,
+        GpuFieldFollows, // interlaced frames shown late or twice, scanned out as the field they were drawn for
         GpuPrimitives,
         GpuRenderPasses,
         GpuCopies,

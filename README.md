@@ -72,6 +72,14 @@ A controller works too; the keyboard keeps working alongside it.
   keeps its normal speed; the picture is about one frame later. With V-Sync on, Monitor mode
   waits for the desktop compositor in windowed and borderless mode, because some drivers ignore
   the swap interval there.
+- **Steady picture** (V7.2): the game draws each frame for one of the two interlaced video
+  fields, which sit one line apart. paraLLEl-GS showed a frame on whichever field the video
+  output had reached by then, so a frame that came late or was shown twice landed on the wrong
+  field, and the whole picture jumped a line up or down now and then. The renderer now notes
+  which field each frame buffer was drawn for (from the game's drawing offset) and shows it on
+  that field; `Graphicslogs.txt` counts how often that happens. In five-opponent battles on the
+  test PC (1440p, 120 fps) it caught about 430 such frames in under six minutes of play, up to
+  35 in two seconds in busy moments: each of them used to be a one-line jump.
 - **True 16:9 widescreen**: the 3D cameras see more to each side instead of stretching the
   picture; the battle HUD sits right at the screen edges, and the radar, weapon panel, names and
   text keep their shape; movies stay 4:3. Also **4:3** (original) and **Stretch**.
@@ -100,6 +108,11 @@ A controller works too; the keyboard keeps working alongside it.
   moving the 3D model showed it from another angle and pushed the icon off-centre).
 - The ammo and cars-left numbers keep their 4:3 width in 16:9, so a thin "1" no longer drops
   out between the font texture's texels.
+- **HUD text no longer glitches** (V7.2): a text call (the cars-left counter in the top-left
+  corner, for one) sometimes stops part-way through its string for a VBlank or timer interrupt
+  and carries on afterwards. The port set the game's own font size back as soon as the call
+  first stopped, so the rest of the string came out at the wrong size and place for a frame.
+  The size now stays until the call really finishes.
 
 ### Camera
 - **Field of view** slider (50–120°; the game's own view is 65° at 4:3 and 81° at 16:9).

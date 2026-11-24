@@ -1,5 +1,5 @@
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
-index ea00016..b912995 100644
+index ea00016..cce3a87 100644
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
 @@ -9,6 +9,8 @@
@@ -172,7 +172,19 @@ index ea00016..b912995 100644
  	prim_attr.state |= render_pass.current_instance << STATE_VERTEX_RENDER_PASS_INSTANCE_OFFSET;
  
  	// If our damage region expands, then mark hazards.
-@@ -3246,6 +3374,11 @@ void GSInterface::init_transfer()
+@@ -2875,7 +3003,11 @@ void GSInterface::drawing_kick_primitive(bool adc)
+ 	if (!adc)
+ 	{
+ 		if (!draw_is_degenerate())
++		{
++			const auto &kick_ctx = registers.ctx[registers.prim.desc.CTXT];
++			note_field_draw(kick_ctx.frame.desc.FBP, kick_ctx.xyoffset.desc.OFY);
+ 			drawing_kick_append<list_primitive, fan_primitive, quad, num_vertices>();
++		}
+ 		else
+ 			TRACE("Degenerate Draw", DummyBits{});
+ 	}
+@@ -3246,6 +3378,11 @@ void GSInterface::init_transfer()
  			return;
  		}
  
@@ -184,7 +196,7 @@ index ea00016..b912995 100644
  		if (host_timeline == UINT64_MAX)
  		{
  			host_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
-@@ -3254,6 +3387,19 @@ void GSInterface::init_transfer()
+@@ -3254,6 +3391,19 @@ void GSInterface::init_transfer()
  				renderer.wait_timeline(host_timeline);
  		}
  		renderer.wait_timeline(host_timeline);
@@ -204,7 +216,7 @@ index ea00016..b912995 100644
  
  		void *mapped = renderer.begin_host_vram_access();
  
-@@ -4268,6 +4414,7 @@ void GSInterface::flush()
+@@ -4268,6 +4418,7 @@ void GSInterface::flush()
  {
  	flush_pending_transfer(true);
  	uint64_t value = tracker.mark_submission_timeline();
@@ -212,11 +224,64 @@ index ea00016..b912995 100644
  	renderer.flush_submit(value);
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
+@@ -4633,11 +4784,42 @@ void GSInterface::register_backbuffer_promotion_fbp(uint32_t fbp)
+ 	num_promoted_backbuffers++;
+ }
+ 
++bool GSInterface::drawn_field_phase(uint32_t fbp, uint32_t &phase) const
++{
++	const auto &t = field_draws[fbp & 511u];
++	// Drawn during the last few frames: a buffer shown late or a second time is still that recent.
++	if (t.epoch == 0 || field_vsync_epoch - t.epoch > 3 || t.count[0] + t.count[1] == 0)
++		return false;
++	phase = t.count[1] > t.count[0] ? 1u : 0u;
++	return true;
++}
++
+ ScanoutResult GSInterface::vsync(const VSyncInfo &info_)
+ {
+ 	auto info = info_;
+ 	auto ffmd = priv_registers.smode2.FFMD;
+ 
++	// Field rendering: scan the shown buffer out as the field it was drawn for (its half-line
++	// offset), once the game is seen drawing both fields' offsets. A buffer the game shows late, or
++	// a second time, then stays where it was instead of moving a line up or down.
++	if (info.follow_drawn_field && priv_registers.smode2.INT && priv_registers.smode2.FFMD &&
++	    (priv_registers.pmode.EN1 || priv_registers.pmode.EN2))
++	{
++		const uint32_t fbp = priv_registers.pmode.EN2 ? priv_registers.dispfb2.FBP : priv_registers.dispfb1.FBP;
++		uint32_t drawn = 0;
++		if (drawn_field_phase(fbp, drawn))
++		{
++			field_phase_last_seen[drawn] = field_vsync_epoch;
++			const uint64_t oldest = std::min(field_phase_last_seen[0], field_phase_last_seen[1]);
++			if (oldest != 0 && field_vsync_epoch - oldest < 60 && info.phase != drawn)
++			{
++				info.phase = drawn;
++				field_follow_count++;
++			}
++		}
++	}
++	field_vsync_epoch++;
++
+ 	// Somewhat of a hack to avoid having to turn off force_progressive manually.
+ 	if (state_tracker.has_complex_scanmsk_timeout)
+ 	{
 diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
-index 9f05da8..431d6b2 100644
+index 9f05da8..ead4b49 100644
 --- a/gs/gs_interface.hpp
 +++ b/gs/gs_interface.hpp
-@@ -251,11 +251,31 @@ public:
+@@ -184,6 +184,9 @@ struct VSyncInfo
+ 	// This will look funny if the game is constantly changing vertical scanout resolution.
+ 	bool raw_circuit_scanout;
+ 
++	// Field rendering: scan a buffer out as the field it was drawn for (see GSInterface::vsync).
++	bool follow_drawn_field = true;
++
+ 	// When using SSAA, attempt to scan out a higher resolution image based on the super samples.
+ 	// This only works well if the game is rendering 3D geometry directly to the frame buffer which is used to scanout.
+ 	// Some games blit the real framebuffer to scanout location using textures, which will lose the SSAA information necessary to scanout,
+@@ -251,11 +254,31 @@ public:
  class GSInterface final
  {
  public:
@@ -248,7 +313,16 @@ index 9f05da8..431d6b2 100644
  	void set_debug_mode(const DebugMode &mode);
  	void set_hacks(const Hacks &hacks);
  
-@@ -521,6 +541,16 @@ private:
+@@ -297,6 +320,8 @@ public:
+ 
+ 	ScanoutResult vsync(const VSyncInfo &info);
+ 	bool vsync_can_skip(const VSyncInfo &info) const;
++	// Scan-outs that followed the field a buffer was drawn for instead of the CRTC field.
++	uint64_t get_field_follow_count() const { return field_follow_count; }
+ 
+ 	FlushStats consume_flush_stats();
+ 	double get_accumulated_timestamps(TimestampType type) const;
+@@ -521,6 +546,16 @@ private:
  
  	uint32_t drawing_kick_update_texture(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb);
  
@@ -265,6 +339,41 @@ index 9f05da8..431d6b2 100644
  	struct PrimitiveTemplate
  	{
  		uint32_t state, tex, tex2;
+@@ -559,6 +594,34 @@ private:
+ 		uint32_t has_complex_scanmsk_timeout = 0;
+ 	} state_tracker;
+ 
++	// Field-rendered games (interlaced, FFMD) draw each buffer with the half-line offset of one
++	// field. This keeps which field each buffer was drawn for, so the scan-out can follow it when a
++	// game shows a buffer late or twice: going by the CRTC field alone moves the picture by a line.
++	struct FieldDrawTrack
++	{
++		uint64_t epoch = 0;
++		uint32_t count[2] = {};
++	};
++	FieldDrawTrack field_draws[512];
++	uint64_t field_vsync_epoch = 1;
++	uint64_t field_phase_last_seen[2] = {};
++	uint64_t field_follow_count = 0;
++	inline void note_field_draw(uint32_t fbp, uint32_t ofy)
++	{
++		const uint32_t frac = ofy & 15u;
++		if ((frac != 0u && frac != 8u) || ofy < 16u)
++			return;
++		auto &t = field_draws[fbp & 511u];
++		if (t.epoch != field_vsync_epoch)
++		{
++			t.epoch = field_vsync_epoch;
++			t.count[0] = 0;
++			t.count[1] = 0;
++		}
++		t.count[frac >> 3]++;
++	}
++	bool drawn_field_phase(uint32_t fbp, uint32_t &phase) const;
++
+ 	void update_internal_register(uint64_t &reg, uint64_t value, StateDirtyFlags flags);
+ 
+ 	void update_texture_page_rects();
 diff --git a/gs/gs_renderer.cpp b/gs/gs_renderer.cpp
 index dbe032d..8a48702 100644
 --- a/gs/gs_renderer.cpp

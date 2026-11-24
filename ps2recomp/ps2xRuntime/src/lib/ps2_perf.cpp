@@ -2259,8 +2259,8 @@ namespace ps2perf
                               formatCount(rate(GpuRenderPasses)).c_str(), formatCount(rate(GpuCopies)).c_str(),
                               formatCount(rate(GpuPaletteUpdates)).c_str());
                 std::snprintf(g3, sizeof(g3),
-                              "           frames: %.1f scanouts/s, %.1f read back to the window/s, %.1f skipped (GPU still busy)/s, %s GS->CPU reads/s (%s answered from the frame before) | video memory in use %.0f MB of %.0f MB",
-                              rate(GpuFrames), rate(GpuReadbacks), rate(GpuDroppedReadbacks), formatCount(rate(LocalToHostReads)).c_str(),
+                              "           frames: %.1f scanouts/s (%.0f shown late or twice, kept on their own field), %.1f read back to the window/s, %.1f skipped (GPU still busy)/s, %s GS->CPU reads/s (%s answered from the frame before) | video memory in use %.0f MB of %.0f MB",
+                              rate(GpuFrames), static_cast<double>(counters[GpuFieldFollows]), rate(GpuReadbacks), rate(GpuDroppedReadbacks), formatCount(rate(LocalToHostReads)).c_str(),
                               formatCount(rate(GsDownloadsPredicted)).c_str(),
                               static_cast<double>(g_gauges[GpuMemoryUsedBytes].load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
                               static_cast<double>(g_gauges[GpuMemoryBudgetBytes].load(std::memory_order_relaxed)) / (1024.0 * 1024.0));

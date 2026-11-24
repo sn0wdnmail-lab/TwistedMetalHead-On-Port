@@ -8,6 +8,10 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/gs/gs_gpu_renderer.h"
 #include <atomic>
+#include <map>
+#include <string>
+#include <cstdio>
+extern std::atomic<uint64_t> g_ps2xVsyncCount;
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1314,6 +1318,18 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         int ci = (regAddr == GS_REG_XYOFFSET_2) ? 1 : 0;
         m_ctx[ci].xyoffset.ofx = static_cast<uint16_t>(value & 0xFFFF);
         m_ctx[ci].xyoffset.ofy = static_cast<uint16_t>((value >> 32) & 0xFFFF);
+        static const bool logOffsets = std::getenv("PS2X_LOG_XYOFFSET") != nullptr; // diagnostics
+        if (logOffsets)
+        {
+            static uint16_t lastOfy[2] = {0xFFFFu, 0xFFFFu};
+            if (lastOfy[ci] != m_ctx[ci].xyoffset.ofy)
+            {
+                lastOfy[ci] = m_ctx[ci].xyoffset.ofy;
+                std::fprintf(stderr, "[xyoff] tick %llu ctx %d ofy %u.%u\n",
+                             static_cast<unsigned long long>(g_ps2xVsyncCount.load(std::memory_order_relaxed)), ci + 1,
+                             unsigned(m_ctx[ci].xyoffset.ofy >> 4), unsigned(m_ctx[ci].xyoffset.ofy & 15u));
+            }
+        }
         break;
     }
     case GS_REG_PRMODECONT:
@@ -1372,6 +1388,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
         m_ctx[ci].frame.fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
+        static const bool logFrames = std::getenv("PS2X_LOG_XYOFFSET") != nullptr; // diagnostics
+        if (logFrames && ci == 0)
+        {
+            static uint32_t lastFbp = 0xFFFFFFFFu;
+            if (lastFbp != m_ctx[0].frame.fbp)
+            {
+                lastFbp = m_ctx[0].frame.fbp;
+                std::fprintf(stderr, "[frame] tick %llu fbp %u\n", static_cast<unsigned long long>(g_ps2xVsyncCount.load(std::memory_order_relaxed)),
+                             unsigned(lastFbp));
+            }
+        }
         break;
     }
     case GS_REG_ZBUF_1:
@@ -1679,6 +1706,30 @@ void GS::vertexKick(bool drawing)
                     const GSVertex &v = batch.vertices[static_cast<size_t>(i)];
                     std::fprintf(stderr, "[gs-tri]   v%d xy=(%.1f,%.1f) z=%.0f rgba=(%u,%u,%u,%u) q=%g\n", i, v.x, v.y, v.z, v.r, v.g, v.b, v.a, v.q);
                 }
+            }
+        }
+        {
+            static const bool logDraws = std::getenv("PS2X_LOG_XYOFFSET") != nullptr; // diagnostics
+            if (logDraws)
+            {
+                static uint64_t curTick = ~0ull;
+                static std::map<std::pair<uint32_t, uint32_t>, uint32_t> counts;
+                const uint64_t tick = g_ps2xVsyncCount.load(std::memory_order_relaxed);
+                if (tick != curTick)
+                {
+                    if (!counts.empty())
+                    {
+                        std::string line = "[draws] tick " + std::to_string(curTick);
+                        for (const auto &kv : counts)
+                            line += " | fbp " + std::to_string(kv.first.first) + " ofy " + std::to_string(kv.first.second >> 4) + "." +
+                                    std::to_string(kv.first.second & 15u) + " n=" + std::to_string(kv.second);
+                        std::fprintf(stderr, "%s\n", line.c_str());
+                    }
+                    counts.clear();
+                    curTick = tick;
+                }
+                const auto &c = batch.state.context;
+                ++counts[{c.frame.fbp, c.xyoffset.ofy}];
             }
         }
         updatePreferredDisplaySourceForDraw(batch);
