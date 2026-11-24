@@ -36,23 +36,35 @@ Keys (or plug in a controller)
   Z                 Square         Left/Right Shift   L2 / R2
   V                 Triangle
   F2                settings (video, audio, game, HUD, UI colour)
+  F11 or Alt+Enter  windowed <-> full screen
+  F12               screenshot (Screenshots folder next to TMHO.exe)
   F1                debugger
 
 To quit, close the window, or use F2 > Game > Quit game (press Quit twice).
 
 Video (F2 > Video) - all of it changes straight away, no restart needed
-  Display mode         Windowed, Borderless or Fullscreen.
-  Resolution           Windowed: the window size. Fullscreen: the display mode
-                       (your monitor's own is the first entry). Borderless: the
-                       size the picture is drawn at before it fills the screen.
-                       4:3 sizes go from 640 x 480 up to 4K, 16:9 sizes from
-                       854 x 480 to 3840 x 2160.
+  Display mode         Windowed, Borderless or Fullscreen. F11 or Alt+Enter
+                       switches between windowed and full screen at any time.
+  Resolution           The game picture's resolution, whatever your screen is:
+                       480p (1x, the PS2's own), 720p, 1080p, 1440p or 2160p (4K).
+                       Higher is sharper; lower is lighter on the graphics card.
+                       One above your screen's is drawn big and shrunk to fit,
+                       for smoother edges.
   Aspect ratio         4:3 is the original picture. 16:9 is true widescreen: the
                        game's 3D cameras see more to each side (nothing is
                        stretched), and the HUD, radar and text keep their shape.
                        Pre-rendered movies stay 4:3. Stretch fills the screen.
-  Internal resolution  How sharp the GPU draws the game: 1x (640 x 448), 2x or
-                       4x. Auto picks 2x for up to 1080p and 4x above.
+  Scaling              Sharp or Smooth, when the picture is smaller than the
+                       screen.
+  V-Sync               Waits for the monitor's refresh to avoid tearing.
+  Frame rate           60 fps shows the game's own frames. 120 fps and Monitor
+                       (your screen's refresh rate, e.g. 144 or 170) add
+                       in-between frames made from the two newest game frames:
+                       motion is smoother and the game keeps its normal speed.
+                       The picture is then about one frame later.
+
+On a slower PC: Resolution 480p or 720p, Frame rate 60 fps, and keep
+F2 > Game > VU1 thread on (the default).
 
 Sharper font (Vulkan renderer)
   A picture named font_atlas.png in a "textures" folder next to TMHO.exe
@@ -80,13 +92,20 @@ Battle HUD (F2 > HUD)
   Reset HUD layout     Puts the HUD back where it starts: right at the screen
                        edges in 16:9, where the game has it in 4:3.
 
+Screenshots: F12 (or F2 > Game > Screenshot > Take) saves the game picture -
+without menus or the FPS counter - as a PNG in a "Screenshots" folder next to
+TMHO.exe, named by date and time.
+
+Pause in background (F2 > Game) stops the game while its window is not in
+front, and carries on when you come back. Mute in background (F2 > Audio)
+silences it instead.
+
 Record screenshots (F2 > Game) saves a picture of the game every half second
 in Logs\frames (pictures older than 10 minutes are deleted). Handy for bug
 reports; leave it off otherwise.
 
-FPS counter: F2 > Game > FPS counter. The big number is the game's real frame
-rate (new pictures per second; 60 is smooth, coloured green, yellow below 50,
-red below 25). Underneath: the window's frame rate and the game speed.
+FPS counter: F2 > Game > FPS counter shows "FPS - 60" in the corner: pictures
+on screen per second (with in-between frames on, those count too).
 
 Needs Windows 10/11 (64-bit) and a graphics card with Vulkan. Logs go in a
 "Logs" folder next to TMHO.exe: performancelogs.txt, Graphicslogs.txt and

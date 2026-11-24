@@ -8,6 +8,8 @@
 #include "runtime/gs/gs_gpu_renderer.h"
 #include "runtime/ps2_perf.h"
 #include "runtime/ps2_launcher.h"
+#include "runtime/ps2_present.h"
+#include "ps2_capture.h"
 
 #include "raylib.h"
 
@@ -53,6 +55,8 @@ namespace ps2settings
         bool g_clickThisFrame = false;    // latched once per frame in update()
         bool g_tapKeys[512] = {};         // keys that went down since the last frame
         bool g_keysThisFrame[512] = {};
+        bool g_tapAltEnter = false;       // Alt+Enter went down since the last frame
+        bool g_altEnterThisFrame = false;
 
         void onMouseButton(GLFWwindow *window, int button, int action, int mods)
         {
@@ -66,6 +70,18 @@ namespace ps2settings
         {
             if (action == 1 && key >= 0 && key < 512)
                 g_tapKeys[key] = true;
+            // Keys the port itself answers, kept from raylib and the game: F11 and Alt+Enter
+            // (fullscreen), F12 (screenshot; raylib's own F12 would overwrite screenshot000.png
+            // every session and Ctrl+F12 would start a slow GIF recording).
+            constexpr int kAlt = 0x0004; // GLFW_MOD_ALT
+            if (key == KEY_ENTER && (mods & kAlt) != 0)
+            {
+                if (action == 1)
+                    g_tapAltEnter = true;
+                return;
+            }
+            if (key == KEY_F11 || key == KEY_F12)
+                return;
             if (g_raylibKey)
                 g_raylibKey(window, key, scancode, action, mods);
         }
@@ -93,6 +109,8 @@ namespace ps2settings
                 g_keysThisFrame[k] = g_tapKeys[k];
                 g_tapKeys[k] = false;
             }
+            g_altEnterThisFrame = g_tapAltEnter;
+            g_tapAltEnter = false;
         }
 
         Settings g_settings;
@@ -118,22 +136,6 @@ namespace ps2settings
         };
         constexpr int kWindowSizeCount = static_cast<int>(sizeof(kWindowSizes) / sizeof(kWindowSizes[0]));
 
-        // Resolutions offered per aspect ratio, from the PS2's 480 lines up to 4K.
-        struct Resolution
-        {
-            int width;
-            int height;
-            const char *tag;
-        };
-        const Resolution kResolutions43[] = {
-            {640, 480, "480p, 1x"}, {960, 720, "720p, 1.5x"}, {1280, 960, "960p, 2x"},
-            {1440, 1080, "1080p"}, {1920, 1440, "1440p, 3x"}, {2880, 2160, "4K"},
-        };
-        const Resolution kResolutions169[] = {
-            {854, 480, "480p"}, {1280, 720, "720p"}, {1600, 900, "900p"},
-            {1920, 1080, "1080p"}, {2560, 1440, "1440p"}, {3840, 2160, "4K"},
-        };
-
         struct Swatch
         {
             uint32_t rgb;
@@ -154,9 +156,10 @@ namespace ps2settings
             const Settings &s = g_settings;
             out << "# Twisted Metal: Head-On PC port settings (F2 in game)\n";
             out << "window_mode=" << s.windowMode << "\n";
-            out << "# res_width/res_height: window size (windowed), display mode (fullscreen) or picture size (borderless); 0 = monitor\n";
-            out << "res_width=" << s.resWidth << "\n";
-            out << "res_height=" << s.resHeight << "\n";
+            out << "# resolution: the game picture's lines - 0 = 480p (1x), 1 = 720p, 2 = 1080p, 3 = 1440p, 4 = 2160p\n";
+            out << "resolution=" << s.resolution << "\n";
+            out << "# frame_rate: 0 = 60 fps, 1 = 120 fps, 2 = the monitor's rate (in-between frames; the game keeps its speed)\n";
+            out << "frame_rate=" << s.frameRate << "\n";
             out << "aspect=" << s.aspect << "\n";
             out << "filter=" << s.filter << "\n";
             out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
@@ -182,9 +185,14 @@ namespace ps2settings
                 out << "gpu_timestamps=" << s.gpuTimestamps << "\n";
             if (s.gpuFeedBatch != 1)
                 out << "gpu_feed_batch=" << s.gpuFeedBatch << "\n";
+            if (s.audioDump != 0)
+                out << "audio_dump=" << s.audioDump << "\n";
+            if (s.gsDownloadPrediction != 1)
+                out << "gs_download_prediction=" << s.gsDownloadPrediction << "\n";
             out << "master_volume=" << s.masterVolume << "\n";
             out << "mute_unfocused=" << (s.muteUnfocused ? 1 : 0) << "\n";
             out << "pause_in_menu=" << (s.pauseInMenu ? 1 : 0) << "\n";
+            out << "pause_unfocused=" << (s.pauseUnfocused ? 1 : 0) << "\n";
             out << "accent=" << s.accentIndex << "\n";
             char hex[16];
             std::snprintf(hex, sizeof(hex), "%06X", s.accentCustom & 0xFFFFFFu);
@@ -193,8 +201,6 @@ namespace ps2settings
             out << "menu_side=" << s.menuSide << "\n";
             out << "# renderer: 0 = Vulkan GPU, 1 = software (CPU). Takes effect on the next start.\n";
             out << "renderer=" << s.renderer << "\n";
-            out << "# internal_res (GPU renderer): 0 = Auto (from the output size), 1 = 1x (640x448), 2 = 2x (1280x896), 3 = 4x (2560x1792)\n";
-            out << "internal_res=" << s.internalScale << "\n";
             out << "# vu1_thread (GPU renderer): 1 = VIF1 and VU1 microcode run on their own CPU core, 0 = on the game thread. Next start.\n";
             out << "vu1_thread=" << (s.vu1Thread ? 1 : 0) << "\n";
         }
@@ -246,9 +252,12 @@ namespace ps2settings
                 else if (key == "gpu_flush_primitives") s.gpuFlushPrimitives = std::clamp(number, 0, 1 << 20);
                 else if (key == "gpu_timestamps") s.gpuTimestamps = std::clamp(number, 0, 1);
                 else if (key == "gpu_feed_batch") s.gpuFeedBatch = std::clamp(number, 0, 1);
+                else if (key == "audio_dump") s.audioDump = std::clamp(number, 0, 1);
+                else if (key == "gs_download_prediction") s.gsDownloadPrediction = std::clamp(number, 0, 1);
                 else if (key == "master_volume") s.masterVolume = std::clamp(number, 0, 100);
                 else if (key == "mute_unfocused") s.muteUnfocused = number != 0;
                 else if (key == "pause_in_menu") s.pauseInMenu = number != 0;
+                else if (key == "pause_unfocused") s.pauseUnfocused = number != 0;
                 else if (key == "accent") s.accentIndex = std::clamp(number, 0, kSwatchCount);
                 else if (key == "accent_custom") s.accentCustom = static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 16)) & 0xFFFFFFu;
                 else if (key == "menu_opacity") s.menuOpacity = std::clamp(number, 60, 100);
@@ -257,13 +266,16 @@ namespace ps2settings
                 else if (key == "internal_resolution") s.internalScale = number <= 0 ? 0 : std::clamp(number + 1, 2, 3); // older files
                 else if (key == "internal_res") s.internalScale = std::clamp(number, 0, 3);
                 else if (key == "vu1_thread") s.vu1Thread = number != 0;
+                else if (key == "resolution") s.resolution = std::clamp(number, 0, 4);
+                else if (key == "frame_rate") s.frameRate = std::clamp(number, 0, 2);
             }
         }
 
         // ---------------------------------------------------------------- applying
         int g_appliedWindowMode = 0;
         int g_appliedAspectForWindow = -1;
-        bool g_appliedVsync = false;
+        int g_appliedSwapInterval = -1; // 0 or 1 as last given to the driver
+        bool g_compositorSync = false;  // V-Sync done by waiting for the desktop compositor (Windows)
         int g_appliedFilter = -1;
         Texture2D *g_frameTexture = nullptr;
 
@@ -282,57 +294,54 @@ namespace ps2settings
             return height > 0 && static_cast<float>(width) / static_cast<float>(height) > 1.5f;
         }
 
-        // The window size for windowed mode: the chosen resolution, else a default that suits the
-        // aspect ratio; never larger than the monitor.
+        // The window size for windowed mode: the chosen resolution in the picture's shape, shrunk to
+        // leave room for the title bar and the taskbar when the monitor is smaller.
         void windowedSize(int &width, int &height)
         {
             const Settings &s = g_settings;
-            width = s.resWidth;
-            height = s.resHeight;
-            if (width <= 0 || height <= 0)
-            {
-                width = s.aspect == 1 ? 1280 : 1280;
-                height = s.aspect == 1 ? 720 : 960;
-            }
+            height = resolutionLines(s.resolution);
+            const float aspect = s.aspect == 0 ? 4.0f / 3.0f : 16.0f / 9.0f;
+            width = static_cast<int>(std::lround(static_cast<float>(height) * aspect));
             const int monitor = GetCurrentMonitor();
             const int mw = GetMonitorWidth(monitor);
             const int mh = GetMonitorHeight(monitor);
-            if (mw > 0 && mh > 0 && (width > mw || height > mh))
+            if (mw > 0 && mh > 0)
             {
-                const float scale = std::min(static_cast<float>(mw) / width, static_cast<float>(mh) / height);
-                width = static_cast<int>(width * scale);
-                height = static_cast<int>(height * scale);
+                const float maxWidth = static_cast<float>(mw) * 0.95f;
+                const float maxHeight = static_cast<float>(mh) * 0.88f;
+                if (static_cast<float>(width) > maxWidth || static_cast<float>(height) > maxHeight)
+                {
+                    const float scale = std::min(maxWidth / static_cast<float>(width), maxHeight / static_cast<float>(height));
+                    width = static_cast<int>(static_cast<float>(width) * scale);
+                    height = static_cast<int>(static_cast<float>(height) * scale);
+                }
             }
         }
 
-        int g_appliedResWidth = -1;
-        int g_appliedResHeight = -1;
+        int g_appliedResolution = -1;
 
+        // Windowed: a window the size of the chosen resolution. Borderless and full screen: the
+        // monitor's own size and mode (the picture is scaled to it).
         void applyWindowMode()
         {
             const Settings &s = g_settings;
-            if (s.windowMode == g_appliedWindowMode && s.resWidth == g_appliedResWidth && s.resHeight == g_appliedResHeight &&
-                (s.windowMode != 0 || s.aspect == g_appliedAspectForWindow))
+            const bool windowedChanged = s.windowMode == 0 &&
+                                         (s.resolution != g_appliedResolution || s.aspect != g_appliedAspectForWindow);
+            if (s.windowMode == g_appliedWindowMode && !windowedChanged)
                 return;
-            const bool modeChanged = s.windowMode != g_appliedWindowMode;
-            // Borderless only changes the picture size when the resolution changes; no mode switch.
-            if (!modeChanged && s.windowMode == 1)
+            if (s.windowMode == g_appliedWindowMode)
             {
-                g_appliedResWidth = s.resWidth;
-                g_appliedResHeight = s.resHeight;
+                int width = 0, height = 0;
+                windowedSize(width, height);
+                SetWindowSize(width, height);
+                centerWindow(width, height);
+                g_appliedResolution = s.resolution;
+                g_appliedAspectForWindow = s.aspect;
                 return;
             }
             const int monitor = GetCurrentMonitor();
-            const int fullWidth = s.resWidth > 0 ? s.resWidth : GetMonitorWidth(monitor);
-            const int fullHeight = s.resHeight > 0 ? s.resHeight : GetMonitorHeight(monitor);
-            // Already full screen and only the resolution changed: one display mode change.
-            if (!modeChanged && s.windowMode == 2 && IsWindowFullscreen())
-            {
-                SetWindowSize(fullWidth, fullHeight);
-                g_appliedResWidth = s.resWidth;
-                g_appliedResHeight = s.resHeight;
-                return;
-            }
+            const int fullWidth = GetMonitorWidth(monitor);
+            const int fullHeight = GetMonitorHeight(monitor);
             // Leave the current mode first.
             if (IsWindowFullscreen())
                 ToggleFullscreen();
@@ -361,19 +370,16 @@ namespace ps2settings
                 ToggleFullscreen();
             }
             g_appliedWindowMode = s.windowMode;
-            g_appliedResWidth = s.resWidth;
-            g_appliedResHeight = s.resHeight;
+            g_appliedResolution = s.resolution;
             g_appliedAspectForWindow = s.aspect;
         }
 
-        // Internal resolution: what the GPU renderer draws at. Auto follows the output height.
+        // What the GPU renderer draws at for the chosen resolution.
         void applyInternalResolution()
         {
             if (!g_gpuAvailable || g_settings.renderer != 0)
                 return;
-            int width = 0, height = 0;
-            pictureTargetSize(GetScreenWidth(), GetScreenHeight(), width, height);
-            const uint32_t rate = superSamplingFor(g_settings.internalScale, height);
+            const uint32_t rate = superSamplingForResolution(g_settings.resolution);
             static uint32_t requested = 0u;
             if (rate != requested)
             {
@@ -382,109 +388,32 @@ namespace ps2settings
             }
         }
 
-        // A resolution entry list for the Resolution row: label and size (0 x 0 = monitor).
-        struct ResolutionChoice
-        {
-            int width;
-            int height;
-            std::string label;
-        };
-
-        std::vector<ResolutionChoice> resolutionChoices()
-        {
-            const Settings &s = g_settings;
-            std::vector<ResolutionChoice> list;
-            const int monitor = GetCurrentMonitor();
-            const int mw = GetMonitorWidth(monitor);
-            const int mh = GetMonitorHeight(monitor);
-            char text[64];
-            auto add = [&](int width, int height, const char *tag)
-            {
-                for (const ResolutionChoice &existing : list)
-                    if (existing.width == width && existing.height == height)
-                        return;
-                if (tag && *tag)
-                    std::snprintf(text, sizeof(text), "%d x %d  (%s)", width, height, tag);
-                else
-                    std::snprintf(text, sizeof(text), "%d x %d", width, height);
-                list.push_back({width, height, text});
-            };
-            if (s.windowMode != 0)
-            {
-                std::snprintf(text, sizeof(text), "Monitor  (%d x %d)", mw, mh);
-                list.push_back({0, 0, text});
-            }
-            if (s.windowMode == 2)
-            {
-                // Exclusive full screen: the display modes the monitor offers.
-                int monitorCount = 0;
-                GLFWmonitor **monitors = glfwGetMonitors(&monitorCount);
-                if (monitors && monitor >= 0 && monitor < monitorCount)
-                {
-                    int modeCount = 0;
-                    const GLFWvidmode *modes = glfwGetVideoModes(monitors[monitor], &modeCount);
-                    std::vector<std::pair<int, int>> sizes;
-                    for (int i = 0; i < modeCount; ++i)
-                        if (modes[i].width >= 640 && modes[i].height >= 480)
-                            sizes.emplace_back(modes[i].width, modes[i].height);
-                    std::sort(sizes.begin(), sizes.end(), [](auto a, auto b) { return a.first * a.second < b.first * b.second; });
-                    for (const auto &size : sizes)
-                        add(size.first, size.second, size.second == 480 ? "480p" : size.second == 720 ? "720p" : size.second == 1080 ? "1080p"
-                                                    : size.second == 1440 ? "1440p" : size.second == 2160 ? "4K" : "");
-                }
-                return list;
-            }
-            const bool wantWide = s.aspect == 1;
-            const bool both = s.aspect == 2;
-            if (!wantWide || both)
-                for (const Resolution &r : kResolutions43)
-                    if (s.windowMode == 1 || ((mw <= 0 || r.width <= mw) && (mh <= 0 || r.height <= mh)))
-                        add(r.width, r.height, r.tag);
-            if (wantWide || both)
-                for (const Resolution &r : kResolutions169)
-                    if (s.windowMode == 1 || ((mw <= 0 || r.width <= mw) && (mh <= 0 || r.height <= mh)))
-                        add(r.width, r.height, r.tag);
-            return list;
-        }
-
-        // After the aspect ratio changes in windowed mode: the same-height size of the new shape.
-        void matchWindowToAspect()
-        {
-            Settings &s = g_settings;
-            if (s.windowMode != 0 || s.aspect == 2)
-                return;
-            int width = 0, height = 0;
-            windowedSize(width, height);
-            const bool wide = s.aspect == 1;
-            if (isWideFamily(width, height) == wide)
-                return;
-            const Resolution *best = nullptr;
-            const Resolution *family = wide ? kResolutions169 : kResolutions43;
-            const int monitor = GetCurrentMonitor();
-            for (int i = 0; i < 6; ++i)
-            {
-                const Resolution &r = family[i];
-                if (r.width > GetMonitorWidth(monitor) || r.height > GetMonitorHeight(monitor))
-                    continue;
-                if (!best || std::abs(r.height - height) < std::abs(best->height - height))
-                    best = &r;
-            }
-            if (best)
-            {
-                s.resWidth = best->width;
-                s.resHeight = best->height;
-            }
-        }
-
+        // V-Sync waits for the monitor's refresh, so it only makes sense when the window draws at
+        // least as often as the monitor refreshes (Monitor frame rate, or 60 fps on a 60 Hz screen);
+        // waiting for it at 120 fps on a 170 Hz screen would drop the frame rate to 85.
+        // Windowed and borderless windows on Windows wait for the desktop compositor instead of
+        // asking the driver: NVIDIA's settings can switch the driver's V-Sync off for every game,
+        // and then the window ran at thousands of frames a second.
         void applyVsync()
         {
-            if (g_settings.vsync == g_appliedVsync)
+            const int refresh = GetMonitorRefreshRate(GetCurrentMonitor());
+            const int target = ps2present::targetFps();
+            const bool fastEnough = target == 0 || refresh <= 0 || target * 100 >= refresh * 95;
+            const bool sync = g_settings.vsync && fastEnough;
+#if defined(_WIN32)
+            const bool compositor = sync && g_settings.windowMode != 2;
+#else
+            const bool compositor = false;
+#endif
+            g_compositorSync = compositor;
+            const int interval = (sync && !compositor) ? 1 : 0;
+            if (interval == g_appliedSwapInterval)
                 return;
-            if (g_settings.vsync)
+            if (interval)
                 SetWindowState(FLAG_VSYNC_HINT);
             else
                 ClearWindowState(FLAG_VSYNC_HINT);
-            g_appliedVsync = g_settings.vsync;
+            g_appliedSwapInterval = interval;
         }
 
         void applyFilter()
@@ -645,69 +574,28 @@ namespace ps2settings
             auto changed = [] { save(); };
             if (tab == 0)
             {
-                Row mode{"Display mode", "Windowed, borderless full screen, or exclusive full screen.", RowKind::Choice,
+                Row mode{"Display mode", "Windowed, borderless full screen, or exclusive full screen. F11 or Alt+Enter switches between windowed and full screen at any time.", RowKind::Choice,
                          [&s] { return s.windowMode; }, [&s, changed](int v) { s.windowMode = v; s.resWidth = 0; s.resHeight = 0; changed(); },
                          {"Windowed", "Borderless", "Fullscreen"}};
                 rows.push_back(mode);
-                const std::vector<ResolutionChoice> choices = resolutionChoices();
-                std::vector<std::string> labels;
-                int current = -1;
-                for (size_t i = 0; i < choices.size(); ++i)
-                {
-                    labels.push_back(choices[i].label);
-                    if (choices[i].width == s.resWidth && choices[i].height == s.resHeight)
-                        current = static_cast<int>(i);
-                }
-                if (current < 0 && s.windowMode == 0)
-                {
-                    // The window's own size (an older setting or one the monitor cannot fit).
-                    int width = 0, height = 0;
-                    windowedSize(width, height);
-                    for (size_t i = 0; i < choices.size(); ++i)
-                        if (choices[i].width == width && choices[i].height == height)
-                            current = static_cast<int>(i);
-                    if (current < 0)
-                    {
-                        char text[48];
-                        std::snprintf(text, sizeof(text), "%d x %d", width, height);
-                        labels.insert(labels.begin(), text);
-                        current = 0;
-                    }
-                }
-                const char *resolutionHelp = s.windowMode == 0 ? "Size of the game window. Changes straight away."
-                                             : s.windowMode == 1 ? "The size the picture is drawn at, then scaled to fill the screen. Monitor draws at the screen's own size."
-                                                                 : "The display mode used in full screen. Monitor keeps the screen's own mode.";
-                const int offset = static_cast<int>(labels.size() - choices.size());
-                Row resolution{"Resolution", resolutionHelp, RowKind::Choice, [current] { return std::max(current, 0); },
-                               [&s, changed, choices, offset](int v)
-                               {
-                                   const int index = v - offset;
-                                   if (index < 0 || index >= static_cast<int>(choices.size()))
-                                       return;
-                                   s.resWidth = choices[static_cast<size_t>(index)].width;
-                                   s.resHeight = choices[static_cast<size_t>(index)].height;
-                                   changed();
-                               },
-                               labels};
+                Row resolution{"Resolution",
+                               "The game picture's resolution, whatever your screen is. Higher is sharper; lower is lighter on the graphics card. "
+                               "One above your screen's is drawn big and shrunk to fit, for smoother edges. Changes straight away.",
+                               RowKind::Choice, [&s] { return std::clamp(s.resolution, 0, 4); },
+                               [&s, changed](int v) { s.resolution = v; changed(); },
+                               {"480p  (1x)", "720p", "1080p", "1440p", "2160p  (4K)"}};
                 rows.push_back(resolution);
                 Row aspect{"Aspect ratio", "4:3 is the original picture. 16:9 is true widescreen: the game's cameras see more to each side and the HUD and text keep their shape (movies stay 4:3). Stretch fills the screen with the 4:3 picture.", RowKind::Choice,
                            [&s] { return s.aspect; },
                            [&s, changed](int v)
                            {
                                s.aspect = v;
-                               matchWindowToAspect();
                                changed();
                                tmho::settingsChanged();
                            },
                            {"4:3", "16:9", "Stretch"}};
                 rows.push_back(aspect);
-                Row internal{"Internal resolution", "How sharp the GPU draws the game. Auto picks from the resolution: 1x (640 x 448) up to 540 lines, 2x (1280 x 896) up to 1080p, 4x (2560 x 1792) above. Changes straight away.",
-                             RowKind::Choice, [&s] { return s.internalScale; }, [&s, changed](int v) { s.internalScale = v; changed(); },
-                             {"Auto", "1x  (640 x 448)", "2x  (1280 x 896)", "4x  (2560 x 1792)"}};
-                internal.enabled = [&s] { return g_gpuAvailable && s.renderer == 0; };
-                internal.disabledNote = "Vulkan renderer only";
-                rows.push_back(internal);
-                Row filter{"Scaling", "Sharp keeps the pixels crisp; Smooth blends them when the picture is enlarged.", RowKind::Choice,
+                Row filter{"Scaling", "How the picture is enlarged when the resolution is below the screen's: Sharp keeps square pixels, Smooth uses a sharp Lanczos filter.", RowKind::Choice,
                            [&s] { return s.filter; }, [&s, changed](int v) { s.filter = v; changed(); },
                            {"Sharp", "Smooth"}};
                 rows.push_back(filter);
@@ -720,10 +608,13 @@ namespace ps2settings
                 renderer.enabled = [] { return g_gpuAvailable; };
                 renderer.disabledNote = "This build has no Vulkan renderer";
                 rows.push_back(renderer);
-                Row rate{"Frame rate", "The game draws 60 frames per second. 120 fps needs generated in-between frames, which are not available yet; game speed never changes.",
-                         RowKind::Choice, [] { return 0; }, [](int) {}, {"60 fps", "120 fps"}};
-                rate.enabled = [] { return false; };
-                rate.disabledNote = "Not available yet";
+                char monitorRate[48];
+                std::snprintf(monitorRate, sizeof(monitorRate), "Monitor  (%d fps)", std::max(60, GetMonitorRefreshRate(GetCurrentMonitor())));
+                Row rate{"Frame rate",
+                         "60 fps shows the game's own frames. 120 fps and Monitor add in-between frames made from the two newest game frames, "
+                         "so motion is smoother; the game itself keeps its normal speed. In-between frames show the picture about one frame later.",
+                         RowKind::Choice, [&s] { return s.frameRate; }, [&s, changed](int v) { s.frameRate = v; changed(); },
+                         {"60 fps", "120 fps", monitorRate}};
                 rows.push_back(rate);
             }
             else if (tab == 1)
@@ -753,12 +644,19 @@ namespace ps2settings
                 Row pause{"Pause in this menu", "Stops the game while the settings drawer is open.", RowKind::Toggle,
                           [&s] { return s.pauseInMenu ? 1 : 0; }, [&s, changed](int v) { s.pauseInMenu = v != 0; changed(); }};
                 rows.push_back(pause);
-                Row fps{"FPS counter", "Shows the game's frame rate (new pictures per second) in the corner, with the window's frame rate and the game speed.", RowKind::Toggle,
+                Row background{"Pause in background", "Stops the game while its window is not focused (another program in front), and carries on when you come back.", RowKind::Toggle,
+                               [&s] { return s.pauseUnfocused ? 1 : 0; }, [&s, changed](int v) { s.pauseUnfocused = v != 0; changed(); }};
+                rows.push_back(background);
+                Row fps{"FPS counter", "Shows FPS in the corner: pictures on screen per second (with in-between frames on, those count too).", RowKind::Toggle,
                         [&s] { return s.showFps ? 1 : 0; }, [&s, changed](int v) { s.showFps = v != 0; changed(); }};
                 rows.push_back(fps);
                 Row record{"Record screenshots", "Saves a picture of the game every half second in Logs\\frames, for bug reports. About 6 MB a minute; pictures older than 10 minutes are deleted.",
                            RowKind::Toggle, [&s] { return s.recordFrames ? 1 : 0; }, [&s, changed](int v) { s.recordFrames = v != 0; changed(); }};
                 rows.push_back(record);
+                Row shot{"Screenshot", "Saves the game picture (without menus or the FPS counter) as a PNG in the Screenshots folder next to TMHO.exe. F12 does the same at any time.",
+                         RowKind::Action, [] { return 0; }, [](int) { ps2capture::requestScreenshot(); }};
+                shot.actionLabel = "Take";
+                rows.push_back(shot);
                 Row vu1{"VU1 thread", "Runs the PS2's 3D math unit (VU1) and the graphics feed on their own CPU core, so busy scenes stay at full speed. Applies on the next start.",
                         RowKind::Toggle, [&s] { return s.vu1Thread ? 1 : 0; }, [&s, changed](int v) { s.vu1Thread = v != 0; changed(); }};
                 rows.push_back(vu1);
@@ -1110,45 +1008,71 @@ namespace ps2settings
         }
 
         // ---------------------------------------------------------------- drawing
+        // ---- short notices (notify)
+        std::string g_noticeText;
+        double g_noticeUntil = 0.0;
+
+        void drawNotice()
+        {
+            const double now = GetTime();
+            if (g_noticeText.empty() || now >= g_noticeUntil)
+                return;
+            const float fade = static_cast<float>(std::clamp((g_noticeUntil - now) / 0.4, 0.0, 1.0)); // fades out at the end
+            const float scale = std::clamp(static_cast<float>(GetScreenHeight()) / 720.0f, 0.6f, 3.0f);
+            const float size = 15.0f * scale;
+            const float padX = 10.0f * scale;
+            const float padY = 5.0f * scale;
+            const float width = textWidth(g_noticeText.c_str(), size, false) + 2.0f * padX;
+            const float height = size + 2.0f * padY;
+            const Rectangle box{(static_cast<float>(GetScreenWidth()) - width) * 0.5f, 10.0f * scale, width, height};
+            DrawRectangleRounded(box, 0.3f, 6, Color{14, 17, 22, static_cast<unsigned char>(200.0f * fade)});
+            text(g_noticeText.c_str(), box.x + padX, box.y + padY, size, Color{235, 240, 245, static_cast<unsigned char>(255.0f * fade)}, false);
+        }
+
+        // F11 / Alt+Enter: windowed <-> the full-screen mode used last (borderless at first).
+        int g_lastFullMode = 1;
+
+        void toggleFullscreen()
+        {
+            Settings &s = g_settings;
+            if (s.windowMode != 0)
+            {
+                g_lastFullMode = s.windowMode;
+                s.windowMode = 0;
+            }
+            else
+                s.windowMode = g_lastFullMode;
+            s.resWidth = 0;
+            s.resHeight = 0;
+            save();
+        }
+
         void drawFpsOverlay(double)
         {
-            // The big number is what the player sees: new pictures from the game per second. The
-            // window can redraw the same picture at 60 while the game itself stalls.
+            // "FPS - 60": distinct pictures on screen per second - the game's new frames, plus the
+            // in-between frames when they are on.
             const ps2perf::LiveStats live = ps2perf::liveStats();
             if (live.windowFps < 0.0)
                 return; // no game running yet (the setup screen)
-            const float scale = std::clamp(static_cast<float>(GetScreenHeight()) / 720.0f, 0.6f, 3.0f);
-            char big[32];
-            if (live.gameFps < 0.0)
-                std::snprintf(big, sizeof(big), "-- FPS");
-            else if (live.gameFps < 9.95)
-                std::snprintf(big, sizeof(big), "%.1f FPS", live.gameFps);
-            else
-                std::snprintf(big, sizeof(big), "%.0f FPS", live.gameFps);
-            char small[64];
+            double fps = ps2present::shownFps();
+            if (fps < 0.0)
+                fps = live.gameFps;
             if (live.paused)
-                std::snprintf(small, sizeof(small), "game  \xC2\xB7  paused (F2 menu)");
-            else if (live.speedPercent >= 0.0)
-                std::snprintf(small, sizeof(small), "game  \xC2\xB7  window %.0f  \xC2\xB7  speed %.0f%%", live.windowFps,
-                              std::min(live.speedPercent, 999.0));
+                fps = 0.0;
+            char label[32];
+            if (fps < 0.0)
+                std::snprintf(label, sizeof(label), "FPS - --");
             else
-                std::snprintf(small, sizeof(small), "game  \xC2\xB7  window %.0f", live.windowFps);
-
-            const Color value = live.paused || live.gameFps < 0.0 ? Color{200, 206, 214, 255}
-                                : live.gameFps >= 50.0         ? Color{110, 231, 140, 255}
-                                : live.gameFps >= 25.0         ? Color{250, 204, 21, 255}
-                                                               : Color{248, 113, 113, 255};
-            const float bigSize = 22.0f * scale;
-            const float smallSize = 12.0f * scale;
-            const float pad = 12.0f * scale;
-            const float width = std::max(textWidth(big, bigSize, true), textWidth(small, smallSize, false)) + 2.0f * pad + 4.0f * scale;
-            const float height = bigSize + smallSize + 16.0f * scale;
-            const Rectangle box{static_cast<float>(GetScreenWidth()) - width - 12.0f * scale, 12.0f * scale, width, height};
-            DrawRectangleRounded(box, 0.25f, 8, Color{14, 17, 22, 210});
-            DrawRectangle(static_cast<int>(box.x), static_cast<int>(box.y + 7.0f * scale), static_cast<int>(3.0f * scale),
-                          static_cast<int>(box.height - 14.0f * scale), rgb(accentRgb()));
-            text(big, box.x + pad + 2.0f * scale, box.y + 6.0f * scale, bigSize, value, true);
-            text(small, box.x + pad + 2.0f * scale, box.y + 8.0f * scale + bigSize, smallSize, Color{170, 178, 190, 255}, false);
+                std::snprintf(label, sizeof(label), "FPS - %.0f", fps);
+            const float scale = std::clamp(static_cast<float>(GetScreenHeight()) / 720.0f, 0.6f, 3.0f);
+            const float size = 15.0f * scale;
+            const float padX = 7.0f * scale;
+            const float padY = 3.0f * scale;
+            const float width = textWidth(label, size, true) + 2.0f * padX;
+            const float height = size + 2.0f * padY;
+            const Rectangle box{static_cast<float>(GetScreenWidth()) - width - 8.0f * scale, 8.0f * scale, width, height};
+            DrawRectangleRounded(box, 0.3f, 6, Color{14, 17, 22, 170});
+            text(label, box.x + padX, box.y + padY, size, Color{235, 240, 245, 255}, true);
         }
 
         void drawDrawer()
@@ -1344,20 +1268,8 @@ namespace ps2settings
         // Where the game picture is on the screen, as the window loop draws it.
         Rectangle pictureOnScreen()
         {
-            const float sw = static_cast<float>(GetScreenWidth());
-            const float sh = static_cast<float>(GetScreenHeight());
-            int tw = 0, th = 0;
-            pictureTargetSize(GetScreenWidth(), GetScreenHeight(), tw, th);
             float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
-            if (tw > 0 && th > 0 && (tw != GetScreenWidth() || th != GetScreenHeight()))
-            {
-                presentRect(0.0f, 0.0f, static_cast<float>(tw), static_cast<float>(th), x, y, w, h);
-                const float scale = std::min(sw / static_cast<float>(tw), sh / static_cast<float>(th));
-                const float ox = std::floor((sw - std::floor(static_cast<float>(tw) * scale)) * 0.5f);
-                const float oy = std::floor((sh - std::floor(static_cast<float>(th) * scale)) * 0.5f);
-                return Rectangle{ox + x * scale, oy + y * scale, w * scale, h * scale};
-            }
-            presentRect(0.0f, 0.0f, sw, sh, x, y, w, h);
+            presentRect(0.0f, 0.0f, static_cast<float>(GetScreenWidth()), static_cast<float>(GetScreenHeight()), x, y, w, h);
             return Rectangle{x, y, w, h};
         }
 
@@ -1722,6 +1634,20 @@ namespace ps2settings
         if (iniPath && *iniPath)
             g_iniPath = iniPath;
         load();
+        if (g_settings.audioDump != 0)
+        {
+            // Testing: the SPU2's mix and what the sound card was given, as raw 48 kHz stereo.
+            const std::string dir = ps2perf::logDirectory();
+            const std::string mix = dir + "/audio_spu2.raw";
+            const std::string out = dir + "/audio_out.raw";
+#if defined(_WIN32)
+            _putenv_s("PS2X_AUDIO_DUMP", mix.c_str());
+            _putenv_s("PS2X_AUDIO_OUT_DUMP", out.c_str());
+#else
+            setenv("PS2X_AUDIO_DUMP", mix.c_str(), 1);
+            setenv("PS2X_AUDIO_OUT_DUMP", out.c_str(), 1);
+#endif
+        }
     }
 
     void setRendererStatus(bool gpuActive, bool gpuAvailable, const char *deviceName)
@@ -1739,10 +1665,27 @@ namespace ps2settings
         if (iniPath && *iniPath)
             g_iniPath = iniPath;
         load();
+        if (g_settings.resolution < 0)
+        {
+            // Older settings: from the internal resolution; new: the monitor's own lines.
+            Settings &s = g_settings;
+            if (s.internalScale == 1)
+                s.resolution = 0;
+            else if (s.internalScale == 2)
+                s.resolution = 2;
+            else if (s.internalScale == 3)
+                s.resolution = 3;
+            else
+            {
+                const int lines = GetMonitorHeight(GetCurrentMonitor());
+                s.resolution = lines >= 2160 ? 4 : lines >= 1440 ? 3 : lines >= 1080 ? 2 : lines >= 720 ? 1 : 0;
+            }
+            save();
+        }
         g_appliedWindowMode = 0;
-        g_appliedResWidth = -1;
+        g_appliedResolution = -1;
         g_appliedAspectForWindow = -1;
-        g_appliedVsync = !g_settings.vsync; // force the first apply
+        g_appliedSwapInterval = -1; // force the first apply
         // The window starts windowed at its default size: apply the saved size/mode now.
         applyWindowMode();
         applyVsync();
@@ -1754,6 +1697,10 @@ namespace ps2settings
         g_frameTexture = frameTexture;
         installTapCapture();
         latchTaps();
+        if (keyTap(KEY_F11) || g_altEnterThisFrame)
+            toggleFullscreen();
+        if (keyTap(KEY_F12))
+            ps2capture::requestScreenshot();
         if (keyTap(KEY_F2))
         {
             const bool open = !g_menuOpen.load(std::memory_order_relaxed);
@@ -1780,7 +1727,9 @@ namespace ps2settings
         // Paused while the menu is open, except for a moment after a HUD layout change so the
         // game draws its HUD in the new place.
         const bool stepping = GetTime() < g_hudStepUntil.load(std::memory_order_relaxed);
-        g_paused.store(g_menuOpen.load(std::memory_order_relaxed) && g_settings.pauseInMenu && !stepping, std::memory_order_relaxed);
+        const bool inBackground = g_settings.pauseUnfocused && !IsWindowFocused();
+        g_paused.store((g_menuOpen.load(std::memory_order_relaxed) && g_settings.pauseInMenu && !stepping) || inBackground,
+                       std::memory_order_relaxed);
 
         applyWindowMode();
         applyVsync();
@@ -1793,11 +1742,6 @@ namespace ps2settings
     {
         outWidth = screenWidth;
         outHeight = screenHeight;
-        if (g_settings.windowMode == 1 && g_settings.resWidth > 0 && g_settings.resHeight > 0)
-        {
-            outWidth = std::min(g_settings.resWidth, 7680);
-            outHeight = std::min(g_settings.resHeight, 4320);
-        }
     }
 
     void presentRect(float sourceWidth, float sourceHeight, float screenWidth, float screenHeight,
@@ -1837,6 +1781,11 @@ namespace ps2settings
             loadFonts();
             drawFpsOverlay(gameSpeedPercent);
         }
+        if (!g_noticeText.empty())
+        {
+            loadFonts();
+            drawNotice();
+        }
         if (g_menuOpen.load(std::memory_order_relaxed))
         {
             if (g_hudEditor)
@@ -1857,6 +1806,23 @@ namespace ps2settings
     void setFrameTextureRawBgra(bool raw) noexcept
     {
         g_frameRawBgra.store(raw, std::memory_order_relaxed);
+    }
+
+    bool compositorSync() noexcept
+    {
+        return g_compositorSync;
+    }
+
+    void notify(const char *text) noexcept
+    {
+        try
+        {
+            g_noticeText = text ? text : "";
+            g_noticeUntil = GetTime() + 2.5;
+        }
+        catch (...)
+        {
+        }
     }
 
     bool frameTextureRawBgra() noexcept

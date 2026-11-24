@@ -1,3 +1,4 @@
+#include <atomic>
 #include "Common.h"
 #include "System.h"
 
@@ -45,10 +46,14 @@ namespace ps2_syscalls
             imr = runtime->memory().gs().imr;
         }
 
-        RUNTIME_LOG("PS2 GsGetIMR: Returning IMR=0x" << std::hex << imr
-                                                     << " pc=0x" << ctx->pc
-                                                     << " ra=0x" << getRegU32(ctx, 31)
-                                                     << std::dec << std::endl);
+        // The game calls this several times a second: log the first few, then every 1000th.
+        static std::atomic<uint32_t> s_logged{0};
+        const uint32_t n = s_logged.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || n % 1000u == 0u)
+            RUNTIME_LOG("PS2 GsGetIMR: Returning IMR=0x" << std::hex << imr
+                                                         << " pc=0x" << ctx->pc
+                                                         << " ra=0x" << getRegU32(ctx, 31)
+                                                         << std::dec << " (call " << n + 1u << ")" << std::endl);
 
         setReturnU64(ctx, imr); // Return in $v0/$v1
     }
@@ -67,13 +72,14 @@ namespace ps2_syscalls
             oldImr = runtime->memory().gs().imr;
             runtime->memory().gs().imr = newImr;
         }
-        RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << newImr
-                                     << " a0_64=0x" << GPR_U64(ctx, 4)
-                                     << " a0_32=0x" << getRegU32(ctx, 4)
-                                     << " a1_32=0x" << getRegU32(ctx, 5)
-                                     << " pc=0x" << ctx->pc
-                                     << " ra=0x" << getRegU32(ctx, 31)
-                                     << std::dec << std::endl);
+        static std::atomic<uint32_t> s_logged{0};
+        const uint32_t n = s_logged.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || n % 1000u == 0u)
+            RUNTIME_LOG("PS2 GsPutIMR: " << " new=0x" << std::hex << newImr
+                                         << " old=0x" << oldImr
+                                         << " pc=0x" << ctx->pc
+                                         << " ra=0x" << getRegU32(ctx, 31)
+                                         << std::dec << " (call " << n + 1u << ")" << std::endl);
         setReturnU64(ctx, oldImr);
     }
 

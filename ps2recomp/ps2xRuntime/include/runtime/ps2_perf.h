@@ -91,6 +91,7 @@ namespace ps2perf
         TexUploadBytes,
         ClutLoads,
         LocalToHostReads,
+        GsDownloadsPredicted, // small per-frame downloads answered from the frame before
         // GPU renderer
         GpuFrames,
         GpuReadbacks,

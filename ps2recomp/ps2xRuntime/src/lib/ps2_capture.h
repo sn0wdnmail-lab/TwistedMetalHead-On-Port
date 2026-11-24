@@ -9,6 +9,13 @@ namespace ps2capture
 {
     // Window thread, after everything is drawn and before EndDrawing().
     void afterDraw(bool recording) noexcept;
+
+    // F12: the next game picture is saved as a full-size PNG in Screenshots\ next to the game,
+    // without the FPS counter or menus.
+    void requestScreenshot() noexcept;
+    // Window thread, right after the game picture is drawn (before any overlay): the window
+    // rectangle the picture covers, in screen coordinates.
+    void afterPicture(float x, float y, float width, float height) noexcept;
     // Writes what is still queued and stops the worker.
     void shutdown() noexcept;
 }

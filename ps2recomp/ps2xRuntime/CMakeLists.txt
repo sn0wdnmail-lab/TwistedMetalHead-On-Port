@@ -423,6 +423,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_launcher.cpp
     src/lib/ps2_file_dialog.cpp
     src/lib/ps2_texture_replace.cpp
+    src/lib/ps2_present.cpp
     src/lib/gs/gs_gpu_renderer.cpp
     src/lib/games_database.cpp
 )

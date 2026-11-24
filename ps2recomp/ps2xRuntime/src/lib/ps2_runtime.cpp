@@ -1,3 +1,4 @@
+#include "runtime/ps2_present.h"
 #include <vector>
 #include "ps2x/iop/iop_audio.h"
 #include <cstdlib>
@@ -9,6 +10,7 @@
 #include "runtime/ps2_mtvu.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/gs/gs_gpu_renderer.h"
+#include "runtime/ps2_host_wait.h"
 #if defined(_WIN32)
 extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int period);
 #endif
@@ -492,16 +494,24 @@ static void EndFrameShader()
         EndShaderMode();
 }
 
+// A new picture landed in the frame texture this loop (and the VBlank it belongs to).
+struct UploadedFrame
+{
+    bool fresh = false;
+    uint64_t tick = 0;
+};
+
 // GPU renderer: the picture arrives already scanned out (and read back) at the size the GPU
 // produced; the texture follows that size.
-static void UploadGpuFrame(Texture2D &tex, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadGpuFrame(Texture2D &tex, uint32_t &outWidth, uint32_t &outHeight, UploadedFrame &uploaded)
 {
     static std::vector<uint8_t> s_frame;
     static uint32_t s_width = 0u, s_height = 0u, s_fbp = 0xFFFFFFFFu;
     ps2perf::Scope latchScope(ps2perf::MainLatch);
     uint32_t width = 0u, height = 0u, fbp = 0u;
     bool rawBgra = false;
-    if (ps2gpu::takeFrame(s_frame, width, height, fbp, rawBgra) && width != 0u && height != 0u &&
+    uint64_t tick = 0;
+    if (ps2gpu::takeFrame(s_frame, width, height, fbp, rawBgra, tick) && width != 0u && height != 0u &&
         s_frame.size() >= static_cast<size_t>(width) * height * 4u)
     {
         s_fbp = fbp; // new pictures are counted at the game's VBlank (EeScheduler)
@@ -525,16 +535,18 @@ static void UploadGpuFrame(Texture2D &tex, uint32_t &outWidth, uint32_t &outHeig
         }
         s_width = width;
         s_height = height;
+        uploaded.fresh = true;
+        uploaded.tick = tick;
     }
     outWidth = s_width != 0u ? s_width : FB_WIDTH;
     outHeight = s_height != 0u ? s_height : DEFAULT_DISPLAY_HEIGHT;
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight, UploadedFrame &uploaded)
 {
     if (ps2gpu::active())
     {
-        UploadGpuFrame(tex, outWidth, outHeight);
+        UploadGpuFrame(tex, outWidth, outHeight, uploaded);
         return;
     }
     ps2settings::setFrameTextureRawBgra(false);
@@ -649,6 +661,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
+    uploaded.fresh = true;
+    uploaded.tick = currentTick;
 }
 
 namespace ps2perf
@@ -675,7 +689,7 @@ static void startGsRenderer(GSRegisters &privRegs)
     if (wantGpu)
     {
         ps2gpu::Options options;
-        options.superSampling = ps2settings::superSamplingFor(ps2settings::get().internalScale, 448); // Auto settles each frame
+        options.superSampling = ps2settings::superSamplingForResolution(ps2settings::get().resolution); // settled again once the window exists
         if (const char *env = std::getenv("PS2X_GPU_SSAA"); env && *env)
             options.superSampling = static_cast<uint32_t>(std::clamp(std::atoi(env), 1, 16));
         started = ps2gpu::init(&privRegs, options, description, error);
@@ -935,6 +949,7 @@ bool PS2Runtime::syncCoreSubsystems()
     ps2SetGsDownloadSource([this](uint8_t *dst, uint32_t bytes) -> uint32_t
                            { return ps2gpu::active() ? ps2gpu::readLocalToHost(dst, bytes)
                                                      : m_gs.consumeLocalToHostBytes(dst, bytes); });
+    ps2SetGsDownloadPrediction(ps2settings::get().gsDownloadPrediction != 0);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      // On the VU1 thread the EE's context is in use elsewhere: D/T-bit stops
@@ -1010,6 +1025,7 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(_WIN32)
         // 1 ms system timer: the scheduler's timed waits and the frame limiter wake on time.
         timeBeginPeriod(1u);
+        ps2host::preferPerformanceCores();
 #endif
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         SetTraceLogCallback(rayLogToGraphics);
@@ -2877,12 +2893,14 @@ void PS2Runtime::run()
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
     LoadBgraShader();
+    ps2present::initialize();
 
     std::atomic<bool> gameThreadFinished{false};
 
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ps2host::raiseThisThread();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2904,6 +2922,7 @@ void PS2Runtime::run()
     uint64_t tick = 0;
     ps2perf::markMainThread();
     ps2perf::registerThread("window (present + input)");
+    ps2host::raiseThisThread();
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -3073,65 +3092,46 @@ void PS2Runtime::run()
         }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        UploadedFrame uploaded;
+        UploadFrame(frameTex, this, presentWidth, presentHeight, uploaded);
         // F2 drawer: toggling, menu input, window mode / V-Sync / scaling filter / volume.
         ps2settings::update(&frameTex);
+        // Scales the new picture to the chosen resolution (and finds its motion for in-between frames).
+        if (uploaded.fresh)
+            ps2present::submitFrame(frameTex.id, frameTex.width, frameTex.height, static_cast<int>(presentWidth),
+                                    static_cast<int>(presentHeight), ps2settings::frameTextureRawBgra(), uploaded.tick);
+        {
+            static int appliedFps = -1;
+            const int wantFps = ps2present::targetFps();
+            if (wantFps != appliedFps)
+            {
+                SetTargetFPS(wantFps);
+                appliedFps = wantFps;
+            }
+        }
 
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        // Borderless with a chosen resolution: the picture is drawn at that size first, then
-        // scaled to the screen (F2 > Video > Resolution).
-        int targetWidth = 0, targetHeight = 0;
-        ps2settings::pictureTargetSize(GetScreenWidth(), GetScreenHeight(), targetWidth, targetHeight);
-        static RenderTexture2D pictureTarget{};
-        const bool useTarget = targetWidth > 0 && targetHeight > 0 && (targetWidth != GetScreenWidth() || targetHeight != GetScreenHeight());
-        if (useTarget)
-        {
-            if (pictureTarget.id == 0 || pictureTarget.texture.width != targetWidth || pictureTarget.texture.height != targetHeight)
-            {
-                if (pictureTarget.id != 0)
-                    UnloadRenderTexture(pictureTarget);
-                pictureTarget = LoadRenderTexture(targetWidth, targetHeight);
-                SetTextureFilter(pictureTarget.texture, TEXTURE_FILTER_BILINEAR);
-            }
-            BeginTextureMode(pictureTarget);
-            ClearBackground(BLACK);
-            float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f;
-            ps2settings::presentRect(srcWidth, srcHeight, static_cast<float>(targetWidth), static_cast<float>(targetHeight), x, y, w, h);
-            BeginFrameShader();
-            DrawTexturePro(frameTex, srcRect, Rectangle{x, y, w, h}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-            EndFrameShader();
-            EndTextureMode();
-        }
-        else if (pictureTarget.id != 0)
-        {
-            UnloadRenderTexture(pictureTarget);
-            pictureTarget = RenderTexture2D{};
-        }
 
         BeginDrawing();
         ClearBackground(BLACK);
-        if (useTarget)
-        {
-            // Keep the chosen resolution's shape on the screen.
-            const float scale = std::min(screenWidth / static_cast<float>(targetWidth), screenHeight / static_cast<float>(targetHeight));
-            const float w = std::floor(static_cast<float>(targetWidth) * scale);
-            const float h = std::floor(static_cast<float>(targetHeight) * scale);
-            const Rectangle from{0.0f, 0.0f, static_cast<float>(targetWidth), -static_cast<float>(targetHeight)}; // render targets are upside down
-            DrawTexturePro(pictureTarget.texture, from, Rectangle{std::floor((screenWidth - w) * 0.5f), std::floor((screenHeight - h) * 0.5f), w, h},
-                           Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        }
-        else
         {
             float dstX = 0.0f, dstY = 0.0f, dstWidth = 0.0f, dstHeight = 0.0f;
             ps2settings::presentRect(srcWidth, srcHeight, screenWidth, screenHeight, dstX, dstY, dstWidth, dstHeight);
-            const Rectangle dstRect{dstX, dstY, dstWidth, dstHeight};
-            BeginFrameShader();
-            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-            EndFrameShader();
+            if (ps2present::ready())
+            {
+                ps2present::draw(dstX, dstY, dstWidth, dstHeight);
+            }
+            else
+            {
+                BeginFrameShader();
+                DrawTexturePro(frameTex, srcRect, Rectangle{dstX, dstY, dstWidth, dstHeight}, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                EndFrameShader();
+            }
+            ps2capture::afterPicture(dstX, dstY, dstWidth, dstHeight); // F12, before the FPS counter and menus
         }
         ps2settings::draw(ps2perf::lastSpeedPercent());
         if (m_debugUiInitialized && m_debugUiDrawCallback)
@@ -3145,6 +3145,7 @@ void PS2Runtime::run()
         {
             ps2perf::Scope endScope(ps2perf::MainEndDrawing);
             EndDrawing();
+            ps2present::afterPresent();
         }
         ps2perf::setOutputSize(presentWidth, presentHeight, static_cast<uint32_t>(GetScreenWidth()), static_cast<uint32_t>(GetScreenHeight()));
         ps2perf::mainThreadTick(m_eeScheduler->eeCycleForDiagnostics(), m_memory.getRDRAM());
@@ -3231,6 +3232,7 @@ void PS2Runtime::run()
     }
     ps2capture::shutdown();
     ps2perf::shutdown();
+    ps2present::shutdown();
     UnloadTexture(frameTex);
     CloseWindow();
 

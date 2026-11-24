@@ -18,8 +18,10 @@ namespace ps2settings
     {
         int windowMode = 0;     // 0 windowed, 1 borderless fullscreen, 2 exclusive fullscreen
         int windowSize = 2;     // old index into the window-size list (read from old settings files only)
-        int resWidth = 0;       // resolution: window size (windowed), display mode (fullscreen) or picture
-        int resHeight = 0;      // size (borderless); 0 = the monitor's, or the default window size
+        int resWidth = 0;       // older files only: window size / display mode (now from `resolution`)
+        int resHeight = 0;
+        int resolution = -1;    // picture resolution: 0 480p (1x), 1 720p, 2 1080p, 3 1440p, 4 2160p; -1 = not chosen yet
+        int frameRate = 0;      // 0 60 fps (the game's frames), 1 120 fps, 2 the monitor's rate (in-between frames)
         int aspect = 0;         // 0 4:3, 1 16:9, 2 stretch to window
         int filter = 1;         // 0 sharp (nearest), 1 smooth (bilinear)
         bool vsync = true;
@@ -27,12 +29,13 @@ namespace ps2settings
         int masterVolume = 100; // 0..100
         bool muteUnfocused = true;
         bool pauseInMenu = true;
+        bool pauseUnfocused = false; // stop the game while its window is in the background
         int accentIndex = 0;    // 0..7 preset swatches, 8 = custom
         uint32_t accentCustom = 0x4C8DFFu;
         int menuOpacity = 92;   // 60..100 (%)
         int menuSide = 0;       // 0 left, 1 right
         int renderer = 0;       // 0 Vulkan GPU (falls back to software), 1 software (CPU)
-        int internalScale = 0;  // GPU renderer resolution: 0 Auto (from the output size), 1 1x, 2 2x, 3 4x - live
+        int internalScale = 0;  // older files only (internal_res): 0 Auto, 1 1x, 2 2x, 3 4x
         bool vu1Thread = true;  // GPU renderer: VIF1/VU1/GS feed on their own core (next start)
         bool recordFrames = false; // a screenshot every 0.5 s into Logs\frames (ps2_capture)
         int fovDegrees = 0;        // battle camera horizontal field of view, 0 = the game's own (tmho_game)
@@ -45,16 +48,24 @@ namespace ps2settings
         int gpuFlushPrimitives = 0; // tuning (hidden): paraLLEl-GS hands queued work to the GPU after this many primitives (0 = default)
         int gpuTimestamps = 1;      // tuning (hidden): measure GPU time per stage for Graphicslogs.txt (0 = off)
         int gpuFeedBatch = 1;       // tuning (hidden): wake the GS feed thread per batch of packets (0 = per packet)
+        int audioDump = 0;          // testing (hidden): write the SPU2 mix and the sound card's audio to Logs\audio_*.raw
+        int gsDownloadPrediction = 1; // tuning (hidden): answer small per-frame GS downloads from the frame before
     };
 
-    // paraLLEl-GS super-sampling rate for internalScale: 2x2 (4) and 4x4 (16) samples give a
-    // high-resolution scanout at twice / four times the PS2's resolution. Auto (0) depends on the
-    // output size; outputLines is the height the picture is shown at.
-    inline uint32_t superSamplingFor(int internalScale, int outputLines = 0)
+    // Lines of each picture resolution (F2 > Video > Resolution).
+    inline int resolutionLines(int resolution)
     {
-        if (internalScale == 0)
-            return outputLines > 1100 ? 16u : outputLines > 540 ? 4u : 1u;
-        return internalScale >= 3 ? 16u : internalScale == 2 ? 4u : 1u;
+        static const int lines[] = {480, 720, 1080, 1440, 2160};
+        return lines[resolution < 0 ? 2 : resolution > 4 ? 4 : resolution];
+    }
+
+    // paraLLEl-GS super-sampling for a picture resolution: 2x2 (4) and 4x4 (16) samples draw the
+    // game at twice / four times the PS2's 448 lines (896 / 1792), which is then scaled to the
+    // chosen lines. 720p and 1080p share 2x (light enough for weak graphics cards), 1440p and
+    // 2160p use 4x.
+    inline uint32_t superSamplingForResolution(int resolution)
+    {
+        return resolution <= 0 ? 1u : resolution <= 2 ? 4u : 16u;
     }
 
     Settings &get();
@@ -96,5 +107,12 @@ namespace ps2settings
     // fixFrameCopy, which does nothing when the texture holds ordinary RGBA.
     void setFrameTextureRawBgra(bool raw) noexcept;
     bool frameTextureRawBgra() noexcept;
+    // True when V-Sync is done by waiting for the desktop compositor after each frame (Windows,
+    // windowed or borderless); see ps2present::afterPresent.
+    bool compositorSync() noexcept;
     void fixFrameCopy(unsigned char *pixels, size_t pixelCount) noexcept;
+
+    // A short message at the top of the window for a few seconds ("Screenshot saved: ...").
+    // Window thread.
+    void notify(const char *text) noexcept;
 }

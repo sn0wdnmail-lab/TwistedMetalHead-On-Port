@@ -41,6 +41,8 @@ game still streams music and movies from it. Saves go in the `saves` folder next
 | L1 / R1 / L2 / R2 | Q / E / Left Shift / Right Shift |
 | Start / Select | Enter / Tab |
 | Settings | **F2** |
+| Windowed ↔ full screen | F11 or Alt+Enter |
+| Screenshot | F12 |
 | Debugger | F1 |
 
 A controller works too; the keyboard keeps working alongside it.
@@ -61,14 +63,21 @@ A controller works too; the keyboard keeps working alongside it.
 ### Graphics
 - **Vulkan GPU renderer** ([paraLLEl-GS](https://github.com/Arntzen-Software/parallel-gs)), with
   a **software (CPU) renderer** as a fallback.
-- **Internal resolution** 1x (native 640×448), 2x or 4x, or **Auto** (2x up to 1080p, 4x above).
-  Changes take effect immediately.
+- **Resolution presets** (V7): **480p** (1x, the PS2's own), **720p**, **1080p**, **1440p** and
+  **2160p (4K)**, whatever the screen is. A preset above the screen's own is drawn big and shrunk
+  to fit (smoother edges). Changes take effect immediately.
+- **Frame rate** (V7): **60 fps** (the game's own frames), **120 fps**, or **Monitor** (the
+  screen's refresh rate, e.g. 144 or 170 Hz). 120 and Monitor add in-between frames made on the
+  GPU from the two newest game frames (motion-compensated), so motion is smoother while the game
+  keeps its normal speed; the picture is about one frame later. With V-Sync on, Monitor mode
+  waits for the desktop compositor in windowed and borderless mode, because some drivers ignore
+  the swap interval there.
 - **True 16:9 widescreen**: the 3D cameras see more to each side instead of stretching the
   picture; the battle HUD sits right at the screen edges, and the radar, weapon panel, names and
   text keep their shape; movies stay 4:3. Also **4:3** (original) and **Stretch**.
-- **Display modes**: Windowed, Borderless and exclusive **Fullscreen**. Resolutions from
-  640×480 (4:3 native) and 854×480 (16:9) up to 4K (3840×2160), plus your monitor's own display
-  modes in Fullscreen. Everything switches **live, without restarting the game**.
+- **Display modes**: Windowed, Borderless and exclusive **Fullscreen**; **F11** or **Alt+Enter**
+  switches between windowed and full screen at any time. Everything switches **live, without
+  restarting the game**.
 - Scaling filter (smooth or sharp) and V-Sync.
 - **Replaceable font** (V6.2, Vulkan renderer): a `textures/font_atlas.png` next to TMHO.exe
   (the game's 16×16 grid of letters, upright, redrawn at 2, 4, 8 or 16 times the size) is used
@@ -101,6 +110,12 @@ A controller works too; the keyboard keeps working alongside it.
 ### Sound
 - The PS2 sound chip (**SPU2**) emulated, driven by the game's own sound driver (989snd) from
   the disc: music, menu sounds, engine sounds, guns, weapons, explosions and the announcer.
+- **Clean sound (V7)**: the SPU2's own Gaussian sample interpolation, volume slides done as the
+  chip does them, and a soft limiter instead of hard clipping when loud explosions add up. The
+  I/O processor's clock now follows the game's exactly (it used to run 2–7% fast in battles, so
+  sound piled up), and the buffer to the sound card follows the card's clock with small, smooth
+  speed corrections (time-stretching only if the clocks drift far apart). In a battle the sound
+  runs within ±0.3% of real time with no dry-outs.
 - **Movies and cutscenes** decoded with FFmpeg, with their audio in sync.
 - Master volume and **mute when the window is in the background**.
 
@@ -128,6 +143,36 @@ A controller works too; the keyboard keeps working alongside it.
   start-up precompile is a cache load: all 10,904 variants load in under a second.
 - The performance log's profiler samples the VU1 thread as well as the game thread, and its
   timers use QueryPerformanceCounter directly (cheaper than the C runtime clock it used before).
+
+#### Version 7: full speed at 4K, and lighter on the CPU
+Measured on a Ryzen 7 3700X with an RTX 2080 SUPER, Challenge on Big Blue Stadium against five
+opponents, 16:9, **2160p** resolution, frame rate **Monitor (170 Hz)**:
+
+| | V6.3 / early V7 | V7 |
+|---|---|---|
+| Game speed | lagging at 4K | 99–100%, window at 170 fps |
+| Slowest frame in each 2-second report | 23–29 ms (a hitch every report) | 6.4–6.6 ms (one 170 Hz refresh) |
+| Game thread waiting for the GPU | up to 330 ms per second | 0 |
+| VU1 microcode (VU1 thread) | 420–690 ms per second | 250–420 ms per second |
+| VU0 microcode (game thread) | 80–110 ms per second | 50–70 ms per second |
+
+- **4K lag fixed**: once a frame the game reads 8 depth values back from the GS (to dim the
+  sun's lens flare when something covers it). That read made the game wait until the whole frame
+  so far was drawn on the GPU. The answer now comes from the previous frame while the real read
+  runs in order behind the drawing (for DMA and for FIFO reads), and the GPU gets its work in
+  smaller batches during super-sampled frames, so it never sits idle.
+- **No more hitch every two seconds**: the performance report (a census of all threads, the
+  profiler and the file writes) ran on the window thread and held one frame up by about 17 ms
+  each time; it has its own thread now.
+- **Compiled VU code 1.6x faster** (3.05 → 1.87 ns per VU cycle in recorded runs, all of them
+  still bit-exact): no result clamp where round-to-zero already keeps results finite, operand
+  normalisation and MAC/status flags in a few SIMD instructions, one normalisation shared by
+  every lane taken from a register, masked writes as single BLENDPS instructions, vectorised
+  FTOI and CLIP, and flags no longer committed before every flag-writing instruction.
+- **Hybrid CPUs**: the game asks Windows not to treat it as background work (no EcoQoS, so it
+  stays on the fast cores of Intel 12th-gen and later laptops), and its game, VU1, GS feed and
+  window threads run slightly above normal priority.
+- Tidier logs: the game's GS interrupt-mask calls are no longer logged several times a second.
 
 #### Version 6.1: less CPU for the same 60 fps
 Measured on the same PC (Ryzen 7 3700X, 16 hardware threads; RTX 2080 SUPER; 16:9, Auto
@@ -167,11 +212,10 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - The vector units use the PS2's own rounding and clamping as well.
 
 ### Settings menu (F2)
-- **Video**: display mode, resolution, aspect ratio, internal resolution, scaling, V-Sync,
-  renderer.
+- **Video**: display mode, resolution, aspect ratio, scaling, V-Sync, renderer, frame rate.
 - **Audio**: master volume, mute in the background.
-- **Game**: pause while the menu is open, FPS counter, screenshot recording, VU1 thread, game
-  disc, field of view, camera distance, quit.
+- **Game**: pause while the menu is open, pause in the background, FPS counter, screenshot
+  recording, screenshot, VU1 thread, game disc, field of view, camera distance, quit.
 - **HUD**: the HUD editor, radar and weapon panel sizes, snap to screen edges, reset.
 - The **setup screen** (F2 > Game > Game disc > Setup, or "Show this screen at start") has the
   disc, Build game and Build shaders.
@@ -179,7 +223,11 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - Settings are kept in `settings.ini`.
 
 ### Tools for testing and bug reports
-- **FPS counter**: the game's real frame rate, the window's frame rate and the game speed.
+- **FPS counter**: `FPS - 60` in the corner: pictures on screen per second (in-between frames
+  included when they are on).
+- **Screenshots** (V7): **F12** saves the game picture, without menus or the FPS counter, as a
+  PNG in `Screenshots` next to `TMHO.exe`, named by date and time. (raylib's own F12 and
+  Ctrl+F12 GIF recorder are switched off.)
 - **Logs** folder: `performancelogs.txt` (speed every 2 seconds, time per thread, what holds the
   game back, a built-in profiler), `Graphicslogs.txt` (GPU work, frames, video memory) and
   `console.txt` (the game's own text output).
@@ -193,35 +241,34 @@ resolution), from the port's own performance log (CPU time of every thread of th
 
 ## Known issues
 
-- **The heaviest five-opponent moments need about 1.6 cores** (VU1 thread ~0.7, game thread
-  ~0.55, GS feed ~0.25). That is full speed on a Ryzen 7 3700X, but a CPU-starved PC (or the 10%
-  cap test above) dips there, because the game waits for the VU1 to finish each frame's drawing
-  before it starts the next.
+- **The heaviest five-opponent moments need about 1.3 cores** (VU1 thread ~0.55, game thread
+  ~0.55, GS feed ~0.25 on a Ryzen 7 3700X). A CPU about half that fast per core is at its limit
+  there; lower resolutions help the GPU but not these threads.
 - **The software (CPU) renderer's text looks rough**: it samples textures without filtering, so
   thin strokes of the small HUD font can drop out. The Vulkan renderer filters them.
-- **No 120 fps yet.** The game's logic, physics and animations are tied to the PS2's 60 Hz
-  frame clock, so a higher frame rate needs changes inside the game's systems, not just a
-  setting (see the plans below).
+- **120 fps and Monitor use in-between frames.** The game's logic, physics and animations still
+  run at the PS2's 60 Hz; the extra frames are made from the two newest game frames, so fast
+  edges can show slight warping and the picture is about one frame later.
 - **Menu artwork is stretched in 16:9.** The 3D views and the HUD are true widescreen, but the
   full-screen 2D menu backgrounds are drawn for 4:3.
 - **Falling through the arena** (player and AI cars) was reported in earlier versions. Version 6
   switched the game's floating-point maths to the PS2's own rounding, the most likely cause; if
   it still happens, please report where.
-- **Reverb** and some sound-envelope details of the SPU2 are not emulated yet, so a few sounds
-  are drier than on a PS2.
+- **Reverb** of the SPU2 is not emulated yet, so a few sounds are drier than on a PS2.
+- **Music, effects and movie volume** sliders are shown but not working yet (they need a
+  per-voice mixer).
 
 ## Coming in the future
 
-- **More headroom in the heaviest battles**: keeping VU registers in CPU registers across
-  compiled blocks, faster VIF1 unpacking, a faster I/O-processor core, and overlapping more of
-  each frame's VU1 work with the game's own work, so slower CPUs stay at 60 fps too.
-- **Native 120 fps** (and a frame-rate setting): running the game's frame timing, physics steps
-  and animations at 120 Hz without speeding the game up and without interpolated frames.
+- **More headroom in the heaviest battles**: the I/O processor on a thread of its own, faster
+  VIF1 unpacking, cheaper MAC/status flags in compiled VU code, and overlapping more of each
+  frame's VU1 work with the game's own work, so slower CPUs stay at 60 fps too.
+- **Native 120 fps**: running the game's frame timing, physics steps and animations at 120 Hz
+  without speeding the game up and without in-between frames.
 - **Widescreen menus**: the 2D menu screens kept at their shape (pillarboxed) or adapted to 16:9.
 - **A true 16:9 frame** (854 pixels wide instead of 640), so text and HUD no longer need squeezing
   to keep their shape.
-- **More accurate sound**: SPU2 reverb, volume envelopes and the PS2's own sample
-  interpolation.
+- **More accurate sound**: SPU2 reverb, and separate music, effects and movie volumes.
 - **Collision follow-up**: tracking down any remaining fall-through spots.
 - **Controls menu**: remapping keys and controller buttons in F2.
 - **Linux release** (the code already builds and runs on Linux).

@@ -2,6 +2,7 @@
 
 #include "runtime/ps2_mtvu.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_host_wait.h"
 
 #include <chrono>
 #include <condition_variable>
@@ -83,6 +84,7 @@ namespace ps2mtvu
         {
             t_onWorker = true;
             nameThisThread();
+            ps2host::raiseThisThread();
             ps2perf::registerThread("VU1 thread (VIF1, VU1 microcode)");
             std::deque<Task> batch;
             for (;;)

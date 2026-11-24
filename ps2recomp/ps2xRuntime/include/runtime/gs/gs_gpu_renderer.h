@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,7 @@ namespace ps2gpu
         uint64_t pmode, smode1, smode2, srfsh, synch1, synch2, syncv;
         uint64_t dispfb1, display1, dispfb2, display2, extbuf, extdata, extwrite, bgcolor;
         uint64_t csr, imr, busdir, siglblid;
+        uint64_t tick; // the VBlank this scan-out belongs to (EeScheduler's count)
     };
     Scanout captureScanout(const GSRegisters &regs);
 
@@ -61,7 +63,9 @@ namespace ps2gpu
     // pixel). rawBgra: the bytes are the GPU's own B, G, R, (undefined alpha), to be drawn through
     // the window's swizzle shader; otherwise RGBA with alpha 255.
     // Returns false when no new picture arrived since the last call.
-    bool takeFrame(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &displayFbp, bool &rawBgra);
+    // tick: the VBlank the picture belongs to.
+    bool takeFrame(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &displayFbp, bool &rawBgra,
+                   uint64_t &tick);
 
     // Window thread, once its swizzle shader is ready: pictures may be handed over as raw BGRA
     // (a plain copy instead of a pass over every pixel on the CPU).
@@ -77,6 +81,9 @@ namespace ps2gpu
 
     // GS -> host transfer data (TRXDIR = 1), for the store-image path.
     uint32_t readLocalToHost(uint8_t *dst, uint32_t bytes);
+    // The same read, done in order behind everything queued for the GS so far, without waiting:
+    // `done` gets the data later (on the GS feed thread). False when it cannot be queued.
+    bool readLocalToHostAsync(uint32_t bytes, std::function<void(const uint8_t *data, uint32_t bytes)> done);
 
     // Any thread: the internal resolution (super-sampling rate 1, 4 or 16 = 1x, 2x, 4x scan-out)
     // to switch to at the next VBlank, without restarting.

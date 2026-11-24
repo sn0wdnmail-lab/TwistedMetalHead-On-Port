@@ -1,3 +1,4 @@
+#include "runtime/ps2_present.h"
 #include <cfenv>
 #include <cstdlib>
 #include <condition_variable>
@@ -2062,20 +2063,33 @@ void EeScheduler::processEvent(const EeEvent &event)
         if (gpuScanout)
             scanout = ps2gpu::captureScanout(m_runtime.memory().gs());
         ++m_vsyncTick;
+        scanout.tick = m_vsyncTick;
         ps2perf::heartbeat(ps2perf::Beat::Game);
         {
             // A new picture from the game = the buffer on display changed since the last VBlank
             // (circuit 2 when it is on, else circuit 1). Counted here, once per field, for the FPS
             // counter and the "PS2 flips" in the logs.
             static uint32_t s_lastShown = 0xFFFFFFFFu;
+            static uint32_t s_sameFor = 0u;
             const GSRegisters &gs = m_runtime.memory().gs();
             const uint64_t dispfb = (gs.pmode & 0x2u) ? gs.dispfb2 : gs.dispfb1;
             const uint32_t shown = static_cast<uint32_t>(dispfb & 0x1FFu);
+            bool newPicture = false;
             if (shown != s_lastShown)
             {
                 s_lastShown = shown;
+                s_sameFor = 0u;
+                newPicture = true;
                 ps2perf::noteGameFrame();
             }
+            else if (++s_sameFor >= 2u)
+            {
+                // The same buffer for a while: a game drawing over the picture on display (movies,
+                // static screens) - every VBlank may carry a new picture.
+                newPicture = true;
+            }
+            // For the window's in-between frames: when this VBlank's picture belongs in time.
+            ps2present::noteVBlank(m_vsyncTick, ps2present::now(), newPicture);
         }
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)

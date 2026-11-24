@@ -20,4 +20,12 @@ namespace ps2host
     // Release a thread blocked in waitUntil(). A wake() that happens before waitUntil() starts is
     // remembered, so the next waitUntil() returns at once.
     void wake() noexcept;
+
+    // Once per process: tell Windows this is not background work, so it keeps the game on the
+    // fast cores of hybrid CPUs (no EcoQoS) and keeps the 1 ms timer while the window is hidden.
+    void preferPerformanceCores() noexcept;
+
+    // For the threads that run the game (game, VU1, GS feed, window): slightly above normal
+    // priority and never power-throttled, so other programs cannot delay a frame.
+    void raiseThisThread() noexcept;
 }

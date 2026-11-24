@@ -11,7 +11,7 @@
 //
 // What still happens at run time, through the same structures the dynamic tier uses:
 //   - MAC/status/clip flags (pushed by FMAC/CLIP/FCSET/FSSET with absolute cycle stamps, and
-//     committed before any instruction that reads them, pushes new ones, or uses Q/P),
+//     committed before any instruction that reads them or uses Q/P),
 //   - Q and P values (queued with absolute ready cycles, committed before they are read),
 //   - the VI value a branch sees right after a VI write (backup register),
 // so the static tier can hand over to the dynamic tier at any block boundary: it writes the
@@ -346,9 +346,13 @@ namespace
                 }
             const bool readsQ = !p.reservedUpper && p.upKind == FU_ARITH && p.upSrc == FSRC_Q;
             const bool push = pushesFlags(p, k);
-            out.commit = efuDue || push || readsQ || sReadsFlags(lo) || sIsFdiv(lo) || sIsEfu(lo) || lo == FL_MFP || lo == FL_WAITQ ||
-                         lo == FL_WAITP;
-            out.setCycle = out.commit || lo == FL_XGKICK;
+            // A flag push needs the exact cycle (its ready stamp) but no commit: the queue keeps
+            // entries in order and a commit before the next flag read applies them all (a full
+            // queue applies its oldest entry itself).
+            // FSSET still commits first: its sticky bits must land in time order with FDIV's.
+            out.commit = efuDue || readsQ || sReadsFlags(lo) || sIsFdiv(lo) || sIsEfu(lo) || lo == FL_MFP || lo == FL_WAITQ ||
+                         lo == FL_WAITP || lo == FL_FSSET;
+            out.setCycle = out.commit || push || lo == FL_XGKICK;
             out.branch = isBranchPair(p);
             out.clearBackup = first || prevRecorded;
             out.recordBackup = !p.iBit && p.viWriteReg != 0u && p.delaysNextBranchRead;

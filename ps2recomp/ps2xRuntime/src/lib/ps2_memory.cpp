@@ -8,6 +8,7 @@
 #include "ps2_gs_download.h"
 #include "runtime/ps2_perf.h"
 #include <functional>
+#include <mutex>
 #include <atomic>
 #include <cstring>
 #include <cstdio>
@@ -22,14 +23,161 @@ namespace
 {
     std::function<uint32_t(uint8_t *, uint32_t)> g_gsDownloadSource; // set by the runtime
 
+    // Tiny downloads that come back every frame are answered from the previous frame. This game
+    // reads 8 depth values where the sun is on screen each frame (to dim its lens flare when
+    // something covers it). Done straight away, that read made the game wait every frame until
+    // the VU1 thread, the GS feed thread and the GPU had all finished the frame so far; answered
+    // from the last result, with the real read done in order behind everything else (for the
+    // next frame), nothing waits - the flare reacts one frame later, which nobody can see.
+    // Only downloads of up to 1 KB, of the same size as the one before; settings.ini
+    // gs_download_prediction=0 turns it off.
+    struct DownloadPrediction
+    {
+        std::mutex mutex;
+        uint32_t bytes = 0;    // size of the remembered result (0: none)
+        uint8_t data[1024]{};
+        bool pending = false;  // the in-order read for the last answer has not come back yet
+    };
+    DownloadPrediction g_prediction;
+    std::atomic<bool> g_predictDownloads{true};
+
+    void rememberDownload(const uint8_t *data, uint32_t bytes)
+    {
+        std::lock_guard<std::mutex> lock(g_prediction.mutex);
+        if (bytes == 0u || bytes > sizeof(g_prediction.data))
+        {
+            g_prediction.bytes = 0u;
+            return;
+        }
+        std::memcpy(g_prediction.data, data, bytes);
+        g_prediction.bytes = bytes;
+    }
+
+    // The real read for an answer given from the previous result: in order on the VU1 thread
+    // (behind the transfer set-up), then on the GS feed thread; its result answers the next one.
+    void refreshPredictionAsync(uint32_t bytes)
+    {
+        ps2mtvu::post([bytes]()
+                      {
+                          const bool queued = ps2gpu::readLocalToHostAsync(bytes, [bytes](const uint8_t *data, uint32_t got)
+                                                                           {
+                                                                               rememberDownload(data, got == bytes ? got : 0u);
+                                                                               std::lock_guard<std::mutex> lock(g_prediction.mutex);
+                                                                               g_prediction.pending = false;
+                                                                           });
+                          if (!queued)
+                          {
+                              // Not possible (renderer stopping): read it here instead.
+                              uint8_t data[1024];
+                              const uint32_t got = g_gsDownloadSource ? g_gsDownloadSource(data, bytes) : 0u;
+                              rememberDownload(data, got == bytes ? got : 0u);
+                              std::lock_guard<std::mutex> lock(g_prediction.mutex);
+                              g_prediction.pending = false;
+                          }
+                      });
+    }
+
+    // Downloads the game reads through the VIF1 FIFO register 16 bytes at a time (this game's
+    // lens-flare depth test): one "session" from VIF1_STAT.FDR set to FDR clear. The size is only
+    // known at the end, so a session is answered from the previous result only once the last
+    // sessions all had the same small size. Game thread only (EE register accesses).
+    struct FifoSession
+    {
+        bool open = false;
+        bool predicted = false; // this session reads g_prediction's copy in `answer`
+        bool overran = false;   // the game read past the predicted size
+        uint32_t consumed = 0;  // bytes the game has read in this session
+        uint32_t lastSize = 0;  // size of the session before
+        uint32_t sameSizeRuns = 0;
+        uint32_t answerBytes = 0;
+        uint8_t answer[1024]{};
+        uint8_t collected[1024]{}; // what a session read for real (remembered at its end)
+    };
+    FifoSession g_fifo;
+
+    void beginFifoSession()
+    {
+        g_fifo.open = true;
+        g_fifo.predicted = false;
+        g_fifo.overran = false;
+        g_fifo.consumed = 0;
+        if (g_fifo.sameSizeRuns < 3u || g_fifo.lastSize == 0u || g_fifo.lastSize > sizeof(g_fifo.answer) ||
+            !ps2mtvu::active() || !ps2gpu::active() || !g_predictDownloads.load(std::memory_order_relaxed))
+            return;
+        {
+            std::lock_guard<std::mutex> lock(g_prediction.mutex);
+            if (g_prediction.bytes != g_fifo.lastSize || g_prediction.pending)
+                return;
+            std::memcpy(g_fifo.answer, g_prediction.data, g_fifo.lastSize);
+            g_prediction.pending = true;
+        }
+        g_fifo.answerBytes = g_fifo.lastSize;
+        g_fifo.predicted = true;
+        ps2perf::count(ps2perf::GsDownloadsPredicted);
+        refreshPredictionAsync(g_fifo.lastSize);
+    }
+
+    void endFifoSession()
+    {
+        if (!g_fifo.open)
+            return;
+        g_fifo.open = false;
+        const uint32_t size = g_fifo.consumed;
+        if (!g_fifo.predicted && size != 0u && size <= sizeof(g_fifo.collected))
+            rememberDownload(g_fifo.collected, size);
+        if (size == 0u)
+            return; // set and cleared without reading: not a download
+        if (g_fifo.overran || size != g_fifo.lastSize)
+            g_fifo.sameSizeRuns = 0u;
+        else
+            ++g_fifo.sameSizeRuns;
+        g_fifo.lastSize = size;
+        if (g_fifo.overran)
+        {
+            static uint32_t logged = 0;
+            if (logged++ < 4u)
+                std::fprintf(stderr, "[gs-download] a %u-byte FIFO download did not match the one before (%u bytes); reading it for real again\n",
+                             size, g_fifo.answerBytes);
+        }
+    }
+
     // The next bytes of a GS download. The VU1 thread's queue is drained first so the TRXDIR
     // write that started the transfer has reached the GS. Past the end the hardware gives 0.
-    void readGsDownload(uint8_t *dst, uint32_t bytes)
+    void readGsDownload(uint8_t *dst, uint32_t bytes, bool wholeTransfer = false)
     {
+        // Only whole transfers (a DMA download), never a FIFO read of part of one.
+        if (wholeTransfer && bytes <= sizeof(g_prediction.data) && ps2mtvu::active() && ps2gpu::active() &&
+            g_predictDownloads.load(std::memory_order_relaxed))
+        {
+            bool answered = false;
+            {
+                std::lock_guard<std::mutex> lock(g_prediction.mutex);
+                if (g_prediction.bytes == bytes && !g_prediction.pending)
+                {
+                    std::memcpy(dst, g_prediction.data, bytes);
+                    g_prediction.pending = true;
+                    answered = true;
+                }
+            }
+            if (answered)
+            {
+                ps2perf::count(ps2perf::GsDownloadsPredicted);
+                refreshPredictionAsync(bytes);
+                return;
+            }
+        }
+        {
+            static uint32_t logged = 0;
+            if (logged < 8u || (logged % 2000u) == 0u)
+                std::fprintf(stderr, "[gs-download] %u bytes (%s)\n", bytes, wholeTransfer ? "DMA" : "FIFO read");
+            ++logged;
+        }
         ps2mtvu::sync(ps2mtvu::SyncReason::Other);
         const uint32_t got = g_gsDownloadSource ? std::min(g_gsDownloadSource(dst, bytes), bytes) : 0u;
         if (got < bytes)
             std::memset(dst + got, 0, bytes - got);
+        if (wholeTransfer && bytes <= sizeof(g_prediction.data))
+            rememberDownload(dst, bytes);
     }
 
     constexpr uint32_t kVif1StatFdr = 1u << 23;      // VIF1 FIFO direction: GS -> EE
@@ -39,6 +187,11 @@ namespace
 void ps2SetGsDownloadSource(std::function<uint32_t(uint8_t *, uint32_t)> source)
 {
     g_gsDownloadSource = std::move(source);
+}
+
+void ps2SetGsDownloadPrediction(bool enabled)
+{
+    g_predictDownloads.store(enabled, std::memory_order_relaxed);
 }
 
 namespace
@@ -966,7 +1119,21 @@ __m128i PS2Memory::read128(uint32_t address)
         alignas(16) uint8_t qword[16] = {};
         const auto stat = m_ioRegisters.find(0x10003C00u);
         if (stat != m_ioRegisters.end() && (stat->second & kVif1StatFdr) != 0u)
-            readGsDownload(qword, sizeof(qword));
+        {
+            if (!g_fifo.open)
+                beginFifoSession(); // FDR was set some other way (never seen): treat as a start
+            if (g_fifo.predicted && !g_fifo.overran && g_fifo.consumed + sizeof(qword) <= g_fifo.answerBytes)
+                std::memcpy(qword, g_fifo.answer + g_fifo.consumed, sizeof(qword));
+            else
+            {
+                if (g_fifo.predicted)
+                    g_fifo.overran = true; // bigger than the one before: the rest is read for real
+                readGsDownload(qword, sizeof(qword));
+                if (!g_fifo.predicted && g_fifo.consumed + sizeof(qword) <= sizeof(g_fifo.collected))
+                    std::memcpy(g_fifo.collected + g_fifo.consumed, qword, sizeof(qword));
+            }
+            g_fifo.consumed += sizeof(qword);
+        }
         return _mm_load_si128(reinterpret_cast<const __m128i *>(qword));
     }
 
@@ -1368,17 +1535,26 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
-    if (address == 0x10003C00u && (value & kVif1StatFdr) != 0u) // VIF1_STAT: FIFO turned to GS -> EE
+    if (address == 0x10003C00u) // VIF1_STAT: FDR turns the FIFO to GS -> EE (a download) and back
     {
         const auto previous = m_ioRegisters.find(address);
-        if (previous == m_ioRegisters.end() || (previous->second & kVif1StatFdr) == 0u)
+        const bool was = previous != m_ioRegisters.end() && (previous->second & kVif1StatFdr) != 0u;
+        const bool now = (value & kVif1StatFdr) != 0u;
+        if (now && !was)
+        {
             ps2perf::count(ps2perf::LocalToHostReads); // one GS download starts
+            endFifoSession();
+            beginFifoSession();
+        }
+        else if (!now && was)
+            endFifoSession();
     }
     if (address == 0x10003C10u && (value & 0x1u) != 0u) // VIF1_FBRST.RST also turns the FIFO back
     {
         const auto stat = m_ioRegisters.find(0x10003C00u);
         if (stat != m_ioRegisters.end())
             stat->second &= ~kVif1StatFdr;
+        endFifoSession();
     }
 
     m_ioRegisters[address] = value;
@@ -1515,7 +1691,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 if (bytes != 0u)
                 {
                     std::vector<uint8_t> data(bytes);
-                    readGsDownload(data.data(), bytes);
+                    readGsDownload(data.data(), bytes, true);
                     const bool toScratch = isScratchpad(madr);
                     uint8_t *const base = toScratch ? m_scratchpad : m_rdram;
                     const uint32_t size = toScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
@@ -2730,7 +2906,23 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (address == 0x10003020u) // GIF_STAT
     {
-        ps2mtvu::sync(ps2mtvu::SyncReason::GifStatus); // PATH3 mask state lives on the VU1 thread
+        // The PATH3 mask (M3P) is set by VIF1 commands, which run on the VU1 thread. A single read
+        // (this game checks once a frame) takes the latest value as it is: waiting for the VU1
+        // thread to finish everything queued, every frame, cost the game thread a lot. A game
+        // polling the register in a loop (waiting for the mask to change) gets the exact state.
+        {
+            static auto lastRead = std::chrono::steady_clock::time_point{};
+            static uint32_t rapidReads = 0;
+            const auto now = std::chrono::steady_clock::now();
+            rapidReads = now - lastRead < std::chrono::microseconds(100) ? rapidReads + 1u : 0u;
+            lastRead = now;
+            if (rapidReads >= 64u)
+            {
+                ps2mtvu::sync(ps2mtvu::SyncReason::GifStatus);
+                rapidReads = 0;
+            }
+        }
+        const bool path3Masked = std::atomic_ref<bool>(const_cast<bool &>(m_path3Masked)).load(std::memory_order_acquire);
         if (g_eeTimerBatch.fqcLive && g_eeTimerBatch.pendingCycles > g_eeTimerBatch.fqcSetAt)
         {
             auto gifStatIt = m_ioRegisters.find(kGifStatRegister);
@@ -2746,7 +2938,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         // effective PATH3 mask controlled by the VIF1 MSKPATH3 command.
         stat = (stat & ~0xFu) |
                (mode & 0x1u) |
-               (m_path3Masked ? 0x2u : 0u) |
+               (path3Masked ? 0x2u : 0u) |
                (mode & 0x4u) |
                (ctrl & 0x8u);
         return stat;

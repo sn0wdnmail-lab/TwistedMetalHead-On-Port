@@ -11,7 +11,8 @@ namespace ps2x::iop::detail
     // SPU2 sound processor: register file, 2 MB sound RAM, 2 cores x 24 ADPCM voices with ADSR
     // envelopes, key on/off, end flags, IRQ address matching, DMA / PIO transfers and AutoDMA PCM
     // input. Output is mixed at 48 kHz into the host audio ring (see ps2x/iop/iop_audio.h).
-    // Reverb, noise and pitch modulation are not emulated.
+    // Voices are read through a 4-tap Gaussian filter like the hardware's, and volume sweeps
+    // (fades) run per sample. Reverb, noise and pitch modulation are not emulated.
     class Spu2
     {
     public:
@@ -36,6 +37,13 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool takeIrq() noexcept;
 
     private:
+        // A volume register in sweep mode slides its level over time, like an envelope.
+        struct Sweep
+        {
+            int32_t level = 0;
+            int32_t wait = 0;
+        };
+
         struct Voice
         {
             uint32_t ssa = 0;
@@ -48,8 +56,9 @@ namespace ps2x::iop::detail
             int16_t samples[28]{};
             int32_t hist1 = 0;
             int32_t hist2 = 0;
-            int16_t previous = 0;
-            int16_t current = 0;
+            int32_t history[4]{}; // the four newest samples, [3] newest (Gaussian taps)
+            Sweep volumeLeft{};
+            Sweep volumeRight{};
             uint8_t flags = 0;
             int phase = 0; // 0 off, 1 attack, 2 decay, 3 sustain, 4 release
             int32_t envelope = 0;
@@ -63,6 +72,8 @@ namespace ps2x::iop::detail
             uint32_t tsa = 0;
             std::deque<int16_t> admaLeft;
             std::deque<int16_t> admaRight;
+            Sweep masterLeft{};
+            Sweep masterRight{};
         };
 
         [[nodiscard]] uint16_t &reg(uint32_t offset) { return m_regs[(offset & 0x7FFu) >> 1]; }
@@ -79,6 +90,7 @@ namespace ps2x::iop::detail
         void stepEnvelope(int core, int index, Voice &voice);
         void checkIrq(uint32_t start, uint32_t count);
         void mixSample(int16_t &outLeft, int16_t &outRight);
+        static int32_t sweep(Sweep &state, uint16_t raw);
 
         std::vector<uint16_t> m_ram;
         std::array<uint16_t, RegisterSize / 2> m_regs{};

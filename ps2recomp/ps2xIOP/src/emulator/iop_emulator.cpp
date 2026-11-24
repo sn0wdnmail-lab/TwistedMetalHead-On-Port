@@ -142,6 +142,8 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            clockStarted = false;
+            iopTarget = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -691,10 +693,15 @@ namespace ps2x::iop::detail
             if (pumping)
                 return done();
             pumping = true;
+            const uint64_t start = totalCycles;
             const uint64_t deadline = totalCycles + maxCycles;
             while (!done() && totalCycles < deadline)
                 runCycles(std::min<uint64_t>(4096u, deadline - totalCycles));
             pumping = false;
+            // At most 100 ms is paid back: a pump that ran longer than that (a wait that never
+            // ended) is forgiven rather than freezing the IOP for as long.
+            // (runEeCycles pays the lead back: the IOP waits until the EE's clock catches up.)
+            clockPumped += totalCycles - start;
             return done();
         }
 
@@ -877,6 +884,12 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        // Where the EE's clock says the IOP should be (see runEeCycles).
+        bool clockStarted = false;
+        uint64_t iopTarget = 0;
+        // Clock report (console, every 10 s of IOP time): cycles run on schedule, by blocking
+        // calls, and how much lead was let go.
+        uint64_t clockScheduled = 0, clockPumped = 0, clockForgiven = 0, clockReportAt = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -917,20 +930,49 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        Impl &i = *m_impl;
+        const uint64_t total = i.eeCycleCarry + eeCycles;
         // The EE scheduler reports time in small checkpoint slices; running the IOP scheduler
         // for each of them costs more than the IOP work itself. Batch ~2048 EE cycles (256 IOP
         // cycles, under 7 microseconds of IOP time) before stepping the IOP.
         constexpr uint64_t kIopBatchEeCycles = 2048u;
         if (total < kIopBatchEeCycles)
         {
-            m_impl->eeCycleCarry = total;
+            i.eeCycleCarry = total;
             return;
         }
-        const uint64_t iopCycles = total / 8u;
-        m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        i.eeCycleCarry = total % 8u;
+        // The IOP runs up to where the EE's clock says it should be (an eighth of its cycles).
+        // It never stops exactly there (a thread finishes what it was doing) and blocking calls
+        // run it ahead too; aiming at the target instead of adding a fixed number of cycles each
+        // time keeps those overshoots from adding up. They did, to a few percent in battles, and
+        // the sound (made at the IOP's pace) came out that much too fast.
+        if (!i.clockStarted)
+        {
+            i.clockStarted = true;
+            i.iopTarget = i.totalCycles;
+        }
+        i.iopTarget += total / 8u;
+        i.clockScheduled += total / 8u;
+        // A blocking call that ran far ahead (a wait that never ended) is let go beyond 100 ms,
+        // rather than freezing the IOP for as long.
+        constexpr uint64_t kMaxLead = kIopClockHz / 10u;
+        if (i.totalCycles > i.iopTarget + kMaxLead)
+        {
+            i.clockForgiven += i.totalCycles - (i.iopTarget + kMaxLead);
+            i.iopTarget = i.totalCycles - kMaxLead;
+        }
+        if (i.iopTarget > i.totalCycles)
+            i.runCycles(i.iopTarget - i.totalCycles);
+        if (i.clockScheduled >= i.clockReportAt + kIopClockHz * 10u)
+        {
+            const double scheduled = static_cast<double>(i.clockScheduled - i.clockReportAt);
+            const double lead = static_cast<double>(i.totalCycles) - static_cast<double>(i.iopTarget);
+            std::fprintf(stderr, "[iop-clock] 10 s of EE time: blocking calls ran %.2f%% extra IOP time, %.2f%% let go; IOP %+.2f ms from the EE\n",
+                         100.0 * i.clockPumped / scheduled, 100.0 * i.clockForgiven / scheduled, lead * 1000.0 / kIopClockHz);
+            i.clockReportAt = i.clockScheduled;
+            i.clockPumped = i.clockForgiven = 0;
+        }
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

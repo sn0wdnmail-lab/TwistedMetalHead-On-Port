@@ -118,6 +118,8 @@ namespace vufast
         }
     }
 
+    // dest lanes of value over the register (VU field bits: x = 8 ... w = 1; SSE lane 0 = x).
+    // With dest known at compile time (compiled programs) this is one BLENDPS.
     VU_FAST_INLINE void storeMasked(float *dst, __m128 value, uint8_t dest)
     {
         if (dest == 0xFu)
@@ -125,25 +127,50 @@ namespace vufast
             _mm_storeu_ps(dst, value);
             return;
         }
+#if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_constant_p(dest))
+        {
+            const __m128 old = _mm_loadu_ps(dst);
+            __m128 merged;
+            switch (dest & 0xFu)
+            {
+            case 0x1u: merged = _mm_blend_ps(old, value, 0x8); break;
+            case 0x2u: merged = _mm_blend_ps(old, value, 0x4); break;
+            case 0x3u: merged = _mm_blend_ps(old, value, 0xC); break;
+            case 0x4u: merged = _mm_blend_ps(old, value, 0x2); break;
+            case 0x5u: merged = _mm_blend_ps(old, value, 0xA); break;
+            case 0x6u: merged = _mm_blend_ps(old, value, 0x6); break;
+            case 0x7u: merged = _mm_blend_ps(old, value, 0xE); break;
+            case 0x8u: merged = _mm_blend_ps(old, value, 0x1); break;
+            case 0x9u: merged = _mm_blend_ps(old, value, 0x9); break;
+            case 0xAu: merged = _mm_blend_ps(old, value, 0x5); break;
+            case 0xBu: merged = _mm_blend_ps(old, value, 0xD); break;
+            case 0xCu: merged = _mm_blend_ps(old, value, 0x3); break;
+            case 0xDu: merged = _mm_blend_ps(old, value, 0xB); break;
+            case 0xEu: merged = _mm_blend_ps(old, value, 0x7); break;
+            default: return; // no lanes
+            }
+            _mm_storeu_ps(dst, merged);
+            return;
+        }
+#endif
         const __m128 mask = g_laneMasks.mask[dest];
         const __m128 old = _mm_loadu_ps(dst);
         _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(mask, value), _mm_andnot_ps(mask, old)));
     }
 
     // PS2 operand rules: denormals read as signed zero, Inf/NaN exponents read as +-FLT_MAX.
+    // On the magnitude: an unsigned min caps the Inf/NaN exponent at FLT_MAX, a compare clears
+    // exponent-0 values; the sign is put back unchanged.
     VU_FAST_INLINE __m128 vuNorm(__m128 value)
     {
-        const __m128i expMask = _mm_set1_epi32(0x7F800000);
-        const __m128i signMask = _mm_set1_epi32(static_cast<int>(0x80000000u));
-        const __m128i maxMag = _mm_set1_epi32(0x7F7FFFFF);
-        __m128i bits = _mm_castps_si128(value);
-        const __m128i exponent = _mm_and_si128(bits, expMask);
-        const __m128i sign = _mm_and_si128(bits, signMask);
-        const __m128i isMax = _mm_cmpeq_epi32(exponent, expMask);
-        const __m128i isZero = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
-        bits = _mm_or_si128(_mm_andnot_si128(isMax, bits), _mm_and_si128(isMax, _mm_or_si128(sign, maxMag)));
-        bits = _mm_or_si128(_mm_andnot_si128(isZero, bits), _mm_and_si128(isZero, sign));
-        return _mm_castsi128_ps(bits);
+        const __m128i magMask = _mm_set1_epi32(0x7FFFFFFF);
+        const __m128i bits = _mm_castps_si128(value);
+        __m128i mag = _mm_and_si128(bits, magMask);
+        const __m128i sign = _mm_andnot_si128(magMask, bits);
+        mag = _mm_min_epu32(mag, _mm_set1_epi32(0x7F7FFFFF));
+        mag = _mm_and_si128(mag, _mm_cmpgt_epi32(mag, _mm_set1_epi32(0x007FFFFF)));
+        return _mm_castsi128_ps(_mm_or_si128(mag, sign));
     }
 
     VU_FAST_INLINE float normScalar(float value)
@@ -160,32 +187,30 @@ namespace vufast
     }
 
     // Clamp a FMAC result to PS2 range and compute its MAC flags and status nibble.
+    //   Z: exponent 0 (zero or underflow)   S: sign bit   U: exponent 0, not zero   O: exponent 255
+    // The four lane masks are packed to bytes, put in MAC order (w lowest in each nibble) and
+    // read with one PMOVMSKB.
     VU_FAST_INLINE __m128 vuResult(__m128 value, uint8_t dest, uint32_t &mac, uint32_t &statusNibble)
     {
-        const __m128i expMask = _mm_set1_epi32(0x7F800000);
-        const __m128i signMask = _mm_set1_epi32(static_cast<int>(0x80000000u));
         const __m128i magMask = _mm_set1_epi32(0x7FFFFFFF);
-        const __m128i maxMag = _mm_set1_epi32(0x7F7FFFFF);
-        __m128i bits = _mm_castps_si128(value);
-        const __m128i exponent = _mm_and_si128(bits, expMask);
-        const __m128i sign = _mm_and_si128(bits, signMask);
-        const __m128i magnitudeZero = _mm_cmpeq_epi32(_mm_and_si128(bits, magMask), _mm_setzero_si128());
-        const __m128i overflow = _mm_cmpeq_epi32(exponent, expMask);
-        const __m128i underflow = _mm_andnot_si128(magnitudeZero, _mm_cmpeq_epi32(exponent, _mm_setzero_si128()));
-        bits = _mm_or_si128(_mm_andnot_si128(overflow, bits), _mm_and_si128(overflow, _mm_or_si128(sign, maxMag)));
-        bits = _mm_or_si128(_mm_andnot_si128(underflow, bits), _mm_and_si128(underflow, sign));
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i mag = _mm_and_si128(bits, magMask);
+        const __m128i notZeroExp = _mm_cmpgt_epi32(mag, _mm_set1_epi32(0x007FFFFF));
+        const __m128i overflow = _mm_cmpgt_epi32(mag, _mm_set1_epi32(0x7F7FFFFF));
+        const __m128i zeroExp = _mm_cmpeq_epi32(notZeroExp, _mm_setzero_si128());
+        const __m128i underflow = _mm_andnot_si128(_mm_cmpeq_epi32(mag, _mm_setzero_si128()), zeroExp);
+        const __m128i signLanes = _mm_srai_epi32(bits, 31);
+        // Result: Inf/NaN exponent -> +-FLT_MAX, exponent 0 -> +-0.
+        const __m128i clamped = _mm_and_si128(_mm_min_epu32(mag, _mm_set1_epi32(0x7F7FFFFF)), notZeroExp);
+        const __m128i result = _mm_or_si128(clamped, _mm_andnot_si128(magMask, bits));
 
-        const int destBits = kRev4[dest];
-        const int zeroBits = (_mm_movemask_ps(_mm_castsi128_ps(_mm_or_si128(magnitudeZero, underflow)))) & destBits;
-        const int signBits = _mm_movemask_ps(_mm_castsi128_ps(sign)) & destBits;
-        const int underBits = _mm_movemask_ps(_mm_castsi128_ps(underflow)) & destBits;
-        const int overBits = _mm_movemask_ps(_mm_castsi128_ps(overflow)) & destBits;
-        mac = static_cast<uint32_t>(kRev4[zeroBits]) |
-              (static_cast<uint32_t>(kRev4[signBits]) << 4) |
-              (static_cast<uint32_t>(kRev4[underBits]) << 8) |
-              (static_cast<uint32_t>(kRev4[overBits]) << 12);
-        statusNibble = (zeroBits ? 1u : 0u) | (signBits ? 2u : 0u) | (underBits ? 4u : 0u) | (overBits ? 8u : 0u);
-        return _mm_castsi128_ps(bits);
+        const __m128i bytes = _mm_packs_epi16(_mm_packs_epi32(zeroExp, signLanes), _mm_packs_epi32(underflow, overflow));
+        const __m128i macOrder = _mm_shuffle_epi8(bytes, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12));
+        mac = static_cast<uint32_t>(_mm_movemask_epi8(macOrder)) & (static_cast<uint32_t>(dest & 0xFu) * 0x1111u);
+        uint32_t any = mac | (mac >> 1);
+        any |= any >> 2; // bit 4k: some lane of nibble k
+        statusNibble = (any & 1u) | ((any >> 3) & 2u) | ((any >> 6) & 4u) | ((any >> 9) & 8u);
+        return _mm_castsi128_ps(result);
     }
 
     inline float normResultScalar(float value)
@@ -272,9 +297,22 @@ namespace vufast
 
 VU_FAST_INLINE void VU1Interpreter::fastPushFlagEntry(const FastFlagEntry &entry)
 {
-    if (m_fastFlagCount == kFastFlagRing)
+    if (m_fastFlagCount == kFastFlagRing) [[unlikely]]
     {
-        // Cannot happen with a four-cycle latency and one entry per unit per cycle; keep the newest.
+        // Compiled blocks only commit before something reads the flags, so a long run of FMAC
+        // work can fill the queue. The oldest entry is long due (at most two pushes per cycle,
+        // four cycles of latency): apply it now, as a commit would have.
+        const FastFlagEntry &oldest = m_fastFlags[m_fastFlagHead];
+        if (oldest.writes & 1u)
+        {
+            m_state.mac = oldest.mac;
+            const uint32_t current = oldest.status & 0xFu;
+            m_state.status = (m_state.status & 0xFF0u) | current | (current << 6);
+        }
+        if (oldest.writes & 2u)
+            m_state.status = (m_state.status & 0x03Fu) | (oldest.status & 0xFC0u);
+        if (oldest.writes & 4u)
+            m_state.clip = oldest.clip;
         m_fastFlagHead = (m_fastFlagHead + 1u) % kFastFlagRing;
         --m_fastFlagCount;
     }
@@ -299,7 +337,9 @@ VU_FAST_INLINE void VU1Interpreter::fastExecUpperKind(const FastPair &pair)
             __m128 t;
             switch (pair.upSrc)
             {
-            case FSRC_BC: t = vuNorm(broadcastLane(_mm_loadu_ps(m_state.vf[pair.upFt]), pair.upBc)); break;
+            // Normalized before the broadcast (they commute): uses of other lanes of the same
+            // register then share one normalization.
+            case FSRC_BC: t = broadcastLane(vuNorm(_mm_loadu_ps(m_state.vf[pair.upFt])), pair.upBc); break;
             case FSRC_VT: t = vuNorm(_mm_loadu_ps(m_state.vf[pair.upFt])); break;
             case FSRC_Q: t = _mm_set1_ps(normScalar(m_state.q)); break;
             default: t = _mm_set1_ps(normScalar(m_state.i)); break;
@@ -330,12 +370,12 @@ VU_FAST_INLINE void VU1Interpreter::fastExecUpperKind(const FastPair &pair)
             default: result = _mm_setzero_ps(); break;
             }
             float *target = pair.upToAcc ? m_state.acc : m_state.vf[pair.upFd];
+            // No clamp: the operands are in PS2 range (finite), and in the VU's round-to-zero mode
+            // an x86 overflow gives +-FLT_MAX, not infinity, while FTZ turns underflow into 0. The
+            // result is already the PS2's (the clamp was two dependent instructions per operation).
             if (fmac && (!m_fastNeedMacStatus || pair.flagsDead))
             {
-                // Nothing in the loaded program reads MAC/status: clamp the result and skip the flags.
-                const __m128 maxValue = _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF));
-                const __m128 minValue = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0xFF7FFFFFu)));
-                result = _mm_min_ps(_mm_max_ps(result, minValue), maxValue);
+                // Nothing in the loaded program reads MAC/status: skip the flags.
                 storeMasked(target, result, dest);
                 return;
             }
@@ -345,7 +385,7 @@ VU_FAST_INLINE void VU1Interpreter::fastExecUpperKind(const FastPair &pair)
                     return;
                 uint32_t mac = 0u;
                 uint32_t statusNibble = 0u;
-                result = vuResult(result, dest, mac, statusNibble);
+                (void)vuResult(result, dest, mac, statusNibble); // flags only (see above)
                 storeMasked(target, result, dest);
                 FastFlagEntry entry;
                 entry.issueCycle = m_cycle;
@@ -377,22 +417,14 @@ VU_FAST_INLINE void VU1Interpreter::fastExecUpperKind(const FastPair &pair)
     else if constexpr (Kind == FU_FTOI)
     {
         {
+            // The power-of-two scale is exact (round-to-zero turns an overflow into FLT_MAX);
+            // CVTTPS2DQ gives 0x80000000 out of range, which is right below -2^31 and fixed above.
             static const float scales[4] = {1.0f, 16.0f, 4096.0f, 32768.0f};
-            float values[4];
-            _mm_storeu_ps(values, vuNorm(_mm_loadu_ps(m_state.vf[pair.upFs])));
-            alignas(16) int32_t ints[4];
-            const double scale = scales[pair.upScale];
-            for (int c = 0; c < 4; ++c)
-            {
-                const double scaled = static_cast<double>(values[c]) * scale;
-                if (scaled >= 2147483647.0)
-                    ints[c] = std::numeric_limits<int32_t>::max();
-                else if (scaled <= -2147483648.0)
-                    ints[c] = std::numeric_limits<int32_t>::min();
-                else
-                    ints[c] = static_cast<int32_t>(scaled);
-            }
-            storeMasked(m_state.vf[pair.upFt], _mm_castsi128_ps(_mm_load_si128(reinterpret_cast<const __m128i *>(ints))), dest);
+            const __m128 scaled = _mm_mul_ps(vuNorm(_mm_loadu_ps(m_state.vf[pair.upFs])), _mm_set1_ps(scales[pair.upScale]));
+            const __m128i truncated = _mm_cvttps_epi32(scaled);
+            const __m128 tooBig = _mm_cmpge_ps(scaled, _mm_set1_ps(2147483648.0f));
+            const __m128i ints = _mm_blendv_epi8(truncated, _mm_set1_epi32(0x7FFFFFFF), _mm_castps_si128(tooBig));
+            storeMasked(m_state.vf[pair.upFt], _mm_castsi128_ps(ints), dest);
             return;
         }
     }
@@ -411,22 +443,15 @@ VU_FAST_INLINE void VU1Interpreter::fastExecUpperKind(const FastPair &pair)
             uint32_t wBits = 0u;
             std::memcpy(&wBits, &m_state.vf[pair.upFt][3], sizeof(wBits));
             const int32_t limit = (wBits & 0x7F800000u) != 0u ? static_cast<int32_t>(wBits & 0x7FFFFFFFu) : 0x007FFFFF;
-            uint32_t flags = 0u;
-            for (uint32_t component = 0; component < 3u; ++component)
-            {
-                uint32_t bits = 0u;
-                std::memcpy(&bits, &m_state.vf[pair.upFs][component], sizeof(bits));
-                int32_t positive = 0;
-                int32_t negative = 0;
-                const uint32_t flipped = bits ^ 0x80000000u;
-                std::memcpy(&positive, &bits, 4);
-                std::memcpy(&negative, &flipped, 4);
-                if (positive > limit)
-                    flags |= 1u << (component * 2u);
-                if (negative > limit)
-                    flags |= 2u << (component * 2u);
-            }
-            m_workingClip = ((m_workingClip << 6) | (flags & 0x3Fu)) & 0xFFFFFFu;
+            // x, y, z compared as integers against |w|: +limit with the bits, -limit with the sign flipped.
+            const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(m_state.vf[pair.upFs]));
+            const __m128i lim = _mm_set1_epi32(limit);
+            const uint32_t positive = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(bits, lim)))) & 7u;
+            const uint32_t negative = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
+                                          _mm_cmpgt_epi32(_mm_xor_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u))), lim)))) & 7u;
+            static constexpr uint8_t kSpread[8] = {0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15}; // bit c -> bit 2c
+            const uint32_t flags = kSpread[positive] | (static_cast<uint32_t>(kSpread[negative]) << 1);
+            m_workingClip = ((m_workingClip << 6) | flags) & 0xFFFFFFu;
             FastFlagEntry entry;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
@@ -1394,8 +1419,10 @@ struct Vu1Aot
             {
             case FSRC_BC:
             {
-                const __m128 lane = broadcastLane(_mm_loadu_ps(vu.m_state.vf[pair.upFt]), pair.upBc);
-                t = (Norm & 2u) ? vuNorm(lane) : lane;
+                // Normalized before the broadcast (they commute): the compiler then shares one
+                // normalization between the uses of different lanes of the same register.
+                const __m128 whole = _mm_loadu_ps(vu.m_state.vf[pair.upFt]);
+                t = broadcastLane((Norm & 2u) ? vuNorm(whole) : whole, pair.upBc);
                 break;
             }
             case FSRC_VT:
@@ -1437,11 +1464,9 @@ struct Vu1Aot
             default: result = _mm_setzero_ps(); break;
             }
             float *target = pair.upToAcc ? vu.m_state.acc : vu.m_state.vf[pair.upFd];
+            // No clamp needed (see fastExecUpperKind<FU_ARITH>).
             if (fmac && (!vu.m_fastNeedMacStatus || pair.flagsDead))
             {
-                const __m128 maxValue = _mm_castsi128_ps(_mm_set1_epi32(0x7F7FFFFF));
-                const __m128 minValue = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int>(0xFF7FFFFFu)));
-                result = _mm_min_ps(_mm_max_ps(result, minValue), maxValue);
                 storeMasked(target, result, dest);
                 return;
             }
@@ -1451,7 +1476,7 @@ struct Vu1Aot
                     return;
                 uint32_t mac = 0u;
                 uint32_t statusNibble = 0u;
-                result = vuResult(result, dest, mac, statusNibble);
+                (void)vuResult(result, dest, mac, statusNibble);
                 storeMasked(target, result, dest);
                 VU1Interpreter::FastFlagEntry entry;
                 entry.issueCycle = vu.m_cycle;

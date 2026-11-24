@@ -2079,6 +2079,22 @@ void GSCpuBackend::BeginTransfer(const GSTransferCommand &command)
             ps2perf::count(ps2perf::TexUploads); // GS downloads are counted where they start (VIF1_STAT.FDR)
     }
 
+    if (command.direction == 1u)
+    {
+        // PS2X_PGS_READBACK_LOG=1 (shared with the Vulkan renderer): what the game reads back.
+        static const bool readbackLog = []()
+        {
+            const char *v = std::getenv("PS2X_PGS_READBACK_LOG");
+            return v && *v && *v != '0';
+        }();
+        static uint32_t logged = 0;
+        if (readbackLog && (logged < 40u || (logged % 300u) == 0u))
+            std::fprintf(stderr, "[cpu-readback] #%u SBP 0x%x SBW %u SPSM 0x%x at %u,%u size %ux%u\n", logged,
+                         unsigned(command.bitbltbuf.sbp), unsigned(command.bitbltbuf.sbw), unsigned(command.bitbltbuf.spsm),
+                         unsigned(command.trxpos.ssax), unsigned(command.trxpos.ssay), unsigned(command.trxreg.rrw),
+                         unsigned(command.trxreg.rrh));
+        ++logged;
+    }
     if (command.direction == 2u)
         PerformLocalToLocalTransfer();
     else if (command.direction == 1u)

@@ -1,8 +1,17 @@
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
-index ea00016..29c747f 100644
+index ea00016..b912995 100644
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
-@@ -132,6 +132,8 @@ static bool write_mask_is_16bit_channel_slice(uint32_t psm, uint32_t color_mask)
+@@ -9,6 +9,8 @@
+ #include "shaders/swizzle_utils.h"
+ #include "muglm/muglm_impl.hpp"
+ #include "gs_registers_debug.hpp"
++#include <chrono>
++#include <cstdlib>
+ 
+ namespace ParallelGS
+ {
+@@ -132,6 +134,8 @@ static bool write_mask_is_16bit_channel_slice(uint32_t psm, uint32_t color_mask)
  
  void GSInterface::flush_render_pass(FlushReason reason)
  {
@@ -11,7 +20,7 @@ index ea00016..29c747f 100644
  	ParallelGS::RenderPass rp = {};
  
  	if (render_pass.primitive_count)
-@@ -1799,6 +1801,29 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+@@ -1799,6 +1803,29 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
  		if (info.info.arrayed && is_palette_format(psm) && desc.clamp.desc.has_region_repeat())
  			info.info.flags |= TEX_INFO_FORCE_SAMPLE_MAPPING;
  
@@ -41,7 +50,7 @@ index ea00016..29c747f 100644
  		render_pass.tex_infos.push_back(info);
  		render_pass.tex0_infos.push_back(ctx.tex0.desc);
  		render_pass.held_images.push_back(std::move(image));
-@@ -1811,6 +1836,89 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+@@ -1811,6 +1838,89 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
  	return texture_index;
  }
  
@@ -131,7 +140,7 @@ index ea00016..29c747f 100644
  void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb)
  {
  	if (!get_and_clear_dirty_flag(STATE_DIRTY_PRIM_TEMPLATE_BIT))
-@@ -2687,6 +2795,18 @@ void GSInterface::drawing_kick_append()
+@@ -2687,6 +2797,18 @@ void GSInterface::drawing_kick_append()
  	PrimitiveAttribute prim_attr;
  	prim_attr.tex = prim_state.tex;
  	prim_attr.tex2 = prim_state.tex2;
@@ -150,7 +159,7 @@ index ea00016..29c747f 100644
  	prim_attr.state = prim_state.state;
  	prim_attr.fbmsk = ctx.frame.desc.FBMSK;
  	prim_attr.fogcol = registers.fogcol.words[0];
-@@ -2719,6 +2839,12 @@ void GSInterface::drawing_kick_append()
+@@ -2719,6 +2841,12 @@ void GSInterface::drawing_kick_append()
  		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
  	}
  
@@ -163,7 +172,39 @@ index ea00016..29c747f 100644
  	prim_attr.state |= render_pass.current_instance << STATE_VERTEX_RENDER_PASS_INSTANCE_OFFSET;
  
  	// If our damage region expands, then mark hazards.
-@@ -4268,6 +4394,7 @@ void GSInterface::flush()
+@@ -3246,6 +3374,11 @@ void GSInterface::init_transfer()
+ 			return;
+ 		}
+ 
++		// [ps2x] PS2X_PGS_READBACK_LOG=1: what the game reads back and how long it waits for the GPU.
++		// (The first few and then one in 3000 are always logged; PS2X_PGS_READBACK_LOG=0 turns it off.)
++		static const bool readback_log = []() { const char *v = getenv("PS2X_PGS_READBACK_LOG"); return !(v && *v == '0'); }();
++		const bool needed_submit = host_timeline == UINT64_MAX;
++		const auto wait_start = std::chrono::steady_clock::now();
+ 		if (host_timeline == UINT64_MAX)
+ 		{
+ 			host_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
+@@ -3254,6 +3387,19 @@ void GSInterface::init_transfer()
+ 				renderer.wait_timeline(host_timeline);
+ 		}
+ 		renderer.wait_timeline(host_timeline);
++		if (readback_log)
++		{
++			static uint32_t logged = 0;
++			const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - wait_start).count();
++			if (logged < 12 || (logged % 3000u) == 0u)
++				fprintf(stderr, "[pgs-readback] #%u SBP 0x%x SBW %u SPSM 0x%x at %u,%u size %ux%u (%u bytes) | %s, waited %.0f us\n",
++				        logged, unsigned(transfer_state.copy.bitbltbuf.desc.SBP), unsigned(transfer_state.copy.bitbltbuf.desc.SBW),
++				        unsigned(transfer_state.copy.bitbltbuf.desc.SPSM), unsigned(transfer_state.copy.trxpos.desc.SSAX),
++				        unsigned(transfer_state.copy.trxpos.desc.SSAY), unsigned(transfer_state.copy.trxreg.desc.RRW),
++				        unsigned(transfer_state.copy.trxreg.desc.RRH), required_bytes,
++				        needed_submit ? "unsubmitted writes" : "writes already submitted", us);
++			logged++;
++		}
+ 
+ 		void *mapped = renderer.begin_host_vram_access();
+ 
+@@ -4268,6 +4414,7 @@ void GSInterface::flush()
  {
  	flush_pending_transfer(true);
  	uint64_t value = tracker.mark_submission_timeline();

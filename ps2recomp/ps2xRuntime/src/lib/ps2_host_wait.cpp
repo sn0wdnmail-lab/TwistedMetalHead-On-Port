@@ -69,6 +69,60 @@ namespace ps2host
         if (HANDLE event = handles().wakeEvent)
             SetEvent(event);
     }
+
+    namespace
+    {
+        // PROCESS_POWER_THROTTLING_STATE / THREAD_POWER_THROTTLING_STATE (Windows 10 1709+),
+        // spelled out so older SDK headers build too.
+        struct PowerThrottlingState
+        {
+            ULONG version;
+            ULONG controlMask;
+            ULONG stateMask;
+        };
+        constexpr ULONG kThrottlingVersion = 1u;
+        constexpr ULONG kExecutionSpeed = 0x1u;       // EcoQoS / efficiency-core placement
+        constexpr ULONG kIgnoreTimerResolution = 0x4u; // process only: keep timeBeginPeriod(1)
+        constexpr int kProcessPowerThrottling = 4;    // PROCESS_INFORMATION_CLASS
+        constexpr int kThreadPowerThrottling = 3;     // THREAD_INFORMATION_CLASS
+
+        HMODULE kernel32()
+        {
+            static const HMODULE module = GetModuleHandleW(L"kernel32.dll");
+            return module;
+        }
+    }
+
+    void preferPerformanceCores() noexcept
+    {
+        using SetProcessInformationFn = BOOL(WINAPI *)(HANDLE, int, LPVOID, DWORD);
+        const auto fn = kernel32() ? reinterpret_cast<SetProcessInformationFn>(
+                                         reinterpret_cast<void *>(GetProcAddress(kernel32(), "SetProcessInformation")))
+                                   : nullptr;
+        if (!fn)
+            return; // before Windows 8: nothing to opt out of
+        PowerThrottlingState state{kThrottlingVersion, kExecutionSpeed | kIgnoreTimerResolution, 0u};
+        if (!fn(GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof(state)))
+        {
+            // Windows 10 before 2004 knows execution speed but not the timer flag.
+            state.controlMask = kExecutionSpeed;
+            fn(GetCurrentProcess(), kProcessPowerThrottling, &state, sizeof(state));
+        }
+    }
+
+    void raiseThisThread() noexcept
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        using SetThreadInformationFn = BOOL(WINAPI *)(HANDLE, int, LPVOID, DWORD);
+        const auto fn = kernel32() ? reinterpret_cast<SetThreadInformationFn>(
+                                         reinterpret_cast<void *>(GetProcAddress(kernel32(), "SetThreadInformation")))
+                                   : nullptr;
+        if (fn)
+        {
+            PowerThrottlingState state{kThrottlingVersion, kExecutionSpeed, 0u};
+            fn(GetCurrentThread(), kThreadPowerThrottling, &state, sizeof(state));
+        }
+    }
 }
 
 #else
@@ -88,6 +142,14 @@ namespace ps2host
     }
 
     void wake() noexcept
+    {
+    }
+
+    void preferPerformanceCores() noexcept
+    {
+    }
+
+    void raiseThisThread() noexcept
     {
     }
 }

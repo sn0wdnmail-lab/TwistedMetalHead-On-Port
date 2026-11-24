@@ -1,6 +1,7 @@
 #include "ps2_capture.h"
 
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_settings.h"
 
 #include "raylib.h"
 #include "rlgl.h"
@@ -10,10 +11,12 @@
 #include "external/stb_image_write.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <filesystem>
@@ -40,7 +43,9 @@ namespace ps2capture
             int height = 0;
             double seconds = 0.0;
             uint64_t index = 0;
+            std::filesystem::path pngPath; // set: a screenshot, written whole as PNG
         };
+        std::atomic<bool> g_screenshotWanted{false};
 
         std::mutex g_mutex;
         std::condition_variable g_cv;
@@ -118,6 +123,15 @@ namespace ps2capture
             }
         }
 
+        void writePng(const Job &job)
+        {
+            FILE *file = openForWrite(job.pngPath);
+            if (!file)
+                return;
+            stbi_write_png_to_func(writeToFile, file, job.width, job.height, 4, job.rgba.data(), job.width * 4);
+            std::fclose(file);
+        }
+
         void workerMain()
         {
             for (;;)
@@ -131,7 +145,19 @@ namespace ps2capture
                     job = std::move(g_jobs.front());
                     g_jobs.pop_front();
                 }
-                encode(job);
+                if (!job.pngPath.empty())
+                    writePng(job);
+                else
+                    encode(job);
+            }
+        }
+
+        void startWorker()
+        {
+            if (!g_worker.joinable())
+            {
+                g_stop = false;
+                g_worker = std::thread(workerMain);
             }
         }
 
@@ -152,11 +178,7 @@ namespace ps2capture
             if (error)
                 return false;
             g_written.clear();
-            if (!g_worker.joinable())
-            {
-                g_stop = false;
-                g_worker = std::thread(workerMain);
-            }
+            startWorker();
             ps2perf::performanceNote("Recording screenshots every %.1f s to %s", kInterval, g_folder.u8string().c_str());
             return true;
         }
@@ -223,6 +245,86 @@ namespace ps2capture
         catch (...)
         {
             failed = true;
+        }
+    }
+
+    void requestScreenshot() noexcept
+    {
+        g_screenshotWanted.store(true, std::memory_order_relaxed);
+    }
+
+    void afterPicture(float x, float y, float width, float height) noexcept
+    {
+        if (!g_screenshotWanted.exchange(false, std::memory_order_relaxed))
+            return;
+        try
+        {
+            rlDrawRenderBatchActive(); // the picture is still in raylib's batch until it is flushed
+            Image screen = LoadImageFromScreen();
+            if (!screen.data || screen.width <= 0 || screen.height <= 0)
+            {
+                UnloadImage(screen);
+                ps2settings::notify("Screenshot failed: the picture could not be read");
+                return;
+            }
+            // Just the game picture (no black bars): screen coordinates to pixels (high-DPI too).
+            const float sx = static_cast<float>(screen.width) / std::max(1.0f, static_cast<float>(GetScreenWidth()));
+            const float sy = static_cast<float>(screen.height) / std::max(1.0f, static_cast<float>(GetScreenHeight()));
+            const int left = std::clamp(static_cast<int>(x * sx + 0.5f), 0, screen.width - 1);
+            const int top = std::clamp(static_cast<int>(y * sy + 0.5f), 0, screen.height - 1);
+            const int right = std::clamp(static_cast<int>((x + width) * sx + 0.5f), left + 1, screen.width);
+            const int bottom = std::clamp(static_cast<int>((y + height) * sy + 0.5f), top + 1, screen.height);
+            Job job;
+            job.width = right - left;
+            job.height = bottom - top;
+            job.rgba.resize(static_cast<size_t>(job.width) * static_cast<size_t>(job.height) * 4u);
+            const uint8_t *pixels = static_cast<const uint8_t *>(screen.data);
+            for (int row = 0; row < job.height; ++row)
+            {
+                const uint8_t *src = pixels + (static_cast<size_t>(top + row) * static_cast<size_t>(screen.width) + static_cast<size_t>(left)) * 4u;
+                uint8_t *dst = job.rgba.data() + static_cast<size_t>(row) * static_cast<size_t>(job.width) * 4u;
+                std::memcpy(dst, src, static_cast<size_t>(job.width) * 4u);
+                for (int px = 0; px < job.width; ++px)
+                    dst[px * 4 + 3] = 255u; // opaque
+            }
+            UnloadImage(screen);
+
+            // Screenshots\TMHO 2026-11-24 18-05-42.png next to the game (a number added if taken
+            // within the same second).
+            const std::time_t now = std::time(nullptr);
+            std::tm local{};
+#if defined(_WIN32)
+            localtime_s(&local, &now);
+#else
+            localtime_r(&now, &local);
+#endif
+            char stamp[48];
+            std::strftime(stamp, sizeof(stamp), "TMHO %Y-%m-%d %H-%M-%S", &local);
+            const std::filesystem::path folder = pathFromUtf8(GetApplicationDirectory()) / "Screenshots";
+            std::error_code error;
+            std::filesystem::create_directories(folder, error);
+            if (error)
+            {
+                ps2settings::notify("Screenshot failed: could not create the Screenshots folder");
+                return;
+            }
+            std::filesystem::path path = folder / (std::string(stamp) + ".png");
+            for (int n = 2; std::filesystem::exists(path, error) && n < 100; ++n)
+                path = folder / (std::string(stamp) + " (" + std::to_string(n) + ").png");
+            job.pngPath = path;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                startWorker();
+                g_jobs.push_back(std::move(job));
+            }
+            g_cv.notify_one();
+            const std::u8string fileName = path.filename().u8string();
+            const std::string shown = "Screenshot saved: Screenshots\\" + std::string(fileName.begin(), fileName.end());
+            ps2settings::notify(shown.c_str());
+        }
+        catch (...)
+        {
+            ps2settings::notify("Screenshot failed");
         }
     }
 

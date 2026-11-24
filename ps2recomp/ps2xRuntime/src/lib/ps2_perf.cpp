@@ -1,5 +1,7 @@
 #include "runtime/ps2_perf.h"
 #include "runtime/ps2_mtvu.h"
+#include "runtime/ps2_present.h"
+#include "ps2x/iop/iop_audio.h"
 
 namespace ps2settings
 {
@@ -460,7 +462,7 @@ namespace ps2perf
                 {
                     const std::string &label = it->second.label;
                     const bool ours = label == "GameThread" || label.rfind("VU1 thread", 0) == 0 || label.rfind("GS feed", 0) == 0 ||
-                                      label.rfind("window", 0) == 0 || label == "perf sampler";
+                                      label.rfind("window", 0) == 0 || label == "perf sampler" || label == "perf report";
                     if (!ours && cores >= 0.03 && cores > otherCores)
                     {
                         otherCores = cores;
@@ -1892,6 +1894,42 @@ namespace ps2perf
         }
     }
 
+    namespace
+    {
+        // What the window thread hands the report thread each frame.
+        std::atomic<uint64_t> g_tickEeCycle{0};
+        std::atomic<const uint8_t *> g_tickRdram{nullptr};
+        std::atomic<uint64_t> g_framesThisInterval{0};
+        std::atomic<uint64_t> g_pausedFrames{0};
+        std::atomic<bool> g_reportThreadStarted{false};
+        std::atomic<bool> g_reportThreadRunning{false};
+
+        void writeReport(uint64_t now, uint64_t eeCycle, const uint8_t *rdram) noexcept;
+
+        // The 2-second report (thread census, profile, file writes) takes milliseconds; on the
+        // window thread it showed up as a hitch every report. It has its own thread instead.
+        void reportMain()
+        {
+            registerThread("perf report");
+            uint64_t next = nowNs() + kReportIntervalNs;
+            struct Running
+            {
+                ~Running() { g_reportThreadRunning.store(false, std::memory_order_release); }
+            } running;
+            while (!g_shutdown.load(std::memory_order_relaxed))
+            {
+                const uint64_t now = nowNs();
+                if (now < next)
+                {
+                    std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(next - now, 100000000ull)));
+                    continue;
+                }
+                next = now + kReportIntervalNs;
+                writeReport(now, g_tickEeCycle.load(std::memory_order_relaxed), g_tickRdram.load(std::memory_order_relaxed));
+            }
+        }
+    }
+
     void mainThreadTick(uint64_t eeCycle, const uint8_t *rdram) noexcept
     {
         const uint64_t now = nowNs();
@@ -1911,13 +1949,30 @@ namespace ps2perf
         lastFrameNs = now;
         count(MainFrames);
         // Frames shown while the F2 drawer had the game paused (this report interval).
-        static uint64_t framesThisInterval = 0;
-        static uint64_t pausedFrames = 0;
-        ++framesThisInterval;
+        g_framesThisInterval.fetch_add(1u, std::memory_order_relaxed);
         if (ps2settings::emulationPaused())
-            ++pausedFrames;
+            g_pausedFrames.fetch_add(1u, std::memory_order_relaxed);
+        g_tickEeCycle.store(eeCycle, std::memory_order_relaxed);
+        g_tickRdram.store(rdram, std::memory_order_relaxed);
+        if (!g_reportThreadStarted.exchange(true, std::memory_order_relaxed))
+        {
+            try
+            {
+                g_reportThreadRunning.store(true, std::memory_order_release);
+                std::thread(reportMain).detach();
+            }
+            catch (...)
+            {
+                g_reportThreadRunning.store(false, std::memory_order_release);
+            }
+        }
+    }
 
-        static uint64_t lastNs = now;
+    namespace
+    {
+    void writeReport(uint64_t now, uint64_t eeCycle, const uint8_t *rdram) noexcept
+    {
+        static uint64_t lastNs = now - kReportIntervalNs;
         static uint64_t lastCycle = eeCycle;
         static uint64_t lastBuckets[BucketCount] = {};
         static uint64_t lastCounters[CounterCount] = {};
@@ -1928,12 +1983,15 @@ namespace ps2perf
         if (first)
         {
             first = false;
-            g_session.startSeconds = nsToSeconds(now);
+            std::lock_guard<std::mutex> lock(g_fileMutex);
+            g_session.startSeconds = nsToSeconds(now) - nsToSeconds(kReportIntervalNs);
         }
 
         const uint64_t interval = now - lastNs;
-        if (interval < kReportIntervalNs)
+        if (interval == 0u)
             return;
+        const uint64_t framesThisInterval = g_framesThisInterval.exchange(0u, std::memory_order_relaxed);
+        const uint64_t pausedFrames = g_pausedFrames.exchange(0u, std::memory_order_relaxed);
 
         try
         {
@@ -2065,8 +2123,8 @@ namespace ps2perf
             if (pausedInterval)
             {
                 std::snprintf(verdict, sizeof(verdict), pausedFrames * 10u >= framesThisInterval * 9u
-                                                            ? "PAUSED - the F2 settings menu is open, so the game is stopped (not counted in the averages)"
-                                                            : "PAUSED part of the time - the F2 settings menu was open (not counted in the averages)");
+                                                            ? "PAUSED - the F2 settings menu is open or the window is in the background, so the game is stopped (not counted in the averages)"
+                                                            : "PAUSED part of the time - the F2 settings menu was open or the window was in the background (not counted in the averages)");
             }
             else if (speed < 97.0 && vuThread && mtvuWaitMs > 150.0)
             {
@@ -2091,9 +2149,6 @@ namespace ps2perf
                 std::snprintf(verdict, sizeof(verdict), "SLOW (%.0f%%) - held back by %s: %.0f ms/s of the game thread; next: %s %.0f ms/s",
                               speed, costLabel(costs[0]), costs[0].ms, costLabel(costs[1]), costs[1].ms);
             }
-
-            framesThisInterval = 0;
-            pausedFrames = 0;
 
             // ---- performance report
             char logicText[48] = "";
@@ -2142,6 +2197,35 @@ namespace ps2perf
                           "           CPU cores in use: whole game %.2f (of %u) = game thread %.2f + window %.2f + raster workers %.2f (%u threads) + other %.2f | RAM in use %.0f MB",
                           processCores, std::max(1u, std::thread::hardware_concurrency()), gameCores, windowCores, rasterCores,
                           rasterThreads, otherCores + unaccountedCores, ramMb);
+            // Sound: how full the buffer runs and anything that would be heard as a crackle.
+            char la[512];
+            {
+                static ps2x::iop::AudioStats last{};
+                const ps2x::iop::AudioStats now = ps2x::iop::audioStats();
+                const double framesToMs = 1000.0 / 48000.0;
+                std::snprintf(la, sizeof(la),
+                              "           sound: game made %.2fk frames/s, %.0f ms buffered, tempo %+.2f%% (time-stretched %.0f%%) | silence %.0f ms/s (%llu dry-outs) | dropped %.0f ms/s | "
+                              "clipped %.0f samples/s | sound card asked %.0f times/s",
+                              static_cast<double>(now.pushedFrames - last.pushedFrames) * perSecond / 1000.0,
+                              static_cast<double>(now.bufferedFrames) * framesToMs, now.rateTenthsPermille / 100.0,
+                              now.pulledFrames > last.pulledFrames
+                                  ? 100.0 * static_cast<double>(now.stretchedFrames - last.stretchedFrames) / static_cast<double>(now.pulledFrames - last.pulledFrames)
+                                  : 0.0,
+                              static_cast<double>(now.silentFrames - last.silentFrames) * framesToMs * perSecond,
+                              static_cast<unsigned long long>(now.underruns - last.underruns),
+                              static_cast<double>(now.droppedFrames - last.droppedFrames) * framesToMs * perSecond,
+                              static_cast<double>(now.clippedSamples - last.clippedSamples) * perSecond,
+                              static_cast<double>(now.callbacks - last.callbacks) * perSecond);
+                last = now;
+            }
+            // Picture: the size frames are scaled to and what reaches the screen.
+            char lp[256];
+            {
+                int pw = 0, ph = 0;
+                ps2present::pictureSize(pw, ph);
+                std::snprintf(lp, sizeof(lp), "           picture: scaled to %d x %d | shown %.0f fps%s", pw, ph, ps2present::shownFps(),
+                              ps2present::interpolating() ? " (with in-between frames)" : "");
+            }
             const std::string threadsText = busiestThreads(interval);
             char l6[900];
             std::snprintf(l6, sizeof(l6), "           threads: %s", threadsText.c_str());
@@ -2161,8 +2245,9 @@ namespace ps2perf
                               formatCount(rate(GpuRenderPasses)).c_str(), formatCount(rate(GpuCopies)).c_str(),
                               formatCount(rate(GpuPaletteUpdates)).c_str());
                 std::snprintf(g3, sizeof(g3),
-                              "           frames: %.1f scanouts/s, %.1f read back to the window/s, %.1f skipped (GPU still busy)/s, %s GS->CPU reads/s | video memory in use %.0f MB of %.0f MB",
+                              "           frames: %.1f scanouts/s, %.1f read back to the window/s, %.1f skipped (GPU still busy)/s, %s GS->CPU reads/s (%s answered from the frame before) | video memory in use %.0f MB of %.0f MB",
                               rate(GpuFrames), rate(GpuReadbacks), rate(GpuDroppedReadbacks), formatCount(rate(LocalToHostReads)).c_str(),
+                              formatCount(rate(GsDownloadsPredicted)).c_str(),
                               static_cast<double>(g_gauges[GpuMemoryUsedBytes].load(std::memory_order_relaxed)) / (1024.0 * 1024.0),
                               static_cast<double>(g_gauges[GpuMemoryBudgetBytes].load(std::memory_order_relaxed)) / (1024.0 * 1024.0));
                 std::snprintf(g4, sizeof(g4),
@@ -2200,6 +2285,8 @@ namespace ps2perf
 
             {
                 std::lock_guard<std::mutex> lock(g_fileMutex);
+                if (g_shutdown.load(std::memory_order_relaxed))
+                    return; // the session summary is written and the files are closed
                 ensureFilesLocked();
                 if (g_perfFile)
                 {
@@ -2210,6 +2297,8 @@ namespace ps2perf
                     if (l8[0] != '\0')
                         writeLine(g_perfFile, l8);
                     writeLine(g_perfFile, l3);
+                    writeLine(g_perfFile, lp);
+                    writeLine(g_perfFile, la);
                     writeLine(g_perfFile, l4);
                     writeLine(g_perfFile, l6);
                     writeLine(g_perfFile, l5);
@@ -2248,7 +2337,8 @@ namespace ps2perf
                 std::fflush(stderr);
             }
 
-            // ---- session totals
+            // ---- session totals (shutdown() reads them from another thread)
+            std::lock_guard<std::mutex> sessionLock(g_fileMutex);
             if (pausedInterval)
             {
                 g_session.pausedIntervals++;
@@ -2278,11 +2368,16 @@ namespace ps2perf
         lastNs = now;
         lastCycle = eeCycle;
     }
+    } // namespace
 
     void shutdown() noexcept
     {
-        if (g_shutdown.exchange(true)) // also stops the watchdog, logs on or off
+        if (g_shutdown.exchange(true)) // also stops the watchdog and the report thread, logs on or off
             return;
+        // The report thread checks g_shutdown at least every 100 ms; let it finish a report it is
+        // writing before the session summary and before the process tears its globals down.
+        for (int i = 0; i < 300 && g_reportThreadRunning.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (!enabled())
             return;
         try

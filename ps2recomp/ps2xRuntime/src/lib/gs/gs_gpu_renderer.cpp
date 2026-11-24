@@ -16,6 +16,7 @@
 
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_perf.h"
+#include "runtime/ps2_host_wait.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_texture_replace.h"
 
@@ -61,6 +62,21 @@ namespace ps2gpu
     std::atomic<uint32_t> g_requestedSuperSampling{0u};
     std::atomic<uint32_t> g_currentSuperSampling{1u};
     std::atomic<bool> g_rawBgraFrames{false}; // the window can draw raw BGRA pictures
+    std::atomic<uint64_t> g_syncWaitNs{0};    // time the game spent in GS downloads (waiting for the GPU)
+
+    // How much drawing paraLLEl-GS collects before handing it to the GPU. Large batches cost the
+    // CPU the least, but a game that reads the picture back every frame (this one does) then
+    // waits while the GPU draws the whole frame from scratch. Small batches let the GPU draw
+    // while the frame is still being built, so a download only waits for the last bit.
+    constexpr uint32_t kLargeBatch = 65536u;
+    constexpr uint32_t kSmallBatch = 4096u;
+    struct BatchPolicy
+    {
+        uint32_t current = 0u;
+        double waitEmaMs = 0.0;         // download wait per frame (smoothed)
+        double smallUntil = 0.0;        // keep small batches until this time
+        double holdSeconds = 30.0;      // how long small batches are kept after waits are seen
+    } g_batch;
     namespace
     {
         void startFeed();
@@ -188,6 +204,7 @@ namespace ps2gpu
             uint32_t height = 0;
             VkFormat format = VK_FORMAT_UNDEFINED;
             uint32_t displayFbp = 0;
+            uint64_t tick = 0;
             bool pending = false;
         };
 
@@ -214,6 +231,7 @@ namespace ps2gpu
             uint32_t frameWidth = 0;
             uint32_t frameHeight = 0;
             uint32_t frameFbp = 0;
+            uint64_t frameTick = 0;
             bool frameFresh = false;
             bool frameRawBgra = false; // frame holds the GPU's BGRA bytes as they came back
         };
@@ -298,6 +316,7 @@ namespace ps2gpu
                 s.frameWidth = slot.width;
                 s.frameHeight = slot.height;
                 s.frameFbp = slot.displayFbp;
+                s.frameTick = slot.tick;
                 s.frameRawBgra = raw;
                 s.frameFresh = true;
             }
@@ -319,7 +338,7 @@ namespace ps2gpu
             }
         }
 
-        void queueReadbackLocked(State &s, const ScanoutResult &result, uint32_t displayFbp)
+        void queueReadbackLocked(State &s, const ScanoutResult &result, uint32_t displayFbp, uint64_t tick)
         {
             Readback &slot = s.ring[s.ringIndex];
             if (slot.pending)
@@ -346,6 +365,7 @@ namespace ps2gpu
             }
             slot.format = result.image->get_format();
             slot.displayFbp = displayFbp;
+            slot.tick = tick;
 
             auto cmd = s.device.request_command_buffer();
             cmd->image_barrier(*result.image, VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -361,6 +381,41 @@ namespace ps2gpu
             slot.image = result.image;
             slot.pending = true;
             s.ringIndex = (s.ringIndex + 1u) % 3u;
+        }
+
+        // Once a frame: picks the batch size (see BatchPolicy). Above native resolution the GPU has
+        // real work every frame, so small batches always pay; at native resolution they are used
+        // while downloads are seen waiting, then large batches are tried again.
+        void updateBatchPolicyLocked(State &s)
+        {
+            const int fixed = ps2settings::get().gpuFlushPrimitives;
+            const double waitMs = static_cast<double>(g_syncWaitNs.exchange(0u, std::memory_order_relaxed)) / 1e6;
+            BatchPolicy &b = g_batch;
+            b.waitEmaMs += (waitMs - b.waitEmaMs) * 0.1;
+            const double nowSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            uint32_t wanted = kLargeBatch;
+            if (fixed > 0)
+                wanted = static_cast<uint32_t>(fixed);
+            else if (s.superSampling > 1u)
+                wanted = kSmallBatch;
+            else
+            {
+                if (b.waitEmaMs > 1.0)
+                {
+                    if (b.current == kLargeBatch && b.smallUntil > 0.0)
+                        b.holdSeconds = std::min(b.holdSeconds * 2.0, 600.0); // large batches stalled again
+                    b.smallUntil = nowSeconds + b.holdSeconds;
+                }
+                wanted = nowSeconds < b.smallUntil ? kSmallBatch : kLargeBatch;
+            }
+            if (wanted != b.current)
+            {
+                if (b.current != 0u)
+                    ps2perf::graphicsNote("           GPU work is now handed over every %u primitives (downloads waited %.1f ms a frame)", wanted,
+                                          b.waitEmaMs);
+                b.current = wanted;
+                ParallelGS::set_minimum_primitives_for_flush(wanted);
+            }
         }
 
         std::string driverVersionText(const VkPhysicalDeviceProperties &props)
@@ -448,13 +503,10 @@ namespace ps2gpu
             debug.timestamps = true; // GPU time per second in Graphicslogs.txt
             s.iface.set_debug_mode(debug);
         }
-        // paraLLEl-GS hands queued work to the GPU after 4096 primitives by default: four times a
-        // frame in a battle, each costing several GPU queue submissions (about 1100 a second in
-        // all). The GPU is far from busy here, so one submission at the end of each frame (65536
-        // primitives is more than a battle frame holds) halves that (settings.ini can override).
-        ParallelGS::set_minimum_primitives_for_flush(ps2settings::get().gpuFlushPrimitives > 0
-                                                         ? static_cast<uint32_t>(ps2settings::get().gpuFlushPrimitives)
-                                                         : 65536u);
+        // How often queued drawing goes to the GPU: chosen once a frame by updateBatchPolicyLocked
+        // (settings.ini gpu_flush_primitives fixes it).
+        g_batch = BatchPolicy{};
+        updateBatchPolicyLocked(s);
         setFeedBatching(ps2settings::get().gpuFeedBatch != 0);
         // Replacement textures (textures\font_atlas.png): the renderer samples them instead of the
         // game's own, picking the mip level that fits each letter's size on screen.
@@ -526,6 +578,7 @@ namespace ps2gpu
             uint32_t path = 0;
             std::vector<uint8_t> bytes;
             Scanout scanout{};
+            std::function<void()> task; // runs in order instead (an asynchronous GS download)
         };
 
         constexpr size_t kFeedMaxBytes = 32u << 20; // the producer waits beyond this much data
@@ -562,6 +615,7 @@ namespace ps2gpu
         {
             t_onFeedThread = true;
             ps2perf::registerThread("GS feed thread");
+            ps2host::raiseThisThread();
             std::deque<FeedItem> batch;
             for (;;)
             {
@@ -582,7 +636,12 @@ namespace ps2gpu
                 }
                 for (FeedItem &item : batch)
                 {
-                    if (item.vsync)
+                    if (item.task)
+                    {
+                        item.task();
+                        item.task = nullptr;
+                    }
+                    else if (item.vsync)
                         vsyncNow(item.scanout);
                     else
                         gifTransferNow(item.path, item.bytes.data(), item.bytes.size());
@@ -835,6 +894,7 @@ namespace ps2gpu
             std::fprintf(stderr, "[gpu] internal resolution: %ux super-sampling\n", s.superSampling);
         }
 
+        updateBatchPolicyLocked(s);
         copyPrivRegistersLocked(s, scanout);
         const uint32_t field = static_cast<uint32_t>((scanout.csr >> 13) & 1u);
         // Buffer identity for the flip counter: the circuit that is shown (this game uses circuit 2 only).
@@ -989,11 +1049,12 @@ namespace ps2gpu
         collectReadbacksLocked(s);
         static const bool noReadback = std::getenv("PS2X_GPU_NO_READBACK") != nullptr;
         if (result.image && !noReadback)
-            queueReadbackLocked(s, result, displayFbp);
+            queueReadbackLocked(s, result, displayFbp, scanout.tick);
     }
     }
 
-    bool takeFrame(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &displayFbp, bool &rawBgra)
+    bool takeFrame(std::vector<uint8_t> &pixels, uint32_t &width, uint32_t &height, uint32_t &displayFbp, bool &rawBgra,
+                   uint64_t &tick)
     {
         State &s = st();
         std::lock_guard<ps2sync::Mutex> lock(s.frameMutex);
@@ -1003,6 +1064,7 @@ namespace ps2gpu
         width = s.frameWidth;
         height = s.frameHeight;
         displayFbp = s.frameFbp;
+        tick = s.frameTick;
         rawBgra = s.frameRawBgra;
         s.frameFresh = false;
         return true;
@@ -1023,17 +1085,44 @@ namespace ps2gpu
         return active() ? g_currentSuperSampling.load() : 1u;
     }
 
+    bool readLocalToHostAsync(uint32_t bytes, std::function<void(const uint8_t *, uint32_t)> done)
+    {
+        if (bytes < 16u || bytes > 4096u || !active() || !feedQueues())
+            return false;
+        FeedItem item;
+        item.task = [bytes, done = std::move(done)]()
+        {
+            uint8_t data[4096];
+            uint32_t got = 0;
+            {
+                State &s = st();
+                std::lock_guard<ps2sync::Mutex> lock(s.mutex);
+                registerThreadLocked(s);
+                const uint32_t words = bytes / 16u;
+                s.iface.read_transfer_fifo(data, words);
+                got = words * 16u;
+            }
+            done(data, got);
+        };
+        enqueueFeed(std::move(item));
+        return true;
+    }
+
     uint32_t readLocalToHost(uint8_t *dst, uint32_t bytes)
     {
         if (!dst || bytes < 16u || !active())
             return 0u;
         ps2perf::Scope scope(ps2perf::GpuSync); // downloads are counted where they start (VIF1_STAT.FDR)
+        const auto start = std::chrono::steady_clock::now();
         drainFeed(); // the transfer set-up may still be on its way to paraLLEl-GS
         State &s = st();
         std::lock_guard<ps2sync::Mutex> lock(s.mutex);
         registerThreadLocked(s);
         const uint32_t words = bytes / 16u;
         s.iface.read_transfer_fifo(dst, words);
+        g_syncWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - start).count()),
+                               std::memory_order_relaxed);
         return words * 16u;
     }
 
@@ -1136,11 +1225,12 @@ namespace ps2gpu
     void writeRegister(uint8_t, uint64_t) {}
     Scanout captureScanout(const GSRegisters &) { return Scanout{}; }
     void vsync(const Scanout &) {}
-    bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, uint32_t &, bool &) { return false; }
+    bool takeFrame(std::vector<uint8_t> &, uint32_t &, uint32_t &, uint32_t &, bool &, uint64_t &) { return false; }
     void setRawBgraFrames(bool) noexcept {}
     void kickFeed() noexcept {}
     void setFeedBatching(bool) noexcept {}
     uint32_t readLocalToHost(uint8_t *, uint32_t) { return 0u; }
+    bool readLocalToHostAsync(uint32_t, std::function<void(const uint8_t *, uint32_t)>) { return false; }
     void drainFeed() {}
     void requestSuperSampling(uint32_t) noexcept {}
     uint32_t currentSuperSampling() noexcept { return 1u; }

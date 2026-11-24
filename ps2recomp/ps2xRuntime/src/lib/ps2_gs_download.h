@@ -7,3 +7,5 @@
 #include <functional>
 
 void ps2SetGsDownloadSource(std::function<uint32_t(uint8_t *dst, uint32_t bytes)> source);
+// Small downloads repeated every frame answered from the frame before (see ps2_memory.cpp).
+void ps2SetGsDownloadPrediction(bool enabled);

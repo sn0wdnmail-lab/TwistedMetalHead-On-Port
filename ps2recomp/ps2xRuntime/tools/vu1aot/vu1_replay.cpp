@@ -105,6 +105,7 @@ namespace
     // One interpreter per code image, reused like the game's VU1 (decode cache, compiled-program
     // lookup and flag scan stay warm).
     std::map<uint64_t, std::unique_ptr<VU1Interpreter>> g_units[2];
+    uint64_t g_coreNs = 0; // time inside the VU core only (no copying of memories)
 
     void execute(PS2Memory &memory, GS &gs, const std::vector<uint8_t> &code, const Run &run, Outcome &out)
     {
@@ -121,6 +122,7 @@ namespace
         out.gif.clear();
         Vu1Aot::setGifCapture(vu, &out.gif, false);
         const uint64_t start = Vu1Aot::cycle(vu);
+        const auto coreStart = std::chrono::steady_clock::now();
         if (run.resume)
         {
             // MSCNT: continue from the recorded state with a drained pipeline.
@@ -130,6 +132,7 @@ namespace
         }
         else
             vu.execute(vuCode, size, vuData, size, gs, &memory, run.startPc, run.top, run.itop, run.maxCycles);
+        g_coreNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - coreStart).count());
         out.cycles = Vu1Aot::cycle(vu) - start;
         out.state = vu.state();
         out.data.assign(vuData, vuData + size);
@@ -340,14 +343,16 @@ int main(int argc, char **argv)
                 out.data.assign(vuData, vuData + run.size);
             }
         const double setup = std::chrono::duration<double>(std::chrono::steady_clock::now() - s0).count();
+        g_coreNs = 0;
         const auto t0 = std::chrono::steady_clock::now();
         for (int r = 0; r < repeat; ++r)
             for (const Run &run : runs)
                 execute(memory, gs, codes[run.hash], run, out);
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - setup;
         const double cycles = static_cast<double>(totalCycles) * repeat;
-        std::printf("%s: %.3f s (setup %.3f s excluded) for %.2fM VU cycles = %.2f ns per VU cycle\n",
-                    core ? "compiled   " : "interpreter", seconds, setup, cycles / 1e6, seconds * 1e9 / cycles);
+        std::printf("%s: %.3f s (setup %.3f s excluded) for %.2fM VU cycles = %.2f ns per VU cycle; core alone %.3f ns per VU cycle\n",
+                    core ? "compiled   " : "interpreter", seconds, setup, cycles / 1e6, seconds * 1e9 / cycles,
+                    static_cast<double>(g_coreNs) / cycles);
     }
     return failures[0] + failures[1] == 0 ? 0 : 1;
 }
