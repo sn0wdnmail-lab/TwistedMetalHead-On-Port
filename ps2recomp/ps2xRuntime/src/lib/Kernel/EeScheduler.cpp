@@ -1937,9 +1937,11 @@ void EeScheduler::waitWhilePaused()
 {
     if (!ps2settings::emulationPaused())
         return;
-    ps2perf::Scope perfScope(ps2perf::IdleWait);
     while (ps2settings::emulationPaused() && !m_stopRequested.load(std::memory_order_acquire))
     {
+        // A scope per wait, so the performance log counts the pause as idle time as it passes
+        // (one long scope landed all of it in the report after the pause, as "idle 6000 ms/s").
+        ps2perf::Scope perfScope(ps2perf::IdleWait);
         std::unique_lock lock(m_eventMutex);
         m_eventCv.wait_for(lock, std::chrono::milliseconds(10));
     }

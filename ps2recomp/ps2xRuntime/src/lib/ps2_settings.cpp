@@ -3,6 +3,8 @@
 // and mouse control. Settings persist in settings.ini next to the executable's working directory.
 
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_host_wait.h"
+#include "ps2x/iop/iop_audio.h"
 #include "tmho_game.h"
 #include "ps2_movie_state.h"
 #include "runtime/gs/gs_gpu_renderer.h"
@@ -163,7 +165,20 @@ namespace ps2settings
             out << "aspect=" << s.aspect << "\n";
             out << "filter=" << s.filter << "\n";
             out << "vsync=" << (s.vsync ? 1 : 0) << "\n";
+            out << "# brightness: percent, 100 = the game's own picture (a gamma curve: dark areas lighten most)\n";
+            out << "brightness=" << s.brightness << "\n";
             out << "show_fps=" << (s.showFps ? 1 : 0) << "\n";
+            out << "skip_intro=" << (s.skipIntro ? 1 : 0) << "\n";
+            out << "vibration=" << (s.vibration ? 1 : 0) << "\n";
+            out << "pause_on_controller_loss=" << (s.pauseOnPadLoss ? 1 : 0) << "\n";
+            if (s.windowW > 0 && s.windowH > 0)
+            {
+                out << "# where the window was left in windowed mode\n";
+                out << "window_x=" << s.windowX << "\n";
+                out << "window_y=" << s.windowY << "\n";
+                out << "window_w=" << s.windowW << "\n";
+                out << "window_h=" << s.windowH << "\n";
+            }
             out << "record_frames=" << (s.recordFrames ? 1 : 0) << "\n";
             out << "fov=" << s.fovDegrees << "\n";
             out << "camera_distance=" << s.cameraDistance << "\n";
@@ -190,6 +205,9 @@ namespace ps2settings
             if (s.gsDownloadPrediction != 1)
                 out << "gs_download_prediction=" << s.gsDownloadPrediction << "\n";
             out << "master_volume=" << s.masterVolume << "\n";
+            out << "music_volume=" << s.musicVolume << "\n";
+            out << "effects_volume=" << s.effectsVolume << "\n";
+            out << "movie_volume=" << s.movieVolume << "\n";
             out << "mute_unfocused=" << (s.muteUnfocused ? 1 : 0) << "\n";
             out << "pause_in_menu=" << (s.pauseInMenu ? 1 : 0) << "\n";
             out << "pause_unfocused=" << (s.pauseUnfocused ? 1 : 0) << "\n";
@@ -257,6 +275,17 @@ namespace ps2settings
                 else if (key == "audio_dump") s.audioDump = std::clamp(number, 0, 1);
                 else if (key == "gs_download_prediction") s.gsDownloadPrediction = std::clamp(number, 0, 1);
                 else if (key == "master_volume") s.masterVolume = std::clamp(number, 0, 100);
+                else if (key == "music_volume") s.musicVolume = std::clamp(number, 0, 100);
+                else if (key == "effects_volume") s.effectsVolume = std::clamp(number, 0, 100);
+                else if (key == "movie_volume") s.movieVolume = std::clamp(number, 0, 100);
+                else if (key == "brightness") s.brightness = std::clamp(number, 70, 150);
+                else if (key == "skip_intro") s.skipIntro = number != 0;
+                else if (key == "vibration") s.vibration = number != 0;
+                else if (key == "pause_on_controller_loss") s.pauseOnPadLoss = number != 0;
+                else if (key == "window_x") s.windowX = std::clamp(number, -32000, 32000);
+                else if (key == "window_y") s.windowY = std::clamp(number, -32000, 32000);
+                else if (key == "window_w") s.windowW = std::clamp(number, 0, 16384);
+                else if (key == "window_h") s.windowH = std::clamp(number, 0, 16384);
                 else if (key == "mute_unfocused") s.muteUnfocused = number != 0;
                 else if (key == "pause_in_menu") s.pauseInMenu = number != 0;
                 else if (key == "pause_unfocused") s.pauseUnfocused = number != 0;
@@ -321,6 +350,32 @@ namespace ps2settings
             }
         }
 
+        // Windowed mode: the size and place the window was left at (saved in settings.ini), if
+        // it still fits on a connected monitor; otherwise the resolution's size, centred.
+        void placeWindowed()
+        {
+            Settings &s = g_settings;
+            if (s.windowW > 0 && s.windowH > 0)
+            {
+                const int cx = s.windowX + s.windowW / 2, cy = s.windowY + s.windowH / 2;
+                for (int m = 0; m < GetMonitorCount(); ++m)
+                {
+                    const Vector2 origin = GetMonitorPosition(m);
+                    if (cx >= origin.x && cy >= origin.y && cx < origin.x + GetMonitorWidth(m) && cy < origin.y + GetMonitorHeight(m) &&
+                        s.windowW <= GetMonitorWidth(m) && s.windowH <= GetMonitorHeight(m))
+                    {
+                        SetWindowSize(s.windowW, s.windowH);
+                        SetWindowPosition(s.windowX, s.windowY);
+                        return;
+                    }
+                }
+            }
+            int width = 0, height = 0;
+            windowedSize(width, height);
+            SetWindowSize(width, height);
+            centerWindow(width, height);
+        }
+
         int g_appliedResolution = -1;
 
         // Windowed: a window the size of the chosen resolution. Borderless and full screen: the
@@ -334,10 +389,17 @@ namespace ps2settings
                 return;
             if (s.windowMode == g_appliedWindowMode)
             {
-                int width = 0, height = 0;
-                windowedSize(width, height);
-                SetWindowSize(width, height);
-                centerWindow(width, height);
+                // First placement at start: where the window was left. A resolution or aspect
+                // change in this menu: that resolution's size, centred.
+                if (g_appliedResolution < 0)
+                    placeWindowed();
+                else
+                {
+                    int width = 0, height = 0;
+                    windowedSize(width, height);
+                    SetWindowSize(width, height);
+                    centerWindow(width, height);
+                }
                 g_appliedResolution = s.resolution;
                 g_appliedAspectForWindow = s.aspect;
                 return;
@@ -354,10 +416,7 @@ namespace ps2settings
                 ClearWindowState(FLAG_WINDOW_UNDECORATED); // set below for full screen
             if (s.windowMode == 0)
             {
-                int width = 0, height = 0;
-                windowedSize(width, height);
-                SetWindowSize(width, height);
-                centerWindow(width, height);
+                placeWindowed();
             }
             else if (s.windowMode == 1)
             {
@@ -440,6 +499,17 @@ namespace ps2settings
             {
                 SetMasterVolume(volume);
                 applied = volume;
+            }
+            // Music / effects / movie volumes, in the SPU2's mix.
+            static int appliedEffects = -1, appliedMusic = -1, appliedMovie = -1;
+            if (g_settings.effectsVolume != appliedEffects || g_settings.musicVolume != appliedMusic || g_settings.movieVolume != appliedMovie)
+            {
+                appliedEffects = g_settings.effectsVolume;
+                appliedMusic = g_settings.musicVolume;
+                appliedMovie = g_settings.movieVolume;
+                // A squared curve, so the slider feels even to the ear.
+                auto q15 = [](int percent) { return static_cast<int32_t>(std::lround(std::pow(percent / 100.0, 2.0) * 32768.0)); };
+                ps2x::iop::setMixVolumes(q15(appliedEffects), q15(appliedMusic), q15(appliedMovie));
             }
         }
 
@@ -566,6 +636,7 @@ namespace ps2settings
         std::atomic<double> g_hudStepUntil{0.0};
         void stepHudFrames() { g_hudStepUntil.store(GetTime() + 0.15, std::memory_order_relaxed); }
         bool g_hudDirty = false;           // layout changed since the last save
+        bool g_pausedForPadLoss = false;   // the menu opened because the controller went away: paused until it closes
         Texture2D g_hudPreview{};          // the last battle's picture, when no battle is running
         bool g_hudPreviewLive = false;     // the game picture behind the editor shows the HUD now
         void openHudEditor();
@@ -619,6 +690,15 @@ namespace ps2settings
                          RowKind::Choice, [&s] { return s.frameRate; }, [&s, changed](int v) { s.frameRate = v; changed(); },
                          {"60 fps", "120 fps", monitorRate}};
                 rows.push_back(rate);
+                Row brightness{"Brightness",
+                               "Lightens or darkens the picture. Dark parts of the picture change most, so night arenas get easier to see "
+                               "without washing out bright explosions. 100% is the game's own picture.",
+                               RowKind::Slider, [&s] { return s.brightness; }, [&s, changed](int v) { s.brightness = v; changed(); }};
+                brightness.minimum = 70;
+                brightness.maximum = 150;
+                brightness.step = 5;
+                brightness.suffix = "%";
+                rows.push_back(brightness);
             }
             else if (tab == 1)
             {
@@ -632,14 +712,27 @@ namespace ps2settings
                 Row mute{"Mute in background", "Silences the game while its window is not focused.", RowKind::Toggle,
                          [&s] { return s.muteUnfocused ? 1 : 0; }, [&s, changed](int v) { s.muteUnfocused = v != 0; changed(); }};
                 rows.push_back(mute);
-                for (const char *name : {"Music volume", "Effects volume", "Movie volume"})
+                struct Part
                 {
-                    Row part{name, "Separate volumes need the per-voice mixer, which is being built.", RowKind::Slider,
-                             [] { return 100; }, [](int) {}};
-                    part.suffix = "%";
-                    part.enabled = [] { return false; };
-                    part.disabledNote = "Coming soon";
-                    rows.push_back(part);
+                    const char *name;
+                    const char *help;
+                    int Settings::*field;
+                };
+                static const Part kParts[] = {
+                    {"Music volume", "The music in menus and battles.", &Settings::musicVolume},
+                    {"Effects volume", "Engines, weapons, explosions, pickups, menu sounds and the announcer.", &Settings::effectsVolume},
+                    {"Movie volume", "The sound of the intro and ending movies.", &Settings::movieVolume},
+                };
+                for (const Part &part : kParts)
+                {
+                    const auto field = part.field;
+                    Row row{part.name, part.help, RowKind::Slider, [&s, field] { return s.*field; },
+                            [&s, field, changed](int v) { s.*field = v; changed(); }};
+                    row.minimum = 0;
+                    row.maximum = 100;
+                    row.step = 5;
+                    row.suffix = "%";
+                    rows.push_back(row);
                 }
             }
             else if (tab == 2)
@@ -653,6 +746,15 @@ namespace ps2settings
                 Row fps{"FPS counter", "Shows FPS in the corner: pictures on screen per second (with in-between frames on, those count too).", RowKind::Toggle,
                         [&s] { return s.showFps ? 1 : 0; }, [&s, changed](int v) { s.showFps = v != 0; changed(); }};
                 rows.push_back(fps);
+                Row skip{"Skip intro movies", "Skips the logo movies and the intro movie when the game starts, straight to the menus. The intro can still be watched from the game's own menus.",
+                         RowKind::Toggle, [&s] { return s.skipIntro ? 1 : 0; }, [&s, changed](int v) { s.skipIntro = v != 0; changed(); }};
+                rows.push_back(skip);
+                Row rumble{"Controller vibration", "Lets the game rumble your controller (Xbox and other XInput controllers) when you hit or get hit, as on the PS2.",
+                           RowKind::Toggle, [&s] { return s.vibration ? 1 : 0; }, [&s, changed](int v) { s.vibration = v != 0; changed(); }};
+                rows.push_back(rumble);
+                Row padLoss{"Pause on controller loss", "Opens this menu and pauses the game when the controller you are playing with disconnects (a flat battery, a pulled cable).",
+                            RowKind::Toggle, [&s] { return s.pauseOnPadLoss ? 1 : 0; }, [&s, changed](int v) { s.pauseOnPadLoss = v != 0; changed(); }};
+                rows.push_back(padLoss);
                 Row record{"Record screenshots", "Saves a picture of the game every half second in Logs\\frames, for bug reports. About 6 MB a minute; pictures older than 10 minutes are deleted.",
                            RowKind::Toggle, [&s] { return s.recordFrames ? 1 : 0; }, [&s, changed](int v) { s.recordFrames = v != 0; changed(); }};
                 rows.push_back(record);
@@ -1707,16 +1809,90 @@ namespace ps2settings
         applyVolume();
     }
 
+    void applyVibration();
+
+    // Windowed mode: notes where the window is left (moved or resized), saved once it has stayed
+    // put for a second.
+    void rememberWindowPlacement()
+    {
+        Settings &s = g_settings;
+        if (s.windowMode != 0 || g_appliedWindowMode != 0 || IsWindowFullscreen() || IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) ||
+            IsWindowMinimized() || IsWindowMaximized())
+            return;
+        const Vector2 pos = GetWindowPosition();
+        const int x = static_cast<int>(pos.x), y = static_cast<int>(pos.y);
+        const int w = GetScreenWidth(), h = GetScreenHeight();
+        static double changedAt = -1.0;
+        if (x != s.windowX || y != s.windowY || w != s.windowW || h != s.windowH)
+        {
+            s.windowX = x;
+            s.windowY = y;
+            s.windowW = w;
+            s.windowH = h;
+            changedAt = GetTime();
+        }
+        else if (changedAt >= 0.0 && GetTime() - changedAt > 1.0)
+        {
+            changedAt = -1.0;
+            save();
+        }
+    }
+
+    // Opens F2 from a controller: the Guide / PS button, or both sticks pressed in together.
+    bool padMenuButton()
+    {
+        if (padPressed(GAMEPAD_BUTTON_MIDDLE))
+            return true;
+        for (int pad = 0; pad < 4; ++pad)
+        {
+            if (!IsGamepadAvailable(pad))
+                continue;
+            const bool l3 = IsGamepadButtonDown(pad, GAMEPAD_BUTTON_LEFT_THUMB), r3 = IsGamepadButtonDown(pad, GAMEPAD_BUTTON_RIGHT_THUMB);
+            if (l3 && r3 && (IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_LEFT_THUMB) || IsGamepadButtonPressed(pad, GAMEPAD_BUTTON_RIGHT_THUMB)))
+                return true;
+        }
+        return false;
+    }
+
+    // True once when the controller that was being played with goes away.
+    bool controllerLost()
+    {
+        static bool had = false;
+        static double usedAt = -1000.0;
+        const bool now = IsGamepadAvailable(0);
+        if (now)
+        {
+            for (int b = GAMEPAD_BUTTON_LEFT_FACE_UP; b <= GAMEPAD_BUTTON_RIGHT_THUMB; ++b)
+                if (IsGamepadButtonDown(0, b))
+                    usedAt = GetTime();
+            for (int a = 0; a < 2; ++a)
+                if (std::fabs(GetGamepadAxisMovement(0, a)) > 0.3f)
+                    usedAt = GetTime();
+        }
+        const bool lost = had && !now && GetTime() - usedAt < 120.0;
+        had = now;
+        return lost;
+    }
+
     void update(Texture2D *frameTexture)
     {
         g_frameTexture = frameTexture;
         installTapCapture();
         latchTaps();
+        rememberWindowPlacement();
         if (keyTap(KEY_F11) || g_altEnterThisFrame)
             toggleFullscreen();
         if (keyTap(KEY_F12))
             ps2capture::requestScreenshot();
-        if (keyTap(KEY_F2))
+        if (controllerLost() && g_settings.pauseOnPadLoss && !g_menuOpen.load(std::memory_order_relaxed))
+        {
+            g_menuOpen.store(true, std::memory_order_relaxed);
+            g_pausedForPadLoss = true;
+            loadFonts();
+            g_hudLiveAtOpen = tmho::hudShownRecently(1.0);
+            notify("Controller disconnected - the game is paused. Reconnect it and press B / Esc to carry on.");
+        }
+        if (keyTap(KEY_F2) || padMenuButton())
         {
             const bool open = !g_menuOpen.load(std::memory_order_relaxed);
             g_menuOpen.store(open, std::memory_order_relaxed);
@@ -1743,7 +1919,9 @@ namespace ps2settings
         // game draws its HUD in the new place.
         const bool stepping = GetTime() < g_hudStepUntil.load(std::memory_order_relaxed);
         const bool inBackground = g_settings.pauseUnfocused && !IsWindowFocused();
-        g_paused.store((g_menuOpen.load(std::memory_order_relaxed) && g_settings.pauseInMenu && !stepping) || inBackground,
+        if (!g_menuOpen.load(std::memory_order_relaxed))
+            g_pausedForPadLoss = false;
+        g_paused.store((g_menuOpen.load(std::memory_order_relaxed) && (g_settings.pauseInMenu || g_pausedForPadLoss) && !stepping) || inBackground,
                        std::memory_order_relaxed);
 
         applyWindowMode();
@@ -1751,6 +1929,7 @@ namespace ps2settings
         applyFilter();
         applyVolume();
         applyInternalResolution();
+        applyVibration();
     }
 
     void pictureTargetSize(int screenWidth, int screenHeight, int &outWidth, int &outHeight)
@@ -1826,6 +2005,43 @@ namespace ps2settings
     bool compositorSync() noexcept
     {
         return g_compositorSync;
+    }
+
+    namespace
+    {
+        std::atomic<uint32_t> g_wantedVibration{0}; // bit 8: small motor, bits 0-7: large motor
+    }
+
+    void setWantedVibration(bool smallMotor, uint8_t largeMotor) noexcept
+    {
+        g_wantedVibration.store((smallMotor ? 0x100u : 0u) | largeMotor, std::memory_order_relaxed);
+    }
+
+    // Window thread, each frame: what the controller should do now.
+    void applyVibration()
+    {
+        const uint32_t wanted = g_wantedVibration.load(std::memory_order_relaxed);
+        // Only with a controller plugged in: with none, XInput is not asked at all (looking for
+        // controllers in empty slots is slow).
+        const bool allowed = g_settings.vibration && IsGamepadAvailable(0) && !g_paused.load(std::memory_order_relaxed) &&
+                             !g_menuOpen.load(std::memory_order_relaxed) && IsWindowFocused();
+        const uint32_t effective = allowed ? wanted : 0u;
+        static uint32_t applied = 0u;
+        static double appliedAt = -1.0;
+        // Sent again now and then while running, in case the controller was plugged in meanwhile.
+        if (effective != applied || (effective != 0u && GetTime() - appliedAt > 1.0))
+        {
+            static bool exitHook = false;
+            if (!exitHook && effective != 0u)
+            {
+                exitHook = true;
+                std::atexit([] { ps2host::setPadVibration(0.0f, 0.0f); });
+            }
+            const float large = static_cast<float>(effective & 0xFFu) / 255.0f;
+            ps2host::setPadVibration(large, (effective & 0x100u) ? 1.0f : 0.0f);
+            applied = effective;
+            appliedAt = GetTime();
+        }
     }
 
     void notify(const char *text) noexcept

@@ -28,4 +28,9 @@ namespace ps2host
     // For the threads that run the game (game, VU1, GS feed, window): slightly above normal
     // priority and never power-throttled, so other programs cannot delay a frame.
     void raiseThisThread() noexcept;
+
+    // Controller vibration through XInput (Xbox and other XInput controllers; Windows only, a
+    // no-op elsewhere), on the first connected controller. left: the large low-frequency motor,
+    // right: the small high-frequency one, each 0..1. Window thread.
+    void setPadVibration(float left, float right) noexcept;
 }

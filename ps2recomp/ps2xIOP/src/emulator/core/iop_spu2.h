@@ -63,6 +63,8 @@ namespace ps2x::iop::detail
             int phase = 0; // 0 off, 1 attack, 2 decay, 3 sustain, 4 release
             int32_t envelope = 0;
             int32_t envelopeWait = 0;
+            uint32_t keyOnStamp = 0; // m_sampleCount at key on
+            bool streaming = false;  // plays sound RAM written after its key on: a stream (music)
         };
 
         struct Core
@@ -92,6 +94,12 @@ namespace ps2x::iop::detail
         void mixSample(int16_t &outLeft, int16_t &outRight);
         static int32_t sweep(Sweep &state, uint16_t raw);
 
+        // When each 512-byte block of sound RAM was last written (m_sampleCount), to tell
+        // streamed voices (refilled while they play: music) from the sound effects.
+        static constexpr uint32_t kStampShift = 8u; // halfwords per block: 256
+        void stampWrite(uint32_t start, uint32_t halfwords);
+        std::vector<uint32_t> m_blockWriteStamp;
+        uint32_t m_sampleCount = 1;
         std::vector<uint16_t> m_ram;
         std::array<uint16_t, RegisterSize / 2> m_regs{};
         std::array<Core, 2> m_cores{};

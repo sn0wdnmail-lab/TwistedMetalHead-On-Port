@@ -14,6 +14,9 @@ struct Rectangle;
 
 namespace ps2settings
 {
+    // This port's version, shown on the setup screen and in the window title.
+    inline constexpr const char *kPortVersion = "V8";
+
     struct Settings
     {
         int windowMode = 0;     // 0 windowed, 1 borderless fullscreen, 2 exclusive fullscreen
@@ -51,6 +54,16 @@ namespace ps2settings
         int gpuFeedBatch = 1;       // tuning (hidden): wake the GS feed thread per batch of packets (0 = per packet)
         int audioDump = 0;          // testing (hidden): write the SPU2 mix and the sound card's audio to Logs\audio_*.raw
         int gsDownloadPrediction = 1; // tuning (hidden): answer small per-frame GS downloads from the frame before
+        // V8
+        int brightness = 100;       // picture brightness in percent (70..150): a gamma curve, 100 = the game's own
+        int musicVolume = 100;      // 0..100: the SPU2's sound data input (streamed music) outside movies
+        int effectsVolume = 100;    // 0..100: the SPU2's voices (engines, guns, explosions, voices)
+        int movieVolume = 100;      // 0..100: the sound data input while a movie plays
+        bool skipIntro = true;      // skip the logo movies and the intro movie at start
+        bool vibration = true;      // controller vibration (rumble) when the game asks for it
+        bool pauseOnPadLoss = true; // pause (open this menu) when the controller in use disconnects
+        int windowX = -1, windowY = -1; // windowed mode: where the window was left (-1 = centred)
+        int windowW = 0, windowH = 0;   // windowed mode: its size (0 = from the resolution)
     };
 
     // Lines of each picture resolution (F2 > Video > Resolution).
@@ -116,4 +129,10 @@ namespace ps2settings
     // A short message at the top of the window for a few seconds ("Screenshot saved: ...").
     // Window thread.
     void notify(const char *text) noexcept;
+
+    // Controller vibration the game asks for (libpad's actuators; game thread): the small motor
+    // on or off and the large motor's speed. The window thread passes it to the controller each
+    // frame, and stops it while the game is paused, this menu is open, the window is in the
+    // background or F2 > Game > Controller vibration is off.
+    void setWantedVibration(bool smallMotor, uint8_t largeMotor) noexcept;
 }

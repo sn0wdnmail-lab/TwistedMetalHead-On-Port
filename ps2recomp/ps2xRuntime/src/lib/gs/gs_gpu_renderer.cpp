@@ -91,6 +91,7 @@ namespace ps2gpu
         // shadercache.bin: a Vulkan pipeline cache with Granite's header (GPU UUID + hash), so a
         // cache from another graphics card or driver is ignored and rebuilt.
         size_t g_shaderCacheLoaded = 0; // bytes read at start: the game only writes the file back when it grew
+        std::atomic<uint32_t> g_stalledCompiles{0}; // shaders compiled while the game waited this session
 
         bool loadShaderCache(Device &device)
         {
@@ -120,8 +121,15 @@ namespace ps2gpu
             const size_t size = device.get_pipeline_cache_size();
             if (size == 0)
                 return false;
-            if (onlyIfGrown && size <= g_shaderCacheLoaded)
+            // Shaders compiled during play go into the file even when the driver's cache data
+            // did not grow in size, so the next start has them.
+            const uint32_t compiled = g_stalledCompiles.load(std::memory_order_relaxed);
+            if (onlyIfGrown && size <= g_shaderCacheLoaded && compiled == 0u)
                 return true; // no new shaders this run
+            if (onlyIfGrown)
+                std::fprintf(stderr, "[gpu] shader cache: %.1f MB written at quit (was %.1f MB; %u shaders compiled during play)\n",
+                             static_cast<double>(size) / (1024.0 * 1024.0), static_cast<double>(g_shaderCacheLoaded) / (1024.0 * 1024.0),
+                             compiled);
             std::vector<uint8_t> data(size);
             if (!device.get_pipeline_cache_data(data.data(), size))
                 return false;
@@ -152,6 +160,8 @@ namespace ps2gpu
                     text[--length] = '\0';
                 std::fprintf(stderr, "%s%s\n", tag ? tag : "", text);
                 ps2perf::graphicsNote("Vulkan %s%s", tag ? tag : "", text);
+                if (std::strstr(text, "Stalled compile"))
+                    g_stalledCompiles.fetch_add(1u, std::memory_order_relaxed);
                 return true;
             }
         };

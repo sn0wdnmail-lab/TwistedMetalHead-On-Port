@@ -31,6 +31,11 @@ namespace ps2x::iop
     };
     AudioStats audioStats() noexcept;
 
+    // Mix volumes in Q15 (32768 = as the game set it): the sound effects (the SPU2's voices:
+    // engines, weapons, explosions, the announcer), the music (voices the sound driver refills
+    // while they play: streams) and the movies' sound (the AutoDMA sound data input). Any thread.
+    void setMixVolumes(int32_t effectsQ15, int32_t musicQ15, int32_t movieQ15) noexcept;
+
     // ---- IOP thread: the I/O processor (sound driver, disc and memory card modules) runs on a
     // thread of its own, a little behind the game, and is caught up whenever the game talks to it.
     // Set before the game starts (settings iop_thread; PS2X_IOP_THREAD=0 also turns it off).

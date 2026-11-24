@@ -1102,6 +1102,7 @@ namespace ps2perf
             uint64_t slowFrames = 0;
             double startSeconds = 0.0;
             uint64_t pausedIntervals = 0; // F2 drawer paused the game: left out of the averages
+            uint64_t minimizedIntervals = 0; // window minimized (nothing drawn): left out as well
         };
         Session g_session;
         std::atomic<bool> g_shutdown{false};
@@ -1294,8 +1295,10 @@ namespace ps2perf
                         std::snprintf(line, sizeof(line), "[watchdog]   VU1 thread: idle (waiting for work)");
                     watchdogLine(line);
 #if defined(_WIN32)
-                    const char *const names[3] = {"game", "VU1", "window"};
-                    for (int i = 0; i < 3; ++i)
+                    // Not the window thread: it is the one waiting for the others to stop, and
+                    // reading its stack while it sits in Windows' own window code ended the game.
+                    const char *const names[2] = {"game", "VU1"};
+                    for (int i = 0; i < 2; ++i)
                         if (g_watchHandles[i])
                             watchdogLine(std::string("[watchdog]   ") + names[i] + " thread is in: " + stackOf(i));
 #endif
@@ -1336,11 +1339,14 @@ namespace ps2perf
                     std::snprintf(line, sizeof(line), "[watchdog]   VU1 thread: idle (waiting for work)");
                 watchdogLine(line);
                 std::snprintf(line, sizeof(line), "[watchdog]   window thread: last frame %.1f s ago%s", ago(window),
-                              windowStuck ? "  <-- STUCK (normal while the window is minimized)" : "");
+                              windowStuck ? "  <-- STUCK (normal while the window is being moved or resized)" : "");
                 watchdogLine(line);
 #if defined(_WIN32)
-                const char *const names[3] = {"game", "VU1", "window"};
-                for (int i = 0; i < 3; ++i)
+                // The game and VU1 threads only. The window thread stops in Windows' own window code
+                // while the window is dragged, resized or its title bar is held, and reading its call
+                // stack there ended the whole game (V7.2: minimized for over 5 seconds).
+                const char *const names[2] = {"game", "VU1"};
+                for (int i = 0; i < 2; ++i)
                 {
                     if (!g_watchHandles[i])
                         continue;
@@ -1901,6 +1907,8 @@ namespace ps2perf
         std::atomic<const uint8_t *> g_tickRdram{nullptr};
         std::atomic<uint64_t> g_framesThisInterval{0};
         std::atomic<uint64_t> g_pausedFrames{0};
+        std::atomic<uint64_t> g_minimizedLoops{0}; // window loops spent minimized (this report interval)
+        uint64_t g_lastFrameNs = 0;                 // window thread only
         std::atomic<bool> g_reportThreadStarted{false};
         std::atomic<bool> g_reportThreadRunning{false};
 
@@ -1938,15 +1946,14 @@ namespace ps2perf
         if (!enabled() || g_shutdown)
             return;
 
-        static uint64_t lastFrameNs = 0;
-        if (lastFrameNs != 0u)
+        if (g_lastFrameNs != 0u)
         {
-            const uint64_t frameNs = now - lastFrameNs;
+            const uint64_t frameNs = now - g_lastFrameNs;
             countMax(MaxFrameNs, frameNs);
             if (frameNs > 25000000ull)
                 count(SlowFrames);
         }
-        lastFrameNs = now;
+        g_lastFrameNs = now;
         count(MainFrames);
         // Frames shown while the F2 drawer had the game paused (this report interval).
         g_framesThisInterval.fetch_add(1u, std::memory_order_relaxed);
@@ -1966,6 +1973,19 @@ namespace ps2perf
                 g_reportThreadRunning.store(false, std::memory_order_release);
             }
         }
+    }
+
+    void mainThreadIdle(uint64_t eeCycle, const uint8_t *rdram) noexcept
+    {
+        const uint64_t now = nowNs();
+        g_beatWindow.store(now, std::memory_order_relaxed); // waiting on purpose, not stuck
+        updateLiveStats(now, eeCycle);
+        if (!enabled() || g_shutdown)
+            return;
+        g_lastFrameNs = 0; // the first frame after the window comes back is not one long frame
+        g_minimizedLoops.fetch_add(1u, std::memory_order_relaxed);
+        g_tickEeCycle.store(eeCycle, std::memory_order_relaxed);
+        g_tickRdram.store(rdram, std::memory_order_relaxed);
     }
 
     namespace
@@ -1992,6 +2012,7 @@ namespace ps2perf
             return;
         const uint64_t framesThisInterval = g_framesThisInterval.exchange(0u, std::memory_order_relaxed);
         const uint64_t pausedFrames = g_pausedFrames.exchange(0u, std::memory_order_relaxed);
+        const uint64_t minimizedLoops = g_minimizedLoops.exchange(0u, std::memory_order_relaxed);
 
         try
         {
@@ -2118,9 +2139,18 @@ namespace ps2perf
             const double mtvuWaitMs = msPerSecond(buckets[MtvuWait]);
             // Paused by the F2 drawer for any part of it: the game stood still on purpose, so this
             // interval says so and stays out of the session averages (its speed would look low).
-            const bool pausedInterval = pausedFrames != 0u;
+            const bool minimizedInterval = minimizedLoops != 0u;
+            const bool pausedInterval = pausedFrames != 0u || minimizedInterval;
             char verdict[512];
-            if (pausedInterval)
+            if (minimizedInterval)
+            {
+                // Minimized: the game runs on, but nothing is drawn, so the window numbers mean
+                // nothing for this interval.
+                std::snprintf(verdict, sizeof(verdict), framesThisInterval == 0u
+                                                            ? "MINIMIZED - the game keeps running but nothing is drawn (not counted in the averages)"
+                                                            : "MINIMIZED part of the time (not counted in the averages)");
+            }
+            else if (pausedInterval)
             {
                 std::snprintf(verdict, sizeof(verdict), pausedFrames * 10u >= framesThisInterval * 9u
                                                             ? "PAUSED - the F2 settings menu is open or the window is in the background, so the game is stopped (not counted in the averages)"
@@ -2355,7 +2385,11 @@ namespace ps2perf
 
             // ---- session totals (shutdown() reads them from another thread)
             std::lock_guard<std::mutex> sessionLock(g_fileMutex);
-            if (pausedInterval)
+            if (minimizedInterval)
+            {
+                g_session.minimizedIntervals++;
+            }
+            else if (pausedInterval)
             {
                 g_session.pausedIntervals++;
             }
@@ -2431,6 +2465,12 @@ namespace ps2perf
                 {
                     std::snprintf(line, sizeof(line), "   paused in the F2 settings menu for about %llu s (left out of the numbers above)",
                                   static_cast<unsigned long long>(g_session.pausedIntervals * (kReportIntervalNs / 1000000000ull)));
+                    writeLine(g_perfFile, line);
+                }
+                if (g_session.minimizedIntervals != 0u)
+                {
+                    std::snprintf(line, sizeof(line), "   minimized for about %llu s (left out of the numbers above)",
+                                  static_cast<unsigned long long>(g_session.minimizedIntervals * (kReportIntervalNs / 1000000000ull)));
                     writeLine(g_perfFile, line);
                 }
                 writeLine(g_perfFile, "================================================================================");

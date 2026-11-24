@@ -1029,7 +1029,8 @@ bool PS2Runtime::initialize(const char *title)
 #endif
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         SetTraceLogCallback(rayLogToGraphics);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        const std::string versionedTitle = std::string(title ? title : "") + "  (PC port " + ps2settings::kPortVersion + ")";
+        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, versionedTitle.c_str());
         describePresenter();
         if (!ps2gpu::active())
         {
@@ -2933,6 +2934,10 @@ void PS2Runtime::run()
     ps2perf::markMainThread();
     ps2perf::registerThread("window (present + input)");
     ps2host::raiseThisThread();
+    // raylib would otherwise stop this loop inside its event wait for as long as the window is
+    // minimized; the loop below idles on its own then (no drawing, 60 checks a second), so the
+    // F2 settings, controller checks and the freeze watchdog keep going.
+    SetWindowState(FLAG_WINDOW_ALWAYS_RUN);
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -3106,8 +3111,12 @@ void PS2Runtime::run()
         UploadFrame(frameTex, this, presentWidth, presentHeight, uploaded);
         // F2 drawer: toggling, menu input, window mode / V-Sync / scaling filter / volume.
         ps2settings::update(&frameTex);
+        // Minimized: nothing is shown, so the picture is neither scaled nor drawn (the game keeps
+        // running and playing its sound); the window only checks its messages about 60 times a
+        // second until it is restored (FLAG_WINDOW_ALWAYS_RUN keeps raylib from parking here).
+        const bool minimized = IsWindowMinimized();
         // Scales the new picture to the chosen resolution (and finds its motion for in-between frames).
-        if (uploaded.fresh)
+        if (uploaded.fresh && !minimized)
             ps2present::submitFrame(frameTex.id, frameTex.width, frameTex.height, static_cast<int>(presentWidth),
                                     static_cast<int>(presentHeight), ps2settings::frameTextureRawBgra(), uploaded.tick);
         {
@@ -3126,6 +3135,13 @@ void PS2Runtime::run()
         const float screenHeight = static_cast<float>(GetScreenHeight());
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
 
+        if (minimized)
+        {
+            PollInputEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        }
+        else
+        {
         BeginDrawing();
         ClearBackground(BLACK);
         {
@@ -3157,8 +3173,12 @@ void PS2Runtime::run()
             EndDrawing();
             ps2present::afterPresent();
         }
+        }
         ps2perf::setOutputSize(presentWidth, presentHeight, static_cast<uint32_t>(GetScreenWidth()), static_cast<uint32_t>(GetScreenHeight()));
-        ps2perf::mainThreadTick(m_eeScheduler->eeCycleForDiagnostics(), m_memory.getRDRAM());
+        if (minimized)
+            ps2perf::mainThreadIdle(m_eeScheduler->eeCycleForDiagnostics(), m_memory.getRDRAM());
+        else
+            ps2perf::mainThreadTick(m_eeScheduler->eeCycleForDiagnostics(), m_memory.getRDRAM());
 
         // PS2X_SHOT_TIMES=<s1,s2,...>: save the presented frame as shot_<s>.png (in PS2X_SHOT_DIR,
         // default the working directory) at those seconds after start.

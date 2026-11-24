@@ -175,6 +175,10 @@ namespace ps2perf
     // Called by the main thread every frame; writes a report every two seconds.
     // eeCycle: scheduler cycle counter; rdram: guest RAM (for PS2X_PERF_TICK_ADDR).
     void mainThreadTick(uint64_t eeCycle, const uint8_t *rdram) noexcept;
+    // Instead of mainThreadTick while the window is minimized (nothing drawn): keeps the watchdog
+    // and the game-speed numbers going without counting frames; such intervals are left out of
+    // the session averages, like the F2-paused ones.
+    void mainThreadIdle(uint64_t eeCycle, const uint8_t *rdram) noexcept;
 
     // Writes the session summary and closes the log files.
     void shutdown() noexcept;

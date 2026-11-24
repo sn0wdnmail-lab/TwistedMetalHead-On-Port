@@ -1,5 +1,8 @@
 #include "runtime/ps2_host_wait.h"
 
+#include <algorithm>
+#include <cmath>
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -123,6 +126,70 @@ namespace ps2host
             fn(GetCurrentThread(), kThreadPowerThrottling, &state, sizeof(state));
         }
     }
+
+    void setPadVibration(float left, float right) noexcept
+    {
+        struct Vibration
+        {
+            WORD left;
+            WORD right;
+        };
+        struct GamepadState
+        {
+            DWORD packet;
+            WORD buttons;
+            BYTE leftTrigger, rightTrigger;
+            SHORT thumbLX, thumbLY, thumbRX, thumbRY;
+        };
+        using SetStateFn = DWORD(WINAPI *)(DWORD, Vibration *);
+        using GetStateFn = DWORD(WINAPI *)(DWORD, GamepadState *);
+        static SetStateFn setState = nullptr;
+        static GetStateFn getState = nullptr;
+        static bool loaded = false;
+        if (!loaded)
+        {
+            loaded = true;
+            for (const char *dll : {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"})
+            {
+                if (HMODULE module = LoadLibraryA(dll))
+                {
+                    setState = reinterpret_cast<SetStateFn>(reinterpret_cast<void *>(GetProcAddress(module, "XInputSetState")));
+                    getState = reinterpret_cast<GetStateFn>(reinterpret_cast<void *>(GetProcAddress(module, "XInputGetState")));
+                    if (setState && getState)
+                        break;
+                    setState = nullptr;
+                    getState = nullptr;
+                }
+            }
+        }
+        if (!setState || !getState)
+            return;
+        // The first connected controller, looked for again every couple of seconds (and whenever
+        // the one in use stops answering).
+        static DWORD user = 0xFFFFFFFFu;
+        static ULONGLONG lookedAt = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (user == 0xFFFFFFFFu && now - lookedAt > 2000u)
+        {
+            lookedAt = now;
+            for (DWORD i = 0; i < 4u; ++i)
+            {
+                GamepadState state{};
+                if (getState(i, &state) == ERROR_SUCCESS)
+                {
+                    user = i;
+                    break;
+                }
+            }
+        }
+        if (user == 0xFFFFFFFFu)
+            return;
+        auto toMotor = [](float v) { return static_cast<WORD>(std::lround(std::clamp(v, 0.0f, 1.0f) * 65535.0f)); };
+        Vibration vibration{toMotor(left), toMotor(right)};
+        if (setState(user, &vibration) != ERROR_SUCCESS)
+            user = 0xFFFFFFFFu;
+    }
+
 }
 
 #else
@@ -152,6 +219,8 @@ namespace ps2host
     void raiseThisThread() noexcept
     {
     }
+
+    void setPadVibration(float, float) noexcept {}
 }
 
 #endif

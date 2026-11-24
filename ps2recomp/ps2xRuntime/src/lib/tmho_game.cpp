@@ -24,8 +24,10 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_settings.h"
 #include "tmho_game.h"
+#include "ps2_movie_state.h"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -49,6 +51,8 @@ namespace
     constexpr uint32_t kDrawPlayerText = 0x2224A0u;
     constexpr uint32_t kSetFontSize = 0x222CE8u;
     constexpr uint32_t kCameraLookAt = 0x265E08u;
+    constexpr uint32_t kPlayMovie = 0x100618u;        // (context, file name, ...): LEGAL.PSS / ESPLOGO.PSS at start
+    constexpr uint32_t kStartFrontendMovie = 0x226840u; // (movie object, path): the intro behind the title
     // The chase cameras behind the player's car (return addresses of their look-at calls).
     constexpr uint32_t kChaseCameraCallers[] = {0x1296ACu, 0x129ED0u};
 
@@ -63,6 +67,8 @@ namespace
     Fn g_drawPlayerText = nullptr;
     Fn g_setFontSize = nullptr;
     Fn g_cameraLookAt = nullptr;
+    Fn g_playMovie = nullptr;
+    Fn g_startFrontendMovie = nullptr;
     uint32_t g_eyeScratch = 0; // guest memory for the moved camera position (the game's own stays as it is)
 
     PS2Runtime *g_runtime = nullptr;
@@ -1015,6 +1021,49 @@ namespace
         g_cameraLookAt(rdram, ctx, runtime);
     }
 
+    // F2 > Game > Skip intro movies: the two logo movies, and the intro the first time it plays.
+    bool endsWith(const std::string &text, const char *suffix)
+    {
+        const size_t n = std::strlen(suffix);
+        return text.size() >= n && text.compare(text.size() - n, n, suffix) == 0;
+    }
+
+    std::string guestString(uint8_t *rdram, uint32_t address)
+    {
+        std::string out;
+        if (const uint8_t *p = getMemPtr(rdram, address))
+            for (size_t i = 0; i < 64u && p[i] >= 0x20u && p[i] < 0x7Fu; ++i)
+                out.push_back(static_cast<char>(std::toupper(p[i])));
+        return out;
+    }
+
+    void playMovie(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        if (freshEntry(ctx, kPlayMovie) && ps2settings::get().skipIntro)
+        {
+            const std::string name = guestString(rdram, GPR_U32(ctx, 5));
+            if (endsWith(name, "LEGAL.PSS") || endsWith(name, "ESPLOGO.PSS"))
+                ps2movie::requestSkip(10.0);
+        }
+        g_playMovie(rdram, ctx, runtime);
+    }
+
+    void startFrontendMovie(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static bool introSeen = false;
+        if (freshEntry(ctx, kStartFrontendMovie) && !introSeen)
+        {
+            const std::string path = guestString(rdram, GPR_U32(ctx, 5));
+            if (endsWith(path, "INTRO.PSS") || endsWith(path, "INTROLOS.PSS"))
+            {
+                introSeen = true;
+                if (ps2settings::get().skipIntro)
+                    ps2movie::requestSkip(10.0);
+            }
+        }
+        g_startFrontendMovie(rdram, ctx, runtime);
+    }
+
     bool hook(PS2Runtime &runtime, uint32_t address, Fn wrapper, Fn &original)
     {
         original = runtime.lookupFunction(address);
@@ -1045,6 +1094,8 @@ namespace
         ok &= hook(runtime, kDrawPlayerText, &drawPlayerText, g_drawPlayerText);
         ok &= hook(runtime, kSetFontSize, &setFontSize, g_setFontSize);
         ok &= hook(runtime, kCameraLookAt, &cameraLookAt, g_cameraLookAt);
+        ok &= hook(runtime, kPlayMovie, &playMovie, g_playMovie);
+        ok &= hook(runtime, kStartFrontendMovie, &startFrontendMovie, g_startFrontendMovie);
         // 16 bytes in the HLE kernel's unused low memory (callback stacks end at 0x70000).
         g_eyeScratch = 0x0007FF00u;
         uint8_t *rdram = runtime.memory().getRDRAM();

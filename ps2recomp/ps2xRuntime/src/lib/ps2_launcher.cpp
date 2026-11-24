@@ -1067,7 +1067,8 @@ namespace ps2launcher
             DrawRectangle(static_cast<int>(left), static_cast<int>(y), static_cast<int>(4.0f * s), static_cast<int>(58.0f * s), look.accentColor);
             ui::text("GAME SETUP", left + 16.0f * s, y - 2.0f * s, 13.0f * s, look.accentColor, true);
             ui::text(game.title, left + 16.0f * s, y + 14.0f * s, 30.0f * s, WHITE, true);
-            ui::text(game.subtitle, left + 16.0f * s, y + 46.0f * s, 15.0f * s, kMuted, false);
+            const std::string subtitle = std::string(game.subtitle) + " " + ps2settings::kPortVersion;
+            ui::text(subtitle.c_str(), left + 16.0f * s, y + 46.0f * s, 15.0f * s, kMuted, false);
             const char *f2 = "F2  SETTINGS";
             const float f2Size = 12.0f * s;
             const float f2W = ui::textWidth(f2, f2Size, true) + 16.0f * s;

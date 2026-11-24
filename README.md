@@ -40,12 +40,13 @@ game still streams music and movies from it. Saves go in the `saves` folder next
 | Cross / Circle / Square / Triangle | X or Space / C or Esc / Z / V |
 | L1 / R1 / L2 / R2 | Q / E / Left Shift / Right Shift |
 | Start / Select | Enter / Tab |
-| Settings | **F2** |
+| Settings | **F2** (controller: Guide / PS button, or both sticks pressed in) |
 | Windowed ↔ full screen | F11 or Alt+Enter |
 | Screenshot | F12 |
 | Debugger | F1 |
 
-A controller works too; the keyboard keeps working alongside it.
+A controller works too; the keyboard keeps working alongside it. With an Xbox or other XInput
+controller the game's own **vibration** works (V8).
 
 ---
 
@@ -58,6 +59,17 @@ A controller works too; the keyboard keeps working alongside it.
 - **Setup screen** that builds the game from your disc image, checks the version, finds your
   disc by itself, reuses the files of another copy of the port on the same PC, builds the
   shader cache, and can be skipped at start.
+- **Quality of life (V8)**:
+  - **Skip intro movies** (F2 > Game, on by default): the logo movies and the intro are skipped
+    at start, straight to the menus.
+  - **Controller vibration**: the game's rumble commands drive an XInput controller's motors
+    (small motor on/off, large motor 0–255, as the PS2 pad's two motors). Stops while paused,
+    in the F2 menu or when the window is in the background. F2 > Game > Controller vibration.
+  - **Pause on controller loss**: if the controller you are playing with disconnects, the game
+    pauses with the F2 menu open until it is back.
+  - **F2 from the controller**: the Guide / PS button, or both sticks pressed in together.
+  - **Window remembered**: in windowed mode the window opens where and at the size you left it.
+  - The **version** is shown in the window title and on the setup screen.
 - **Memory cards** saved as files (`saves\mc0`, `saves\mc1`).
 
 ### Graphics
@@ -72,6 +84,8 @@ A controller works too; the keyboard keeps working alongside it.
   keeps its normal speed; the picture is about one frame later. With V-Sync on, Monitor mode
   waits for the desktop compositor in windowed and borderless mode, because some drivers ignore
   the swap interval there.
+- **Brightness** (V8, F2 > Video): 70–150%, a gamma curve on the finished picture, so dark
+  arenas get easier to see without washing out explosions.
 - **Steady picture** (V7.2): the game draws each frame for one of the two interlaced video
   fields, which sit one line apart. paraLLEl-GS showed a frame on whichever field the video
   output had reached by then, so a frame that came late or was shown twice landed on the wrong
@@ -131,6 +145,10 @@ A controller works too; the keyboard keeps working alongside it.
   runs within ±0.3% of real time with no dry-outs.
 - **Movies and cutscenes** decoded with FFmpeg, with their audio in sync.
 - Master volume and **mute when the window is in the background**.
+- **Separate music, effects and movie volume** (V8, F2 > Audio). The game streams its music
+  from the disc into sound-chip voices that it refills while they play; the port tells those
+  voices apart from one-shot sounds (engines, weapons, explosions, menu sounds, the announcer)
+  and mixes the two with their own volumes. Movie sound has its own slider.
 
 ### Performance
 - **Full speed in big battles.** On a Ryzen 7 3700X with an RTX 2080 SUPER (16:9, Auto/2x
@@ -154,6 +172,12 @@ A controller works too; the keyboard keeps working alongside it.
 - **Shader cache**: the GPU renderer's pipelines are kept in `shadercache.bin` (made by Build
   shaders on the setup screen, and topped up by the game when it compiled anything new), so the
   start-up precompile is a cache load: all 10,904 variants load in under a second.
+- **Shaders compiled during play are kept** (V8): pipelines first needed in a battle (10–30 ms
+  each, a short hitch) were compiled again in every session, because the cache file was only
+  written when the driver's cache data grew in size, and NVIDIA's did not. The game now writes it
+  at quit whenever it compiled anything, so each such hitch happens once.
+- **Minimized, nothing is drawn** (V8): the game keeps running and playing, but the picture is
+  neither scaled nor presented until the window comes back.
 - The performance log's profiler samples the VU1 thread as well as the game thread, and its
   timers use QueryPerformanceCounter directly (cheaper than the C runtime clock it used before).
 
@@ -250,11 +274,12 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - The vector units use the PS2's own rounding and clamping as well.
 
 ### Settings menu (F2)
-- **Video**: display mode, resolution, aspect ratio, scaling, V-Sync, renderer, frame rate.
-- **Audio**: master volume, mute in the background.
-- **Game**: pause while the menu is open, pause in the background, FPS counter, screenshot
-  recording, screenshot, VU1 thread, IOP thread, game disc, field of view, camera distance,
-  quit.
+- **Video**: display mode, resolution, aspect ratio, scaling, V-Sync, renderer, frame rate,
+  brightness.
+- **Audio**: master, music, effects and movie volume, mute in the background.
+- **Game**: pause while the menu is open, pause in the background, FPS counter, skip intro
+  movies, controller vibration, pause on controller loss, screenshot recording, screenshot, VU1
+  thread, IOP thread, game disc, field of view, camera distance, quit.
 - **HUD**: the HUD editor, radar and weapon panel sizes, snap to screen edges, reset.
 - The **setup screen** (F2 > Game > Game disc > Setup, or "Show this screen at start") has the
   disc, Build game and Build shaders.
@@ -271,7 +296,12 @@ resolution), from the port's own performance log (CPU time of every thread of th
   game back, a built-in profiler), `Graphicslogs.txt` (GPU work, frames, video memory) and
   `console.txt` (the game's own text output).
 - **Freeze watchdog**: if the game hangs it writes where it got stuck, and if closing takes
-  more than 10 seconds it ends itself.
+  more than 10 seconds it ends itself. **Fixed in V8**: minimizing the window (or holding its
+  title bar) for more than 5 seconds closed the game. The watchdog read the window thread's call
+  stack while it sat in Windows' own window code; it no longer reads that thread's stack, and a
+  minimized window keeps its loop running instead of waiting inside raylib.
+- The **performance log** leaves time spent in the F2 menu or minimized out of the session
+  averages (V8: paused time used to show up as idle time in the report after the pause).
 - **Screenshot recorder** (F2 > Game > Record screenshots): a picture every half second in
   `Logs\frames`, for bug reports.
 - **F1 debugger**: threads, I/O processor, RPC history, GS registers and memory.
@@ -295,8 +325,6 @@ resolution), from the port's own performance log (CPU time of every thread of th
   switched the game's floating-point maths to the PS2's own rounding, the most likely cause; if
   it still happens, please report where.
 - **Reverb** of the SPU2 is not emulated yet, so a few sounds are drier than on a PS2.
-- **Music, effects and movie volume** sliders are shown but not working yet (they need a
-  per-voice mixer).
 
 ## Coming in the future
 
@@ -308,7 +336,7 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - **Widescreen menus**: the 2D menu screens kept at their shape (pillarboxed) or adapted to 16:9.
 - **A true 16:9 frame** (854 pixels wide instead of 640), so text and HUD no longer need squeezing
   to keep their shape.
-- **More accurate sound**: SPU2 reverb, and separate music, effects and movie volumes.
+- **More accurate sound**: SPU2 reverb.
 - **Collision follow-up**: tracking down any remaining fall-through spots.
 - **Controls menu**: remapping keys and controller buttons in F2.
 - **Linux release** (the code already builds and runs on Linux).

@@ -2501,8 +2501,11 @@ namespace ps2_stubs
         setReturnU32(ctx, getPlaybackState(mpegAddr).decodeMode);
     }
 
+    static void applyMovieSkipRequest(uint8_t *rdram, PS2Runtime *runtime);
+
     void sceMpegGetPicture(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        applyMovieSkipRequest(rdram, runtime);
         ps2movie::notePictureDecoded();
         pumpAudioBacklog(rdram, ctx, runtime, getRegU32(ctx, 4));
         updateGuestMpegEnd(rdram, runtime, getRegU32(ctx, 4));
@@ -2763,8 +2766,56 @@ namespace ps2_stubs
             mpegGuestWrite32(rdram, sys + 0x00, done ? 1u : 0u);
     }
 
+    // A skip asked for (ps2movie::requestSkip) ends the movie once it has really started: its
+    // stream counts as ended, nothing more is shown or played, and a wait for a picture finishes,
+    // so the game's movie loop sees the end it would see after the last picture.
+    static void applyMovieSkipRequest(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        static const int kSkipAfterCalls = []()
+        {
+            const char *env = std::getenv("PS2X_SKIP_AFTER");
+            return env ? std::max(1, std::atoi(env)) : 40;
+        }();
+        if (!ps2movie::skipRequested())
+            return;
+        std::vector<uint32_t> ended;
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            bool started = false;
+            for (const auto &entry : g_mpeg_stub_state.playbackByMpeg)
+                started = started || entry.second.sawInput;
+            if (!started)
+                return;
+            // Let the movie run for a few pictures first, so its sound stream has really started
+            // in the sound driver (stopping it before that made 989snd report an error).
+            static int picturesSeen = 0;
+            if (++picturesSeen < kSkipAfterCalls)
+                return;
+            picturesSeen = 0;
+            for (auto &[mpegAddr, playback] : g_mpeg_stub_state.playbackByMpeg)
+            {
+                if (!playback.sawInput || playback.streamEnded)
+                    continue;
+                playback.streamEnded = true;
+                playback.sawSequenceEnd = true;
+                playback.decodedFrames.clear();
+                playback.presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
+                ended.push_back(mpegAddr);
+            }
+            ps2movie::clearSkipRequest();
+        }
+        for (const uint32_t mpegAddr : ended)
+        {
+            std::fprintf(stderr, "[intro] movie skipped (F2 > Game > Skip intro movies)\n");
+            if (runtime)
+                runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+            updateGuestMpegEnd(rdram, runtime, mpegAddr);
+        }
+    }
+
     void sceMpegIsEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        applyMovieSkipRequest(rdram, runtime);
         pumpAudioBacklog(rdram, ctx, runtime, getRegU32(ctx, 4));
         (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2918,5 +2969,33 @@ namespace ps2movie
     {
         const int64_t last = g_lastPictureNs.load(std::memory_order_relaxed);
         return last != 0 && nowNs() - last < 300'000'000;
+    }
+
+    namespace
+    {
+        std::atomic<int64_t> g_skipUntilNs{0};
+    }
+
+    void requestSkip(double withinSeconds) noexcept
+    {
+        g_skipUntilNs.store(nowNs() + static_cast<int64_t>(withinSeconds * 1e9), std::memory_order_relaxed);
+    }
+
+    bool skipRequested() noexcept
+    {
+        const int64_t until = g_skipUntilNs.load(std::memory_order_relaxed);
+        if (until == 0)
+            return false;
+        if (nowNs() > until)
+        {
+            g_skipUntilNs.store(0, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+
+    void clearSkipRequest() noexcept
+    {
+        g_skipUntilNs.store(0, std::memory_order_relaxed);
     }
 }

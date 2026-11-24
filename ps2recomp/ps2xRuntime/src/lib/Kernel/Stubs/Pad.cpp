@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ps2_settings.h"
 
 namespace ps2_stubs
 {
@@ -685,17 +686,51 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // Actuators: SetActAlign says which byte of the SetActDirect data drives which motor
+    // (0 = the small on/off motor, 1 = the large one with a speed, 0xFF = none).
+    namespace
+    {
+        uint8_t g_actAlign[kPadPortCount][6] = {{0u, 1u, 0xFFu, 0xFFu, 0xFFu, 0xFFu}, {0u, 1u, 0xFFu, 0xFFu, 0xFFu, 0xFFu}};
+    }
+
     void scePadSetActAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const uint32_t port = getRegU32(ctx, 4);
+        if (port < kPadPortCount)
+        {
+            if (const uint8_t *align = getConstMemPtr(rdram, getRegU32(ctx, 6)))
+                std::memcpy(g_actAlign[port], align, sizeof(g_actAlign[port]));
+        }
         setReturnS32(ctx, 1);
     }
 
     void scePadSetActDirect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        (void)rdram;
         (void)runtime;
+        const uint32_t port = getRegU32(ctx, 4);
+        const uint8_t *data = getConstMemPtr(rdram, getRegU32(ctx, 6));
+        if (port == 0u && data)
+        {
+            bool smallMotor = false;
+            uint8_t largeMotor = 0u;
+            for (int i = 0; i < 6; ++i)
+            {
+                if (g_actAlign[0][i] == 0u)
+                    smallMotor = (data[i] & 1u) != 0u;
+                else if (g_actAlign[0][i] == 1u)
+                    largeMotor = data[i];
+            }
+            ps2settings::setWantedVibration(smallMotor, largeMotor);
+            static const bool trace = std::getenv("PS2X_TRACE_RUMBLE") != nullptr;
+            static uint32_t lastTraced = 0xFFFFFFFFu;
+            const uint32_t now = (smallMotor ? 0x100u : 0u) | largeMotor;
+            if (trace && now != lastTraced)
+            {
+                lastTraced = now;
+                std::fprintf(stderr, "[rumble] small %d large %u\n", smallMotor ? 1 : 0, largeMotor);
+            }
+        }
         setReturnS32(ctx, 1);
     }
 

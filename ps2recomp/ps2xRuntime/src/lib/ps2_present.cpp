@@ -60,6 +60,7 @@ uniform vec2 dir;
 uniform float scale;
 uniform int nearest;
 uniform int swapRB;
+uniform float gamma;
 out vec4 finalColor;
 float lanczos2(float x)
 {
@@ -102,6 +103,8 @@ void main()
     }
     if (swapRB == 1)
         color.rgb = color.bgr;
+    if (gamma != 1.0)
+        color.rgb = pow(max(color.rgb, vec3(0.0)), vec3(gamma));
     finalColor = vec4(color.rgb, 1.0);
 }
 )";
@@ -292,7 +295,7 @@ void main()
             int loc[12]{};
         };
 
-        enum ResampleLoc { RsSrcSize, RsDstSize, RsDir, RsScale, RsNearest, RsSwap };
+        enum ResampleLoc { RsSrcSize, RsDstSize, RsDir, RsScale, RsNearest, RsSwap, RsGamma };
         enum LumaLoc { LmSrcSize, LmDstSize };
         enum HalfLoc { HfSrcSize };
         enum FlowLoc { FlLumaA, FlCoarse, FlSize, FlCoarseSize, FlCoarsest, FlSearch, FlPatch, FlSubpixel };
@@ -544,6 +547,7 @@ void main()
             setFloat(g_resample, RsScale, scaleX);
             setInt(g_resample, RsNearest, nearestX);
             setInt(g_resample, RsSwap, rawBgra ? 1 : 0);
+            setFloat(g_resample, RsGamma, 1.0f);
             pass(g_wide, source);
             EndShaderMode();
             EndTextureMode();
@@ -556,6 +560,8 @@ void main()
             setFloat(g_resample, RsScale, scaleY);
             setInt(g_resample, RsNearest, nearestY);
             setInt(g_resample, RsSwap, 0);
+            // F2 > Video > Brightness: a gamma curve on the finished picture (100% = 1.0).
+            setFloat(g_resample, RsGamma, std::pow(100.0f / static_cast<float>(std::clamp(ps2settings::get().brightness, 70, 150)), 1.3f));
             pass(target, g_wide.texture);
             EndShaderMode();
             EndTextureMode();
@@ -647,7 +653,7 @@ void main()
     {
         if (g_ready || g_failed)
             return;
-        bool ok = build(g_resample, kResampleFs, {"srcSize", "dstSize", "dir", "scale", "nearest", "swapRB"});
+        bool ok = build(g_resample, kResampleFs, {"srcSize", "dstSize", "dir", "scale", "nearest", "swapRB", "gamma"});
         ok = ok && build(g_luma, kLumaFs, {"srcSize", "dstSize"});
         ok = ok && build(g_half, kHalfFs, {"srcSize"});
         ok = ok && build(g_flow, kFlowFs, {"lumaA", "coarse", "size", "coarseSize", "coarsest", "searchRadius", "patchRadius", "subpixel"});

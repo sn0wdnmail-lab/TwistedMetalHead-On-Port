@@ -35,7 +35,9 @@ Keys (or plug in a controller)
   C or Esc          Circle         Q / E        L1 / R1
   Z                 Square         Left/Right Shift   L2 / R2
   V                 Triangle
-  F2                settings (video, audio, game, HUD, UI colour)
+  F2                settings (video, audio, game, HUD, UI colour); with a
+                    controller: the Guide / PS button, or press both sticks
+                    in together, then the D-pad, A / Cross and B / Circle
   F11 or Alt+Enter  windowed <-> full screen
   F12               screenshot (Screenshots folder next to TMHO.exe)
   F1                debugger
@@ -62,9 +64,32 @@ Video (F2 > Video) - all of it changes straight away, no restart needed
                        in-between frames made from the two newest game frames:
                        motion is smoother and the game keeps its normal speed.
                        The picture is then about one frame later.
+  Brightness           Lightens (or darkens) the picture, 70-150 %. Dark parts
+                       change most, so night arenas get easier to see without
+                       washing out explosions. 100 % is the game's own picture.
+
+In windowed mode the window opens where you last left it, at the size you
+left it.
 
 On a slower PC: Resolution 480p or 720p, Frame rate 60 fps, and keep
 F2 > Game > VU1 thread and IOP thread on (the defaults).
+
+Sound (F2 > Audio)
+  Master volume        Everything the game plays.
+  Music volume         The music (and other sound the game streams from the
+                       disc, such as story voice-overs).
+  Effects volume       Engines, weapons, explosions, pickups, menu sounds and
+                       the announcer.
+  Movie volume         The intro and ending movies.
+
+Game (F2 > Game)
+  Skip intro movies    Skips the logo movies and the intro when the game
+                       starts (on by default), straight to the menus.
+  Controller vibration Lets the game rumble an Xbox or other XInput controller
+                       when you hit or get hit, as on the PS2 (the game's own
+                       pause menu has a Vibration switch too).
+  Pause on controller loss  Opens the settings and pauses the game when the
+                       controller you are playing with disconnects.
 
 CPU cores (F2 > Game, both apply on the next start)
   VU1 thread           The PS2's 3D math unit and the graphics feed run on a
@@ -106,7 +131,9 @@ TMHO.exe, named by date and time.
 
 Pause in background (F2 > Game) stops the game while its window is not in
 front, and carries on when you come back. Mute in background (F2 > Audio)
-silences it instead.
+silences it instead. Minimized, the game keeps running (with those two
+options as you set them) but draws nothing, so it barely uses the graphics
+card until you bring it back.
 
 Record screenshots (F2 > Game) saves a picture of the game every half second
 in Logs\frames (pictures older than 10 minutes are deleted). Handy for bug

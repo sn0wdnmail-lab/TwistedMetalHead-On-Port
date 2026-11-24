@@ -197,6 +197,16 @@ namespace ps2x::iop
     }
 
     std::atomic<uint64_t> g_statClipped{0};
+    std::atomic<int32_t> g_effectsVolumeQ15{32768};
+    std::atomic<int32_t> g_musicVolumeQ15{32768};
+    std::atomic<int32_t> g_movieVolumeQ15{32768};
+
+    void setMixVolumes(int32_t effectsQ15, int32_t musicQ15, int32_t movieQ15) noexcept
+    {
+        g_effectsVolumeQ15.store(std::clamp<int32_t>(effectsQ15, 0, 32768), std::memory_order_relaxed);
+        g_musicVolumeQ15.store(std::clamp<int32_t>(musicQ15, 0, 32768), std::memory_order_relaxed);
+        g_movieVolumeQ15.store(std::clamp<int32_t>(movieQ15, 0, 32768), std::memory_order_relaxed);
+    }
     std::atomic<uint64_t> g_statNoise{0};
     std::atomic<uint64_t> g_statPitchMod{0};
 
@@ -579,7 +589,7 @@ namespace ps2x::iop::detail
     }
 
     Spu2::Spu2()
-        : m_ram(RamHalfwords, 0u)
+        : m_blockWriteStamp(RamHalfwords >> kStampShift, 0u), m_ram(RamHalfwords, 0u)
     {
         reset();
     }
@@ -587,6 +597,8 @@ namespace ps2x::iop::detail
     void Spu2::reset()
     {
         std::fill(m_ram.begin(), m_ram.end(), uint16_t{0});
+        std::fill(m_blockWriteStamp.begin(), m_blockWriteStamp.end(), 0u);
+        m_sampleCount = 1;
         m_regs.fill(0u);
         for (Core &core : m_cores)
         {
@@ -714,6 +726,7 @@ namespace ps2x::iop::detail
             return;
         case kData:
             m_ram[c.tsa & (RamHalfwords - 1u)] = value;
+            stampWrite(c.tsa, 1u);
             checkIrq(c.tsa, 1u);
             c.tsa = (c.tsa + 1u) & (RamHalfwords - 1u);
             return;
@@ -754,6 +767,8 @@ namespace ps2x::iop::detail
             v.phase = 1;
             v.envelope = 0;
             v.envelopeWait = 0;
+            v.keyOnStamp = m_sampleCount;
+            v.streaming = false;
             c.endx &= ~(1u << i);
             decodeBlock(core, v);
             v.history[0] = v.history[1] = v.history[2] = 0;
@@ -780,10 +795,30 @@ namespace ps2x::iop::detail
         }
     }
 
+    void Spu2::stampWrite(uint32_t start, uint32_t halfwords)
+    {
+        if (m_blockWriteStamp.empty() || halfwords == 0u)
+            return;
+        const uint32_t first = (start & (RamHalfwords - 1u)) >> kStampShift;
+        const uint32_t blocks = ((halfwords + (start & ((1u << kStampShift) - 1u))) >> kStampShift) + 1u;
+        const uint32_t count = static_cast<uint32_t>(m_blockWriteStamp.size());
+        for (uint32_t i = 0; i < blocks && i < count; ++i)
+            m_blockWriteStamp[(first + i) % count] = m_sampleCount;
+    }
+
     void Spu2::decodeBlock(int /*core*/, Voice &v)
     {
         const uint32_t base = v.block & (RamHalfwords - 1u);
         checkIrq(base, 8u);
+        // Written after the voice started: the sound driver is refilling it as it plays (a stream).
+        if (!v.streaming && !m_blockWriteStamp.empty() &&
+            static_cast<int32_t>(m_blockWriteStamp[base >> kStampShift] - v.keyOnStamp) > 0)
+        {
+            v.streaming = true;
+            static const bool trace = std::getenv("PS2X_TRACE_STREAMS") != nullptr;
+            if (trace)
+                std::fprintf(stderr, "[spu2] stream voice at %05x (keyed on %u samples ago)\n", base, m_sampleCount - v.keyOnStamp);
+        }
         const uint16_t header = m_ram[base];
         const int shift = std::min(header & 0xF, 12);
         const int filter = std::min((header >> 4) & 0xF, 4);
@@ -951,6 +986,7 @@ namespace ps2x::iop::detail
             std::fprintf(stderr, "[spu2] dma core%d tsa=%05x n=%zu first=%04x\n", core, c.tsa, halfwords, halfwords ? data[0] : 0);
         for (size_t i = 0; i < halfwords; ++i)
             m_ram[(c.tsa + i) & (RamHalfwords - 1u)] = data[i];
+        stampWrite(c.tsa, static_cast<uint32_t>(halfwords));
         checkIrq(c.tsa, static_cast<uint32_t>(halfwords));
         c.tsa = (c.tsa + static_cast<uint32_t>(halfwords)) & (RamHalfwords - 1u);
         return std::max<uint64_t>(static_cast<uint64_t>(halfwords), 64u);
@@ -1005,6 +1041,7 @@ namespace ps2x::iop::detail
 
     void Spu2::mixSample(int16_t &outLeft, int16_t &outRight)
     {
+        ++m_sampleCount;
         int32_t coreOut[2][2] = {};
         for (int core = 0; core < 2; ++core)
         {
@@ -1014,6 +1051,8 @@ namespace ps2x::iop::detail
             const uint32_t vmixr = reg(base + kVmixr) | (static_cast<uint32_t>(reg(base + kVmixr + 2u) & 0xFFu) << 16);
             int32_t left = 0;
             int32_t right = 0;
+            int32_t streamLeft = 0;
+            int32_t streamRight = 0;
             for (int i = 0; i < 24; ++i)
             {
                 Voice &v = c.voices[static_cast<size_t>(i)];
@@ -1031,10 +1070,12 @@ namespace ps2x::iop::detail
                 const int32_t voiceRight = (enveloped * volumeRight) >> 15;
                 reg(vbase + 0xCu) = static_cast<uint16_t>(volumeLeft);
                 reg(vbase + 0xEu) = static_cast<uint16_t>(volumeRight);
+                int32_t &mixLeft = v.streaming ? streamLeft : left;
+                int32_t &mixRight = v.streaming ? streamRight : right;
                 if (vmixl & (1u << i))
-                    left += voiceLeft;
+                    mixLeft += voiceLeft;
                 if (vmixr & (1u << i))
-                    right += voiceRight;
+                    mixRight += voiceRight;
 
                 if (!v.on)
                     continue;
@@ -1051,15 +1092,24 @@ namespace ps2x::iop::detail
                 }
             }
 
+            // F2 > Audio: streamed voices are the music, the other voices the effects, and the
+            // sound data input (AutoDMA) the movies' sound.
+            const int32_t effectsVolume = ps2x::iop::g_effectsVolumeQ15.load(std::memory_order_relaxed);
+            const int32_t musicVolume = ps2x::iop::g_musicVolumeQ15.load(std::memory_order_relaxed);
+            left = static_cast<int32_t>((static_cast<int64_t>(left) * effectsVolume + static_cast<int64_t>(streamLeft) * musicVolume) >> 15);
+            right = static_cast<int32_t>((static_cast<int64_t>(right) * effectsVolume + static_cast<int64_t>(streamRight) * musicVolume) >> 15);
+            const int32_t streamVolume = ps2x::iop::g_movieVolumeQ15.load(std::memory_order_relaxed);
             const uint32_t mbase = masterVolumeBase(core);
             if (!c.admaLeft.empty())
             {
-                left += (c.admaLeft.front() * plainVolume(reg(mbase + 0xCu))) >> 15; // BVOL: sound data input
+                const int32_t input = (c.admaLeft.front() * plainVolume(reg(mbase + 0xCu))) >> 15; // BVOL: sound data input
+                left += (input * streamVolume) >> 15;
                 c.admaLeft.pop_front();
             }
             if (!c.admaRight.empty())
             {
-                right += (c.admaRight.front() * plainVolume(reg(mbase + 0xEu))) >> 15;
+                const int32_t input = (c.admaRight.front() * plainVolume(reg(mbase + 0xEu))) >> 15;
+                right += (input * streamVolume) >> 15;
                 c.admaRight.pop_front();
             }
             coreOut[core][0] = std::clamp<int32_t>(left, -32768, 32767);
