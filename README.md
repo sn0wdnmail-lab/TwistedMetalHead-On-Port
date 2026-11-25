@@ -93,6 +93,26 @@ controller the game's own **vibration** works (V8).
 
 ## V9.1 (all versions)
 
+- **Camera tab** (F2 > Camera): **Camera distance** (50–200%), the new **Camera angle** (−30° to
+  +40°: the chase camera swings up for a view from above, or down toward the road, around your
+  car at the same distance), **Field of view** and **Reset camera**. All live in a battle.
+- **Starts as the game was**: a first start (no settings.ini) is 480p (the PS2's own picture, in
+  a window of at least 720 lines), Smooth scaling, 60 fps, 4:3, intro movies on, and the game's
+  own camera distance, angle and field of view. Phones start in 16:9.
+- **Closes at once, however it is closed** (close button, Alt+F4, the taskbar, F2 > Quit game,
+  the setup screen): the window disappears and the sound stops straight away, settings.ini and
+  shaders compiled since the last save are written (at most 1.5 s, out of sight), and the
+  process ends without waiting for the game's threads, the graphics driver or the sound device.
+  Closing used to wait for those, and could sit for 10 seconds until the watchdog ended it
+  (seen in exclusive full screen). Shaders the game had to wait for are now also saved about
+  once a minute during play.
+- **Saves load again**: memory-card files were numbered from 1, while the PS2's memory card
+  driver (MCMAN) numbers them from 0 - and the game reads its save back through number 0, so a
+  save made in the port (or imported from PCSX2) failed with "Load Failed!" at the next start.
+  Files are now numbered as MCMAN does.
+- **Smoother motion: Lossless Scaling recommended.** For more than 60 fps, running the game at
+  60 fps with Lossless Scaling's frame generation (Windows, on Steam) gives the best result;
+  the port's own 120 fps / Monitor in-between frames remain as an option.
 - **16:9 text keeps every stroke.** In widescreen the game's text is drawn three quarters as
   wide, so each letter is shrunk from its font texture by 2-2.6x; paraLLEl-GS shaded sprites once
   per native pixel, and its filtering then skipped texel columns - letters lost lines (the "E"
@@ -138,7 +158,8 @@ controller the game's own **vibration** works (V8).
 - **Resolution presets** (V7): **480p** (1x, the PS2's own), **720p**, **1080p**, **1440p** and
   **2160p (4K)**, whatever the screen is. A preset above the screen's own is drawn big and shrunk
   to fit (smoother edges). Changes take effect immediately.
-- **Frame rate** (V7): **60 fps** (the game's own frames), **120 fps**, or **Monitor** (the
+- **Frame rate** (V7): **60 fps** (the game's own frames; the default, and recommended together
+  with Lossless Scaling's frame generation for smoother motion), **120 fps**, or **Monitor** (the
   screen's refresh rate, e.g. 144 or 170 Hz). 120 and Monitor add in-between frames made on the
   GPU from the two newest game frames (motion-compensated), so motion is smoother while the game
   keeps its normal speed; the picture is about one frame later. With V-Sync on, Monitor mode
@@ -191,11 +212,13 @@ controller the game's own **vibration** works (V8).
   first stopped, so the rest of the string came out at the wrong size and place for a frame.
   The size now stays until the call really finishes.
 
-### Camera
-- **Field of view** slider (50–120°; the game's own view is 65° at 4:3 and 81° at 16:9).
+### Camera (F2 > Camera, V9.1)
 - **Camera distance** for the chase camera (50–200%).
-- Both work live in a match, and the HUD's 3D radar and weapon icons keep their place and size
-  at any field of view.
+- **Camera angle** (V9.1): −30° to +40° from the game's own; the camera swings around the car at
+  the same distance, along the game's own up direction for the view.
+- **Field of view** slider (50–120°; the game's own view is 65° at 4:3 and 81° at 16:9).
+- **Reset camera** puts all three back. They work live in a match, and the HUD's 3D radar and
+  weapon icons keep their place and size at any field of view.
 
 ### Sound
 - The PS2 sound chip (**SPU2**) emulated, driven by the game's own sound driver (989snd) from
@@ -342,7 +365,8 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - **Audio**: master, music, effects and movie volume, mute in the background.
 - **Game**: pause while the menu is open, pause in the background, FPS counter, skip intro
   movies, controller vibration, pause on controller loss, screenshot recording, screenshot, VU1
-  thread, IOP thread, game disc, import PCSX2 save (V9), field of view, camera distance, quit.
+  thread, IOP thread, game disc, import PCSX2 save (V9), quit.
+- **Camera** (V9.1): camera distance, camera angle, field of view, reset camera.
 - **Controls** (V9): on-screen controls (Android), and remapping of every PS2 button's key and
   controller button.
 - **HUD**: the HUD editor, radar and weapon panel sizes, snap to screen edges, reset.
@@ -360,8 +384,8 @@ resolution), from the port's own performance log (CPU time of every thread of th
 - **Logs** folder: `performancelogs.txt` (speed every 2 seconds, time per thread, what holds the
   game back, a built-in profiler), `Graphicslogs.txt` (GPU work, frames, video memory) and
   `console.txt` (the game's own text output).
-- **Freeze watchdog**: if the game hangs it writes where it got stuck, and if closing takes
-  more than 10 seconds it ends itself. **Fixed in V8**: minimizing the window (or holding its
+- **Freeze watchdog**: if the game hangs it writes where it got stuck. (Closing no longer waits
+  for anything since V9.1; before, a close that took more than 10 seconds was ended by it.) **Fixed in V8**: minimizing the window (or holding its
   title bar) for more than 5 seconds closed the game. The watchdog read the window thread's call
   stack while it sat in Windows' own window code; it no longer reads that thread's stack, and a
   minimized window keeps its loop running instead of waiting inside raylib.

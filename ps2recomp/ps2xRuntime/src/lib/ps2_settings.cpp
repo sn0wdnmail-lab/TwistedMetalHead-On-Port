@@ -295,6 +295,7 @@ namespace ps2settings
             out << "record_frames=" << (s.recordFrames ? 1 : 0) << "\n";
             out << "fov=" << s.fovDegrees << "\n";
             out << "camera_distance=" << s.cameraDistance << "\n";
+            out << "camera_angle=" << s.cameraAngle << "\n";
             out << "# battle HUD layout (F2 > HUD): offsets in 0.1% of the picture, sizes in %\n";
             out << "hud_radar_x=" << s.hudRadarX << "\n";
             out << "hud_radar_y=" << s.hudRadarY << "\n";
@@ -375,6 +376,7 @@ namespace ps2settings
                 else if (key == "record_frames") s.recordFrames = number != 0;
                 else if (key == "fov") s.fovDegrees = number <= 0 ? 0 : std::clamp(number, 50, 120);
                 else if (key == "camera_distance") s.cameraDistance = std::clamp(number, 50, 200);
+                else if (key == "camera_angle") s.cameraAngle = std::clamp(number, kCameraAngleMin, kCameraAngleMax);
                 else if (key == "hud_radar_x") s.hudRadarX = std::clamp(number, -1000, 1000);
                 else if (key == "hud_radar_y") s.hudRadarY = std::clamp(number, -1000, 1000);
                 else if (key == "hud_radar_scale") s.hudRadarScale = std::clamp(number, 40, 250);
@@ -462,7 +464,8 @@ namespace ps2settings
         void windowedSize(int &width, int &height)
         {
             const Settings &s = g_settings;
-            height = resolutionLines(s.resolution);
+            // V9.1: at least 720 lines, so 480p (the PS2's own picture) opens at a comfortable size.
+            height = std::max(720, resolutionLines(s.resolution));
             const float aspect = s.aspect == 0 ? 4.0f / 3.0f : 16.0f / 9.0f;
             width = static_cast<int>(std::lround(static_cast<float>(height) * aspect));
             const int monitor = GetCurrentMonitor();
@@ -762,8 +765,8 @@ namespace ps2settings
         double g_captureSince = 0.0;
         int g_firstRow = 0;           // the drawer scrolls when a tab has more rows than fit
 
-        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "CONTROLS", "HUD", "UI"};
-        constexpr int kTabCount = 6;
+        const char *const kTabs[] = {"VIDEO", "AUDIO", "GAME", "CAMERA", "CONTROLS", "HUD", "UI"};
+        constexpr int kTabCount = 7;
 
         // ---------------------------------------------------------------- HUD editor state
         bool g_hudEditor = false;          // the layout editor covers the screen instead of the drawer
@@ -880,8 +883,13 @@ namespace ps2settings
                          ps2android::active()
                              ? "60 fps shows the game's own frames. 120 fps adds in-between frames made from the two newest game frames, so motion is "
                                "smoother on a 120 Hz screen; the game itself keeps its normal speed. Uses more battery."
-                             : "60 fps shows the game's own frames. 120 fps and Monitor add in-between frames made from the two newest game frames, "
-                               "so motion is smoother; the game itself keeps its normal speed. In-between frames show the picture about one frame later.",
+#if defined(_WIN32)
+                             : "60 fps (recommended) shows the game's own frames. For smoother motion, run the game at 60 fps with Lossless "
+                               "Scaling's frame generation: it looks best. 120 fps and Monitor add the port's own in-between frames instead.",
+#else
+                             : "60 fps (recommended) shows the game's own frames. 120 fps and Monitor add in-between frames made from the two "
+                               "newest game frames, so motion is smoother; the game keeps its normal speed and the picture is about a frame later.",
+#endif
                          RowKind::Choice, [&s] { return ps2android::active() ? std::min(s.frameRate, 1) : s.frameRate; },
                          [&s, changed](int v) { s.frameRate = v; changed(); },
                          {"60 fps", "120 fps"}};
@@ -1001,27 +1009,6 @@ namespace ps2settings
                            RowKind::Action, [] { return 0; }, [](int) { importPcsx2Save(); }};
                 import.actionLabel = "Import";
                 rows.push_back(import);
-                Row fov{"Field of view", "How wide the battle camera sees, across the picture. The game's own view is 65\xC2\xB0 at 4:3 and 81\xC2\xB0 at 16:9.",
-                        RowKind::Slider,
-                        [&s] { return s.fovDegrees > 0 ? s.fovDegrees : static_cast<int>(std::lround(tmho::defaultHorizontalFov())); },
-                        [&s, changed](int v)
-                        {
-                            const int gameDefault = static_cast<int>(std::lround(tmho::defaultHorizontalFov()));
-                            s.fovDegrees = v == gameDefault ? 0 : v;
-                            changed();
-                            tmho::settingsChanged();
-                        }};
-                fov.minimum = 50;
-                fov.maximum = 120;
-                fov.suffix = "\xC2\xB0";
-                rows.push_back(fov);
-                Row distance{"Camera distance", "How far the chase camera sits behind your car: 100% is the game's own, lower is closer, higher is further back. Changes straight away.",
-                             RowKind::Slider, [&s] { return s.cameraDistance; }, [&s, changed](int v) { s.cameraDistance = v; changed(); }};
-                distance.minimum = 50;
-                distance.maximum = 200;
-                distance.step = 5;
-                distance.suffix = "%";
-                rows.push_back(distance);
                 // Quits without the window's close button (full screen has none). Two presses, so
                 // a stray Enter does not end a match.
                 const bool armed = GetTime() < g_quitArmedUntil;
@@ -1037,6 +1024,49 @@ namespace ps2settings
                 rows.push_back(quit);
             }
             else if (tab == 3)
+            {
+                // V9.1: the battle camera, on a tab of its own.
+                Row distance{"Camera distance", "How far the chase camera sits behind your car: 100% is the game's own, lower is closer, higher is further back. Changes straight away.",
+                             RowKind::Slider, [&s] { return s.cameraDistance; }, [&s, changed](int v) { s.cameraDistance = v; changed(); }};
+                distance.minimum = 50;
+                distance.maximum = 200;
+                distance.step = 5;
+                distance.suffix = "%";
+                rows.push_back(distance);
+                Row angle{"Camera angle", "How high the chase camera looks down at your car: 0\xC2\xB0 is the game's own, higher swings it up for a view from above, lower brings it down toward the road. Changes straight away.",
+                          RowKind::Slider, [&s] { return s.cameraAngle; }, [&s, changed](int v) { s.cameraAngle = v; changed(); }};
+                angle.minimum = kCameraAngleMin;
+                angle.maximum = kCameraAngleMax;
+                angle.step = 1;
+                angle.suffix = "\xC2\xB0";
+                rows.push_back(angle);
+                Row fov{"Field of view", "How wide the battle camera sees, across the picture. The game's own view is 65\xC2\xB0 at 4:3 and 81\xC2\xB0 at 16:9.",
+                        RowKind::Slider,
+                        [&s] { return s.fovDegrees > 0 ? s.fovDegrees : static_cast<int>(std::lround(tmho::defaultHorizontalFov())); },
+                        [&s, changed](int v)
+                        {
+                            const int gameDefault = static_cast<int>(std::lround(tmho::defaultHorizontalFov()));
+                            s.fovDegrees = v == gameDefault ? 0 : v;
+                            changed();
+                            tmho::settingsChanged();
+                        }};
+                fov.minimum = 50;
+                fov.maximum = 120;
+                fov.suffix = "\xC2\xB0";
+                rows.push_back(fov);
+                Row reset{"Reset camera", "Puts the camera distance, angle and field of view back to the game's own.", RowKind::Action, [] { return 0; },
+                          [&s, changed](int)
+                          {
+                              s.cameraDistance = 100;
+                              s.cameraAngle = 0;
+                              s.fovDegrees = 0;
+                              changed();
+                              tmho::settingsChanged();
+                          }};
+                reset.actionLabel = "Reset";
+                rows.push_back(reset);
+            }
+            else if (tab == 4)
             {
                 // On-screen controls (touch screens; the mouse drives them with PS2X_TOUCH=1).
                 Row touch{"On-screen controls",
@@ -1084,7 +1114,7 @@ namespace ps2settings
                                }};
                 rows.push_back(resetBinds);
             }
-            else if (tab == 4)
+            else if (tab == 5)
             {
                 Row edit{"Edit HUD layout", "Move and resize the battle HUD over your own game picture: drag a piece, scroll or drag a corner to resize. Best opened during a battle.",
                          RowKind::Action, [] { return 0; }, [](int) { openHudEditor(); }};
@@ -1602,12 +1632,21 @@ namespace ps2settings
             DrawRectangleRoundedLinesEx(hintBox, 0.3f, 6, 1.0f, Color{255, 255, 255, 70});
             text(hint, hintBox.x + 7.0f * s, hintBox.y + (hintBox.height - hintSize) * 0.5f, hintSize, Color{180, 188, 200, 255}, true);
 
-            // Tabs.
+            // Tabs. One size for all labels, a little smaller when the widest would not fit.
+            float tabSize = 14.0f * s;
+            {
+                float widest = 0.0f;
+                for (int t = 0; t < kTabCount; ++t)
+                    widest = std::max(widest, textWidth(kTabs[t], tabSize, true));
+                const float room = tabRect(l, 0).width - 6.0f * s;
+                if (widest > room && widest > 0.0f)
+                    tabSize = std::max(9.0f * s, tabSize * room / widest);
+            }
             for (int t = 0; t < kTabCount; ++t)
             {
                 const Rectangle r = tabRect(l, t);
                 const bool active = t == g_tab;
-                const float size = 14.0f * s;
+                const float size = tabSize;
                 const float w = textWidth(kTabs[t], size, true);
                 text(kTabs[t], r.x + (r.width - w) * 0.5f, r.y + (r.height - size) * 0.5f - 2.0f * s, size,
                      active ? WHITE : Color{138, 147, 163, 255}, true);
@@ -2217,17 +2256,14 @@ namespace ps2settings
                 s.resolution = 2;
             else if (s.internalScale == 3)
                 s.resolution = 3;
-            else if (ps2android::active())
-            {
-                // First start on a phone: 720p keeps it smooth and cool; widescreen fills more of a
-                // phone's wide screen.
-                s.resolution = 1;
-                s.aspect = 1;
-            }
             else
             {
-                const int lines = GetMonitorHeight(GetCurrentMonitor());
-                s.resolution = lines >= 2160 ? 4 : lines >= 1440 ? 3 : lines >= 1080 ? 2 : lines >= 720 ? 1 : 0;
+                // V9.1: a first start is the game as it was - 480p (the PS2's own picture), Smooth
+                // scaling, 60 fps, intro movies on and the game's own camera. On a phone widescreen
+                // fills more of its wide screen.
+                s.resolution = 0;
+                if (ps2android::active())
+                    s.aspect = 1;
             }
             save();
         }
@@ -2270,6 +2306,21 @@ namespace ps2settings
             changedAt = -1.0;
             save();
         }
+    }
+
+    void saveForExit()
+    {
+        Settings &s = g_settings;
+        if (!ps2android::active() && IsWindowReady() && s.windowMode == 0 && g_appliedWindowMode == 0 && !IsWindowFullscreen() &&
+            !IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE) && !IsWindowMinimized() && !IsWindowMaximized() && !IsWindowHidden())
+        {
+            const Vector2 pos = GetWindowPosition();
+            s.windowX = static_cast<int>(pos.x);
+            s.windowY = static_cast<int>(pos.y);
+            s.windowW = GetScreenWidth();
+            s.windowH = GetScreenHeight();
+        }
+        save();
     }
 
     // Opens F2 from a controller: the Guide / PS button, or both sticks pressed in together.

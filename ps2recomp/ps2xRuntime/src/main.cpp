@@ -1,6 +1,7 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
 #include "runtime/ps2_android.h"
+#include "runtime/ps2_exit.h"
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_perf.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
@@ -350,7 +351,7 @@ int main(int argc, char *argv[])
             const ps2launcher::Result setup = ps2launcher::run(kGame);
             if (!setup.play)
             {
-                endProcess(0); // window closed on the setup screen
+                ps2exit::now(0); // window closed on the setup screen
             }
             pathObj = setup.program;
             PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();

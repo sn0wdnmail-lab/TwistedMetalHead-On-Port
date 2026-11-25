@@ -92,6 +92,9 @@ namespace ps2gpu
     uint32_t currentSuperSampling() noexcept;
 
     void shutdown();
+    // V9.1: as the game closes (ps2exit): writes shaders compiled since the last save to
+    // shadercache.bin, waiting at most this long. Nothing else is stopped or released.
+    void saveShaderCacheForExit(int milliseconds);
 
     // ---- Shader cache (shadercache.bin beside the executable) ----
     // The Vulkan pipelines paraLLEl-GS builds are kept in a pipeline cache: init() loads it and

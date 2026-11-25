@@ -11,6 +11,7 @@
 #include "runtime/ps2_touch.h"
 #include "runtime/ps2_gl_shader.h"
 #include "runtime/ps2_launcher.h"
+#include "runtime/ps2_exit.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/gs/gs_gpu_renderer.h"
 #include "runtime/ps2_host_wait.h"
@@ -1052,6 +1053,8 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
         // Esc belongs to the game and the F2 settings drawer, not to closing the window.
         SetExitKey(KEY_NULL);
+        // V9.1: the close button, Alt+F4 and the taskbar close the game at once (ps2exit).
+        ps2exit::watchWindowClose(GetWindowHandle());
         // F2 settings drawer: loads settings.ini and applies window mode, V-Sync and volume.
         ps2settings::initialize((ps2launcher::executableDirectory() + "settings.ini").c_str());
         // SPU2 output: a 48 kHz stereo stream pulled from the IOP's sound processor.
@@ -3247,11 +3250,15 @@ void PS2Runtime::run()
             }
         }
 
-        if (WindowShouldClose() || ps2settings::quitRequested())
+        if (WindowShouldClose() || ps2settings::quitRequested() || ps2exit::closeAsked())
         {
-            RUNTIME_LOG("[run] window close requested, breaking out of loop");
+            // V9.1: the game goes away at once (ps2exit) - no waiting for the game's threads, the
+            // graphics driver or the sound device, which could hold a closing game up (seen in
+            // exclusive full screen). Settings, new shaders and the logs are written first.
+            RUNTIME_LOG("[run] window close requested");
+            std::fprintf(stderr, "[run] window close requested\n");
             requestStop();
-            break;
+            ps2exit::now(0);
         }
     }
 

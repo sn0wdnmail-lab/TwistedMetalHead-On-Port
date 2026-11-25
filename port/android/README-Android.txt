@@ -2,7 +2,10 @@ Twisted Metal: Head-On - Extra Twisted Edition - Android port (V9.1)
 ======================================================================
 
 V9.1: text narrowed for 16:9 keeps every stroke (letters no longer lose
-lines), and Sharp scaling gives every game pixel the same size on screen.
+lines), Sharp scaling gives every game pixel the same size on screen, a new
+Camera tab in the settings (camera distance, camera angle, field of view),
+the game starts as it was: 480p, 60 fps, intro movies on and the game's own
+camera - and saves load again (they failed with "Load Failed!" before).
 The Android build is made and checked on a PC: if something goes wrong on
 your phone, the logs (see the end) are what to send.
 
@@ -44,8 +47,10 @@ Playing
   The game pauses and goes quiet when you leave the app.
   To quit: settings > Game > Quit game (press Quit twice).
 
-Settings to try on a slower phone: Video > Resolution 480p or 720p (720p is
-the default), Frame rate 60 fps. 16:9 widescreen is on from the start.
+Settings: the game starts at Video > Resolution 480p and Frame rate 60 fps,
+the lightest for a phone; try 720p on a fast one. 16:9 widescreen is on from
+the start. Camera distance, camera angle and field of view are in the
+Camera tab.
 
 PCSX2 saves: copy your .ps2 memory card file into Download, then settings >
 Game > Import PCSX2 save.

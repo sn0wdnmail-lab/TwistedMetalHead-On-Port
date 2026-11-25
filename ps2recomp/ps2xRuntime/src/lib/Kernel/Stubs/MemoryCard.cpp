@@ -410,20 +410,18 @@ namespace ps2_stubs
                 return kMcResultUpLimitHandle;
             }
 
-            for (int attempt = 0; attempt < 0x10000; ++attempt)
+            // As the PS2's MCMAN does: the lowest free descriptor, from 0. (V9.1: they started at 1
+            // and went up with every open; Twisted Metal: Head-On reads its save back through
+            // descriptor 0, so loading a save failed with "Load Failed!".)
+            for (int32_t fd = 0; fd < static_cast<int32_t>(kMcMaxOpenFiles); ++fd)
             {
-                if (g_mcNextFd <= 0)
-                {
-                    g_mcNextFd = 1;
-                }
-
-                const int32_t fd = g_mcNextFd++;
                 if (g_mcFiles.find(fd) != g_mcFiles.end())
                 {
                     continue;
                 }
 
                 g_mcFiles.emplace(fd, McOpenFile{file, port, hostPath});
+                g_mcNextFd = fd + 1;
                 return fd;
             }
 

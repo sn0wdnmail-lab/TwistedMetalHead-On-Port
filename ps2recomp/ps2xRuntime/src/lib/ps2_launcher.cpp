@@ -2,6 +2,7 @@
 
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_android.h"
+#include "runtime/ps2_exit.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_texture_replace.h"
 #include "runtime/gs/gs_gpu_renderer.h"
@@ -19,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -1107,7 +1109,7 @@ namespace ps2launcher
         if (const char *pick = std::getenv("PS2X_SETUP_DISC"); pick && *pick) // tests: as if chosen with Browse
             selectDisc(screen, pick);
 
-        while (!WindowShouldClose() && !ps2settings::quitRequested())
+        while (!WindowShouldClose() && !ps2settings::quitRequested() && !ps2exit::closeAsked())
         {
             if (ps2android::active())
             {
@@ -1494,6 +1496,20 @@ namespace ps2launcher
             }
         }
 
+        if (!result.play)
+        {
+            // V9.1: closed (not PLAY): gone at once. A disc check or a game build is simply left
+            // (an unfinished file is redone by the next Build); a shader build gets up to a
+            // second and a half to save what it has compiled.
+            if (screen.shaderWorker && screen.shaderWorker->joinable() && screen.shaders)
+            {
+                screen.shaders->progress.cancel = true;
+                SetWindowState(FLAG_WINDOW_HIDDEN);
+                for (int i = 0; i < 150 && screen.shaders->state.load() == ShaderBuild::Running; ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            ps2exit::now(0);
+        }
         if (screen.checker && screen.checker->joinable())
             screen.checker->join();
         if (screen.searcher && screen.searcher->joinable())

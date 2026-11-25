@@ -16,6 +16,9 @@ namespace ps2settings
 {
     // This port's version, shown on the setup screen and in the window title.
     inline constexpr const char *kPortVersion = "V9.1";
+    // F2 > Camera > Camera angle: degrees below (-) / above (+) the game's own chase camera.
+    inline constexpr int kCameraAngleMin = -30;
+    inline constexpr int kCameraAngleMax = 40;
 
     struct Settings
     {
@@ -44,6 +47,7 @@ namespace ps2settings
         bool recordFrames = false; // a screenshot every 0.5 s into Logs\frames (ps2_capture)
         int fovDegrees = 0;        // battle camera horizontal field of view, 0 = the game's own (tmho_game)
         int cameraDistance = 100;  // chase camera distance in percent of the game's own (tmho_game)
+        int cameraAngle = 0;       // V9.1: chase camera angle in degrees above (+) or below (-) the game's own (tmho_game)
         // Battle HUD layout (F2 > HUD, tmho_game): per piece an offset in 0.1 % of the picture's
         // width / height from where the game puts it, and a size in percent.
         int hudRadarX = 0, hudRadarY = 0, hudRadarScale = 100;
@@ -60,7 +64,7 @@ namespace ps2settings
         int musicVolume = 100;      // 0..100: the SPU2's sound data input (streamed music) outside movies
         int effectsVolume = 100;    // 0..100: the SPU2's voices (engines, guns, explosions, voices)
         int movieVolume = 100;      // 0..100: the sound data input while a movie plays
-        bool skipIntro = true;      // skip the logo movies and the intro movie at start
+        bool skipIntro = false;     // skip the logo movies and the intro movie at start (V9.1: off by default)
         bool vibration = true;      // controller vibration (rumble) when the game asks for it
         bool pauseOnPadLoss = true; // pause (open this menu) when the controller in use disconnects
         int windowX = -1, windowY = -1; // windowed mode: where the window was left (-1 = centred)
@@ -99,6 +103,9 @@ namespace ps2settings
     bool menuOpen() noexcept;
     // "Quit game" (F2 > Game) was confirmed: the main loop closes the game as if the window closed.
     bool quitRequested() noexcept;
+    // V9.1: called as the game closes (ps2exit): notes where the window is and writes
+    // settings.ini now.
+    void saveForExit();
     bool emulationPaused() noexcept;
 
     // Before the window exists: reads settings.ini so the renderer can be chosen.

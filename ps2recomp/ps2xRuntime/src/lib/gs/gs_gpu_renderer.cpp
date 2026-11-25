@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -120,8 +121,12 @@ namespace ps2gpu
             return ok;
         }
 
+        std::mutex g_cacheFileMutex;               // one save at a time (they share shadercache.bin.tmp)
+        std::atomic<bool> g_cacheSaveRunning{false}; // V9.1: a background save is under way
+
         bool saveShaderCache(Device &device, bool onlyIfGrown)
         {
+            std::lock_guard<std::mutex> fileLock(g_cacheFileMutex);
             const size_t size = device.get_pipeline_cache_size();
             if (size == 0)
                 return false;
@@ -1092,7 +1097,8 @@ namespace ps2gpu
         {
             static bool savedAfterBuild = false;
             static uint32_t checkTick = 0;
-            if (!savedAfterBuild && (++checkTick % 60u) == 0u && s.iface.shader_compilation_finished())
+            ++checkTick;
+            if (!savedAfterBuild && (checkTick % 60u) == 0u && s.iface.shader_compilation_finished())
             {
                 savedAfterBuild = true;
                 if (!g_cacheSaver)
@@ -1100,6 +1106,19 @@ namespace ps2gpu
                     Device *device = &s.device;
                     g_cacheSaver = new std::thread([device] { saveShaderCache(*device, true); });
                 }
+            }
+            // V9.1: shaders the game had to wait for are written about once a minute as well, so
+            // closing the game has little or nothing left to save (it closes at once).
+            else if (savedAfterBuild && (checkTick % 3600u) == 0u && g_stalledCompiles.load(std::memory_order_relaxed) != 0u &&
+                     !g_cacheSaveRunning.exchange(true))
+            {
+                Device *device = &s.device;
+                std::thread([device]
+                            {
+                                saveShaderCache(*device, true);
+                                g_cacheSaveRunning.store(false);
+                            })
+                    .detach();
             }
         }
         static const bool debugFrames = std::getenv("PS2X_GPU_DEBUG") != nullptr;
@@ -1260,6 +1279,26 @@ namespace ps2gpu
         saveShaderCache(s.device, true);
     }
 
+    void saveShaderCacheForExit(int milliseconds)
+    {
+        if (!active())
+            return;
+        // On a thread of its own, so a slow driver or disk never holds the closing game up for
+        // longer than this: the file is written to shadercache.bin.tmp first and renamed, so an
+        // unfinished save leaves the old shadercache.bin as it was.
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        Device *device = &st().device;
+        std::thread([device, done]
+                    {
+                        saveShaderCache(*device, true);
+                        done->store(true, std::memory_order_release);
+                    })
+            .detach();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+        while (!done->load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
     std::string shaderCachePath()
     {
         return ps2launcher::executableDirectory() + "shadercache.bin";
@@ -1356,6 +1395,7 @@ namespace ps2gpu
     void requestSuperSampling(uint32_t) noexcept {}
     uint32_t currentSuperSampling() noexcept { return 1u; }
     void shutdown() {}
+    void saveShaderCacheForExit(int) {}
     std::string shaderCachePath() { return {}; }
     uint64_t shaderCacheBytes() { return 0; }
     bool buildShaderCache(ShaderBuildProgress &, std::string &, std::string &error)

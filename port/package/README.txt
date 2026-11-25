@@ -36,7 +36,7 @@ Keys (or plug in a controller)
   C or Esc          Circle         Q / E        L1 / R1
   Z                 Square         Left/Right Shift   L2 / R2
   V                 Triangle
-  F2                settings (video, audio, game, HUD, UI colour); with a
+  F2                settings (video, audio, game, camera, controls, HUD, UI); with a
                     controller: the Guide / PS button, or press both sticks
                     in together, then the D-pad, A / Cross and B / Circle
   F11 or Alt+Enter  windowed <-> full screen
@@ -44,6 +44,12 @@ Keys (or plug in a controller)
   F1                debugger
 
 To quit, close the window, or use F2 > Game > Quit game (press Quit twice).
+(V9.1) The game closes at once, however you close it. Saves made in the port
+(or imported from PCSX2) load again: before V9.1 the game said "Load Failed!".
+
+First start (V9.1): the game starts as it was on the PS2 - 480p picture,
+Smooth scaling, 60 fps, 4:3, intro movies on and the game's own camera.
+Change any of it in F2; your choices are kept in settings.ini.
 
 Video (F2 > Video) - all of it changes straight away, no restart needed
   Display mode         Windowed, Borderless or Fullscreen. F11 or Alt+Enter
@@ -65,11 +71,14 @@ Video (F2 > Video) - all of it changes straight away, no restart needed
                        multiple of the picture. Smooth blends them for a
                        softer, filtered look.
   V-Sync               Waits for the monitor's refresh to avoid tearing.
-  Frame rate           60 fps shows the game's own frames. 120 fps and Monitor
-                       (your screen's refresh rate, e.g. 144 or 170) add
-                       in-between frames made from the two newest game frames:
-                       motion is smoother and the game keeps its normal speed.
-                       The picture is then about one frame later.
+  Frame rate           60 fps (the default, recommended) shows the game's own
+                       frames. For smoother motion, we recommend Lossless
+                       Scaling (on Steam) with its frame generation, running
+                       the game at 60 fps: it gives the best experience.
+                       120 fps and Monitor (your screen's refresh rate) are
+                       the port's own in-between frames made from the two
+                       newest game frames; the picture is then about one frame
+                       later.
   Brightness           Lightens (or darkens) the picture, 70-150 %. Dark parts
                        change most, so night arenas get easier to see without
                        washing out explosions. 100 % is the game's own picture.
@@ -101,7 +110,7 @@ Controls (F2 > Controls) - V9
 
 Game (F2 > Game)
   Skip intro movies    Skips the logo movies and the intro when the game
-                       starts (on by default), straight to the menus.
+                       starts, straight to the menus (off by default).
   Controller vibration Lets the game rumble your controller when you hit or
                        get hit, as on the PS2: Xbox and other XInput
                        controllers, and (V9) PlayStation DualShock 4 and
@@ -136,10 +145,17 @@ Sharper font (Vulkan renderer)
   version of the port is set up ("Build game"), the textures folder of the
   version that last used one is copied next to the new TMHO.exe.
 
-Camera (F2 > Game)
+Camera (F2 > Camera) - V9.1
+  Camera distance      How far the chase camera sits behind your car, 50-200%
+                       (100% is the game's own).
+  Camera angle         How high the chase camera looks down at your car, from
+                       -30 to +40 degrees (0 is the game's own): higher swings
+                       it up for a view from above, lower brings it down
+                       toward the road.
   Field of view        How wide the battle camera sees (the game's own view is
                        65 degrees at 4:3, 81 at 16:9).
-  Camera distance      How far the chase camera sits behind your car, 50-200%.
+  Reset camera         All three back to the game's own.
+  They all change straight away, also in the middle of a battle.
 
 Battle HUD (F2 > HUD)
   Edit HUD layout      Shows the radar and the weapon panel over your own game
@@ -174,7 +190,7 @@ Needs Windows 10/11 (64-bit) and a graphics card with Vulkan. Logs go in a
 "Logs" folder next to TMHO.exe: performancelogs.txt, Graphicslogs.txt and
 console.txt (the game's text output). If something goes wrong, those three
 files are what to send. If the game ever freezes, it notes in them where it
-got stuck, and if closing takes more than 10 seconds it ends itself, so no
-TMHO.exe is left running in the background.
+got stuck. Closing never waits for the game: settings and new shaders are
+written and TMHO.exe ends, so none is left running in the background.
 
 This package contains no game data: you need your own copy of the game.

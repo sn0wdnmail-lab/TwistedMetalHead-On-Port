@@ -995,26 +995,68 @@ namespace
         if (freshEntry(ctx, kCameraLookAt) && g_eyeScratch != 0u && contains(kChaseCameraCallers, returnAddress(ctx)))
         {
             const int percent = ps2settings::get().cameraDistance;
+            const int angle = ps2settings::get().cameraAngle;
             const uint8_t *eye = getMemPtr(rdram, GPR_U32(ctx, 5));
             const uint8_t *target = getMemPtr(rdram, GPR_U32(ctx, 6));
+            const uint8_t *upVector = getMemPtr(rdram, GPR_U32(ctx, 7));
             uint8_t *scratch = getMemPtr(rdram, g_eyeScratch);
-            if (percent != 100 && eye && target && scratch)
+            if ((percent != 100 || angle != 0) && eye && target && scratch)
             {
-                // Same direction from the target, distance scaled: closer below 100 %, further above.
                 float e[4], t[4];
                 std::memcpy(e, eye, sizeof(e));
                 std::memcpy(t, target, sizeof(t));
+                float v[3] = {e[0] - t[0], e[1] - t[1], e[2] - t[2]};
+                float pitchBefore = 0.0f, pitchAfter = 0.0f;
+                if (angle != 0)
+                {
+                    // Camera angle: the camera swings up (or down) around the car, at the same
+                    // distance, along the game's own "up" for this view.
+                    float up[3] = {0.0f, 1.0f, 0.0f};
+                    if (upVector)
+                    {
+                        float u[4];
+                        std::memcpy(u, upVector, sizeof(u));
+                        const float length = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+                        if (length > 1e-6f)
+                            for (int i = 0; i < 3; ++i)
+                                up[i] = u[i] / length;
+                    }
+                    const float along = v[0] * up[0] + v[1] * up[1] + v[2] * up[2];
+                    const float h[3] = {v[0] - along * up[0], v[1] - along * up[1], v[2] - along * up[2]};
+                    const float flat = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+                    const float length = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                    if (flat > 1e-4f && length > 1e-4f)
+                    {
+                        // Never lower than 2 degrees above the car (the camera would go into the
+                        // ground) or higher than 80 (straight above, the view turns over), unless
+                        // the game's own camera already is.
+                        constexpr float kLowest = 2.0f / 57.29578f, kHighest = 80.0f / 57.29578f;
+                        pitchBefore = std::atan2(along, flat);
+                        pitchAfter = std::clamp(pitchBefore + static_cast<float>(angle) / 57.29578f, std::min(pitchBefore, kLowest),
+                                                std::max(pitchBefore, kHighest));
+                        const float c = std::cos(pitchAfter), sn = std::sin(pitchAfter);
+                        for (int i = 0; i < 3; ++i)
+                            v[i] = length * (c * h[i] / flat + sn * up[i]);
+                    }
+                }
+                // Distance: same direction from the target, scaled (closer below 100 %, further above).
                 const float k = static_cast<float>(percent) / 100.0f;
                 for (int i = 0; i < 3; ++i)
-                    e[i] = t[i] + (e[i] - t[i]) * k;
+                    e[i] = t[i] + v[i] * k;
                 std::memcpy(scratch, e, sizeof(e));
                 SET_GPR_U32(ctx, 5, g_eyeScratch);
                 static int traced = 0;
                 if (traceOn() && traced < 5)
                 {
                     ++traced;
-                    std::fprintf(stderr, "[tmho] chase camera caller=%06x target=(%.2f %.2f %.2f) eye moved to (%.2f %.2f %.2f), %d%%\n",
-                                 returnAddress(ctx), t[0], t[1], t[2], e[0], e[1], e[2], percent);
+                    float u[4] = {0, 0, 0, 0};
+                    if (upVector)
+                        std::memcpy(u, upVector, sizeof(u));
+                    float e0[4];
+                    std::memcpy(e0, eye, sizeof(e0));
+                    std::fprintf(stderr, "[tmho] chase camera caller=%06x target=(%.2f %.2f %.2f %.2f) eye (%.2f %.2f %.2f %.2f) up (%.3f %.3f %.3f %.3f) -> eye (%.2f %.2f %.2f), %d%%, pitch %.1f -> %.1f deg\n",
+                                 returnAddress(ctx), t[0], t[1], t[2], t[3], e0[0], e0[1], e0[2], e0[3], u[0], u[1], u[2], u[3], e[0], e[1], e[2], percent,
+                                 pitchBefore * 57.29578f, pitchAfter * 57.29578f);
                 }
             }
         }
