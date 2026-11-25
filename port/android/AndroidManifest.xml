@@ -3,8 +3,8 @@
      (raylib's NativeActivity glue); TmhoActivity adds full screen, storage access and vibration. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.sn0wdnmaillab.tmhoport"
-    android:versionCode="9"
-    android:versionName="V9"
+    android:versionCode="10"
+    android:versionName="V9.1"
     android:installLocation="auto">
 
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="35" />

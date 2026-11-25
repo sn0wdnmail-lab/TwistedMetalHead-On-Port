@@ -24,4 +24,9 @@ namespace ps2texrep
     // The replacements whose pictures exist next to the exe, loaded and ready to hand to the
     // renderer. Problems go to `notes` (one line each) for the graphics log.
     std::vector<Replacement> loadAll(std::vector<std::string> &notes);
+
+    // A new version's folder without a textures folder gets a copy of the one the replacements
+    // were last loaded from (an earlier version's folder). Returns what was done, for the log
+    // ("" when nothing was copied). Called by the setup screen when it builds the game folder.
+    std::string carryOver();
 }

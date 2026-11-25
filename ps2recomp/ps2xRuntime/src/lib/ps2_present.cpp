@@ -84,8 +84,21 @@ void main()
     vec4 color;
     if (nearest == 1)
     {
-        int i = clamp(int(floor(center + 0.5)), 0, maxIndex);
-        color = texelFetch(texture0, dir.x > 0.5 ? ivec2(i, other) : ivec2(other, i), 0);
+        // Sharp (enlarging): each output pixel takes the source pixels it covers, in proportion.
+        // Crisp like nearest neighbour, but every source pixel comes out the same size at uneven
+        // scales (plain nearest repeats some lines twice and others three times).
+        float w = srcLen / dstLen;
+        float s0 = along * w;
+        float s1 = s0 + w;
+        float edge = floor(s1);
+        int i0 = clamp(int(floor(s0)), 0, maxIndex);
+        color = texelFetch(texture0, dir.x > 0.5 ? ivec2(i0, other) : ivec2(other, i0), 0);
+        if (edge > s0 && edge < s1)
+        {
+            int i1 = clamp(int(edge), 0, maxIndex);
+            vec4 next = texelFetch(texture0, dir.x > 0.5 ? ivec2(i1, other) : ivec2(other, i1), 0);
+            color = mix(color, next, (s1 - edge) / w);
+        }
     }
     else
     {

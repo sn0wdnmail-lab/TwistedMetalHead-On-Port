@@ -1,5 +1,5 @@
 diff --git a/gs/gs_interface.cpp b/gs/gs_interface.cpp
-index ea00016..cce3a87 100644
+index ea00016..5403abe 100644
 --- a/gs/gs_interface.cpp
 +++ b/gs/gs_interface.cpp
 @@ -9,6 +9,8 @@
@@ -50,7 +50,7 @@ index ea00016..cce3a87 100644
  		render_pass.tex_infos.push_back(info);
  		render_pass.tex0_infos.push_back(ctx.tex0.desc);
  		render_pass.held_images.push_back(std::move(image));
-@@ -1811,6 +1838,89 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
+@@ -1811,6 +1838,134 @@ uint32_t GSInterface::drawing_kick_update_texture(FBFeedbackMode feedback_mode,
  	return texture_index;
  }
  
@@ -76,6 +76,51 @@ index ea00016..cce3a87 100644
 +	texture_replacement.scale = float(replacement.width) / float(gs_width);
 +	texture_replacement.image = std::move(image);
 +	return true;
++}
++
++// [ps2x] A sprite drawn smaller than its texture (more than 1.05 texels per pixel, in either
++// direction) in a way that loses texels: point-sampled at a ratio that isn't a whole number
++// (whole numbers are exact 2:1 / 4:1 reductions, left as the game made them), or filtered at
++// any ratio. Up to 16:1, and at least two pixels in that direction.
++bool GSInterface::sprite_minified(const VertexPosition *pos, const VertexAttribute *attr, bool linear) const
++{
++	const auto &prim = registers.prim;
++	const auto &ctx = registers.ctx[prim.desc.CTXT];
++	float u[2], v[2];
++	for (int i = 0; i < 2; i++)
++	{
++		if (prim.desc.FST)
++		{
++			u[i] = float(attr[i].uv.x) * (1.0f / 16.0f);
++			v[i] = float(attr[i].uv.y) * (1.0f / 16.0f);
++		}
++		else
++		{
++			float q = attr[i].q != 0.0f ? attr[i].q : 1.0f;
++			u[i] = attr[i].st.x / q * float(1u << std::min<uint32_t>(ctx.tex0.desc.TW, 10u));
++			v[i] = attr[i].st.y / q * float(1u << std::min<uint32_t>(ctx.tex0.desc.TH, 10u));
++		}
++	}
++	const float scale = 1.0f / float(1 << PGS_SUBPIXEL_BITS);
++	const float dx = std::abs(float(pos[1].pos.x - pos[0].pos.x)) * scale;
++	const float dy = std::abs(float(pos[1].pos.y - pos[0].pos.y)) * scale;
++	auto loses_texels = [linear](float texels, float pixels) {
++		if (pixels < 2.0f)
++			return false;
++		const float ratio = texels / pixels;
++		if (ratio <= 1.05f || ratio >= 16.0f)
++			return false;
++		if (linear)
++			return true;
++		const float fraction = ratio - std::floor(ratio);
++		return fraction > 0.05f && fraction < 0.95f;
++	};
++	return loses_texels(std::abs(u[1] - u[0]), dx) || loses_texels(std::abs(v[1] - v[0]), dy);
++}
++
++void GSInterface::set_supersample_minified_sprites(bool enable)
++{
++	supersample_minified_sprites = enable;
 +}
 +
 +// The replacement image has a mip chain; the GS texture usually has none (fixed LOD 0), so each
@@ -140,7 +185,7 @@ index ea00016..cce3a87 100644
  void GSInterface::drawing_kick_update_state(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb)
  {
  	if (!get_and_clear_dirty_flag(STATE_DIRTY_PRIM_TEMPLATE_BIT))
-@@ -2687,6 +2797,18 @@ void GSInterface::drawing_kick_append()
+@@ -2687,6 +2842,18 @@ void GSInterface::drawing_kick_append()
  	PrimitiveAttribute prim_attr;
  	prim_attr.tex = prim_state.tex;
  	prim_attr.tex2 = prim_state.tex2;
@@ -159,7 +204,34 @@ index ea00016..cce3a87 100644
  	prim_attr.state = prim_state.state;
  	prim_attr.fbmsk = ctx.frame.desc.FBMSK;
  	prim_attr.fogcol = registers.fogcol.words[0];
-@@ -2719,6 +2841,12 @@ void GSInterface::drawing_kick_append()
+@@ -2697,8 +2864,24 @@ void GSInterface::drawing_kick_append()
+ 	{
+ 		prim_attr.state |= 1u << STATE_BIT_PARALLELOGRAM;
+ 		prim_attr.state |= 1u << STATE_BIT_SPRITE;
+-		prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
+-		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
++		// [ps2x] Sprites are normally shaded once per native pixel even when super-sampling (UI
++		// atlases stay crisp). A sprite drawn smaller than its texture then samples only some of
++		// its texels: nearest sampling at an uneven ratio skips whole columns, and bilinear
++		// sampling at more than about 2:1 skips them too. The PC port's 16:9 text is narrowed to
++		// three quarters of its width, so letters lost strokes. Such sprites are shaded per
++		// sample instead; without super-sampling (one sample per pixel) a point-sampled one is
++		// filtered instead.
++		const bool linear = (prim_attr.tex & TEX_SAMPLER_MAG_LINEAR_BIT) != 0;
++		const bool minified = supersample_minified_sprites && prim.desc.TME && !replaced_texture &&
++		                      sprite_minified(pos, attr, linear);
++		const bool per_sample_sprite = minified && (sampling_rate_x_log2 || sampling_rate_y_log2);
++		if (minified && !per_sample_sprite && !linear)
++			prim_attr.tex |= TEX_SAMPLER_MAG_LINEAR_BIT;
++		if (!per_sample_sprite)
++		{
++			prim_attr.state |= 1u << STATE_BIT_SNAP_RASTER;
++			prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
++		}
+ 		prim_attr.state &= ~(1u << STATE_BIT_MULTISAMPLE);
+ 	}
+ 	else if (is_line)
+@@ -2719,6 +2902,12 @@ void GSInterface::drawing_kick_append()
  		prim_attr.state |= 1u << STATE_BIT_SNAP_ATTRIBUTE;
  	}
  
@@ -172,7 +244,7 @@ index ea00016..cce3a87 100644
  	prim_attr.state |= render_pass.current_instance << STATE_VERTEX_RENDER_PASS_INSTANCE_OFFSET;
  
  	// If our damage region expands, then mark hazards.
-@@ -2875,7 +3003,11 @@ void GSInterface::drawing_kick_primitive(bool adc)
+@@ -2875,7 +3064,11 @@ void GSInterface::drawing_kick_primitive(bool adc)
  	if (!adc)
  	{
  		if (!draw_is_degenerate())
@@ -184,7 +256,7 @@ index ea00016..cce3a87 100644
  		else
  			TRACE("Degenerate Draw", DummyBits{});
  	}
-@@ -3246,6 +3378,11 @@ void GSInterface::init_transfer()
+@@ -3246,6 +3439,11 @@ void GSInterface::init_transfer()
  			return;
  		}
  
@@ -196,7 +268,7 @@ index ea00016..cce3a87 100644
  		if (host_timeline == UINT64_MAX)
  		{
  			host_timeline = tracker.mark_submission_timeline(FlushReason::HostAccess);
-@@ -3254,6 +3391,19 @@ void GSInterface::init_transfer()
+@@ -3254,6 +3452,19 @@ void GSInterface::init_transfer()
  				renderer.wait_timeline(host_timeline);
  		}
  		renderer.wait_timeline(host_timeline);
@@ -216,7 +288,7 @@ index ea00016..cce3a87 100644
  
  		void *mapped = renderer.begin_host_vram_access();
  
-@@ -4268,6 +4418,7 @@ void GSInterface::flush()
+@@ -4268,6 +4479,7 @@ void GSInterface::flush()
  {
  	flush_pending_transfer(true);
  	uint64_t value = tracker.mark_submission_timeline();
@@ -224,7 +296,7 @@ index ea00016..cce3a87 100644
  	renderer.flush_submit(value);
  	if (debug_mode.deterministic_timeline_query)
  		renderer.wait_timeline(value);
-@@ -4633,11 +4784,42 @@ void GSInterface::register_backbuffer_promotion_fbp(uint32_t fbp)
+@@ -4633,11 +4845,42 @@ void GSInterface::register_backbuffer_promotion_fbp(uint32_t fbp)
  	num_promoted_backbuffers++;
  }
  
@@ -268,7 +340,7 @@ index ea00016..cce3a87 100644
  	if (state_tracker.has_complex_scanmsk_timeout)
  	{
 diff --git a/gs/gs_interface.hpp b/gs/gs_interface.hpp
-index 9f05da8..ead4b49 100644
+index 9f05da8..507b192 100644
 --- a/gs/gs_interface.hpp
 +++ b/gs/gs_interface.hpp
 @@ -184,6 +184,9 @@ struct VSyncInfo
@@ -281,7 +353,7 @@ index 9f05da8..ead4b49 100644
  	// When using SSAA, attempt to scan out a higher resolution image based on the super samples.
  	// This only works well if the game is rendering 3D geometry directly to the frame buffer which is used to scanout.
  	// Some games blit the real framebuffer to scanout location using textures, which will lose the SSAA information necessary to scanout,
-@@ -251,11 +254,31 @@ public:
+@@ -251,11 +254,34 @@ public:
  class GSInterface final
  {
  public:
@@ -309,11 +381,14 @@ index 9f05da8..ead4b49 100644
 +		uint32_t width = 0, height = 0;
 +		std::vector<std::vector<uint32_t>> levels; // level 0 = width x height, then halves
 +	};
++	// [ps2x] Shade sprites drawn smaller than their texture per sample when super-sampling (on by
++	// default): narrowed text keeps all its strokes. See sprite_minified().
++	void set_supersample_minified_sprites(bool enable);
 +	bool set_texture_replacement(const TextureReplacement &replacement);
  	void set_debug_mode(const DebugMode &mode);
  	void set_hacks(const Hacks &hacks);
  
-@@ -297,6 +320,8 @@ public:
+@@ -297,6 +323,8 @@ public:
  
  	ScanoutResult vsync(const VSyncInfo &info);
  	bool vsync_can_skip(const VSyncInfo &info) const;
@@ -322,7 +397,7 @@ index 9f05da8..ead4b49 100644
  
  	FlushStats consume_flush_stats();
  	double get_accumulated_timestamps(TimestampType type) const;
-@@ -521,6 +546,16 @@ private:
+@@ -521,6 +549,18 @@ private:
  
  	uint32_t drawing_kick_update_texture(FBFeedbackMode feedback_mode, const ivec4 &uv_bb, const ivec4 &bb);
  
@@ -333,13 +408,15 @@ index 9f05da8..ead4b49 100644
 +		float scale = 1.0f;
 +		Vulkan::ImageHandle image;
 +	} texture_replacement;
++	bool sprite_minified(const VertexPosition *pos, const VertexAttribute *attr, bool linear) const;
++	bool supersample_minified_sprites = true;
 +	void apply_replacement_lod(PrimitiveAttribute &prim_attr, const VertexPosition *pos, const VertexAttribute *attr,
 +	                           uint32_t count, const TextureInfo &info, bool per_sample) const;
 +
  	struct PrimitiveTemplate
  	{
  		uint32_t state, tex, tex2;
-@@ -559,6 +594,34 @@ private:
+@@ -559,6 +599,34 @@ private:
  		uint32_t has_complex_scanmsk_timeout = 0;
  	} state_tracker;
  

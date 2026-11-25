@@ -11,6 +11,7 @@
 namespace ps2launcher
 {
     std::string executableDirectory(); // ps2_file_dialog.cpp
+    std::string userDataDirectory();   // ps2_file_dialog.cpp
 }
 
 namespace ps2texrep
@@ -153,6 +154,43 @@ namespace ps2texrep
         }
     }
 
+    namespace
+    {
+        // V9.1: where replacement textures were last loaded from (an earlier version's folder) is
+        // remembered in the user's data folder, so the setup screen of a new version can bring
+        // its textures folder over (carryOver).
+        fs::path rememberedFile()
+        {
+            const std::string base = ps2launcher::userDataDirectory();
+            if (base.empty())
+                return {};
+            return utf8Path(base) / "PS2 PC ports" / "SCUS-97621" / "textures.txt";
+        }
+
+        std::string readRemembered()
+        {
+            const fs::path file = rememberedFile();
+            std::vector<unsigned char> bytes;
+            if (file.empty() || !readFile(file, bytes))
+                return {};
+            std::string dir(bytes.begin(), bytes.end());
+            while (!dir.empty() && (dir.back() == '\n' || dir.back() == '\r' || dir.back() == ' '))
+                dir.pop_back();
+            return dir;
+        }
+
+        void remember(const std::string &dir)
+        {
+            const fs::path file = rememberedFile();
+            if (file.empty() || readRemembered() == dir)
+                return;
+            std::error_code ec;
+            fs::create_directories(file.parent_path(), ec);
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << dir << "\n";
+        }
+    }
+
     std::vector<Replacement> loadAll(std::vector<std::string> &notes)
     {
         std::vector<Replacement> result;
@@ -161,8 +199,28 @@ namespace ps2texrep
         {
             Replacement r;
             if (load(slot, dir, r, notes))
+            {
+                remember(dir);
                 result.push_back(std::move(r));
+            }
         }
         return result;
+    }
+
+    std::string carryOver()
+    {
+        const std::string here = ps2launcher::executableDirectory();
+        const std::string earlier = readRemembered();
+        if (here.empty() || earlier.empty())
+            return {};
+        std::error_code ec;
+        const fs::path from = utf8Path(earlier) / "textures";
+        const fs::path to = utf8Path(here) / "textures";
+        if (fs::equivalent(utf8Path(earlier), utf8Path(here), ec) || fs::exists(to, ec) || !fs::is_directory(from, ec))
+            return {};
+        fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::skip_existing, ec);
+        if (ec)
+            return "Couldn't copy the textures folder from " + earlier + ": " + ec.message();
+        return "Replacement textures copied from " + earlier;
     }
 }

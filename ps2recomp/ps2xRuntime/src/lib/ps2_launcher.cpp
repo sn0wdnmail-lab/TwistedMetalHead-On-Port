@@ -3,6 +3,7 @@
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_android.h"
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_texture_replace.h"
 #include "runtime/gs/gs_gpu_renderer.h"
 #include "ps2_settings_ui.h"
 
@@ -572,6 +573,10 @@ namespace ps2launcher
                 return fail("The game program wasn't written.");
             fs::create_directories(savesDir / "mc0", ec);
             fs::create_directories(savesDir / "mc1", ec);
+            // Replacement textures (e.g. a font) set up next to an earlier version come along.
+            const std::string textures = ps2texrep::carryOver();
+            if (!textures.empty())
+                std::fprintf(stderr, "[setup] %s\n", textures.c_str());
             build->state = Build::Done;
         }
 

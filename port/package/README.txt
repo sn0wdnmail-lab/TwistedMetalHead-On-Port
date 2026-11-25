@@ -57,8 +57,13 @@ Video (F2 > Video) - all of it changes straight away, no restart needed
                        game's 3D cameras see more to each side (nothing is
                        stretched), and the HUD, radar and text keep their shape.
                        Pre-rendered movies stay 4:3. Stretch fills the screen.
-  Scaling              Sharp or Smooth, when the picture is smaller than the
-                       screen.
+                       (V9.1) Text narrowed for 16:9 keeps every stroke at all
+                       resolutions (letters no longer lose lines).
+  Scaling              How the game picture is enlarged to the window. Sharp
+                       keeps the pixels crisp, and (V9.1) every pixel comes out
+                       the same size even when the window isn't an exact
+                       multiple of the picture. Smooth blends them for a
+                       softer, filtered look.
   V-Sync               Waits for the monitor's refresh to avoid tearing.
   Frame rate           60 fps shows the game's own frames. 120 fps and Monitor
                        (your screen's refresh rate, e.g. 144 or 170) add
@@ -127,7 +132,9 @@ Sharper font (Vulkan renderer)
   or 16 times the size (2048 x 2048 is plenty, even at 4K). Every piece of
   text in the game is drawn from it at the full internal resolution, so the
   letters are sharpest at 2x or 4x. Remove the file to get the game's own
-  font back. Graphicslogs.txt notes whether it was used.
+  font back. Graphicslogs.txt notes whether it was used. (V9.1) When a new
+  version of the port is set up ("Build game"), the textures folder of the
+  version that last used one is copied next to the new TMHO.exe.
 
 Camera (F2 > Game)
   Field of view        How wide the battle camera sees (the game's own view is

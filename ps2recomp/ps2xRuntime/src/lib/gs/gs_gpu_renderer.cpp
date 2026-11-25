@@ -605,6 +605,12 @@ namespace ps2gpu
             }
         }
         s.superSampling = static_cast<uint32_t>(gsOptions.super_sampling);
+        // Sprites drawn smaller than their texture by an uneven factor (16:9 text) are shaded per
+        // sample, so letters keep every stroke (PS2X_PGS_SSAA_MINIFIED=0 turns it off).
+        {
+            const char *env = std::getenv("PS2X_PGS_SSAA_MINIFIED");
+            s.iface.set_supersample_minified_sprites(!(env && *env == '0'));
+        }
         g_currentSuperSampling.store(s.superSampling);
 
         const VkPhysicalDeviceProperties &props = s.device.get_gpu_properties();

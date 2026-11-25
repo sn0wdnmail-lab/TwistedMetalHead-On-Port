@@ -91,6 +91,25 @@ controller the game's own **vibration** works (V8).
 - A click or tap on a slider sets it where it lands; paraLLEl-GS's texture cache is capped on
   GPUs that share the system's memory (phones, integrated GPUs).
 
+## V9.1 (all versions)
+
+- **16:9 text keeps every stroke.** In widescreen the game's text is drawn three quarters as
+  wide, so each letter is shrunk from its font texture by 2-2.6x; paraLLEl-GS shaded sprites once
+  per native pixel, and its filtering then skipped texel columns - letters lost lines (the "E"
+  of NEW GAME had no spine). Sprites drawn smaller than their texture are now shaded per sample
+  when super-sampling (point-sampled ones only at uneven ratios; whole-number 2:1 reductions stay
+  as the game made them), so text is complete and smooth at 720p and above, in 16:9 and 4:3.
+  Without super-sampling (480p) a point-sampled one of them is filtered instead.
+  `PS2X_PGS_SSAA_MINIFIED=0` turns it off for comparisons.
+- **Sharp scaling gives every game pixel the same size.** Plain nearest neighbour repeated some
+  lines twice and others three times when the window isn't an exact multiple of the picture
+  (1280x447 shown at 1689x950, say). Sharp now takes the source pixels each screen pixel covers,
+  in proportion: just as crisp, without the uneven rows and columns. Smooth is unchanged
+  (Lanczos), so the two now look clearly different.
+- **Replacement textures come along to new versions**: the setup screen copies the `textures`
+  folder of the version that last loaded one (remembered in the user's data folder) next to the
+  new TMHO.exe when it builds the game folder. Delete the folder to stop using it.
+
 ## What the PC port includes
 
 ### The game itself
@@ -141,13 +160,16 @@ controller the game's own **vibration** works (V8).
 - **Display modes**: Windowed, Borderless and exclusive **Fullscreen**; **F11** or **Alt+Enter**
   switches between windowed and full screen at any time. Everything switches **live, without
   restarting the game**.
-- Scaling filter (smooth or sharp) and V-Sync.
+- Scaling filter and V-Sync: **Sharp** keeps the game's pixels crisp and (V9.1) all the same
+  size at any window size; **Smooth** is a sharp Lanczos filter.
 - **Replaceable font** (V6.2, Vulkan renderer): a `textures/font_atlas.png` next to TMHO.exe
   (the game's 16×16 grid of letters, upright, redrawn at 2, 4, 8 or 16 times the size) is used
   for every piece of text instead of the game's 512×512 font texture. It is mipmapped, so it
   stays clean at every internal resolution. Since V6.3 its text is shaded per sample at 2x and
   4x (paraLLEl-GS otherwise shades sprites once per native pixel), so letters get sharper with
   the internal resolution instead of losing thin strokes. No font picture ships with the port.
+  Since V9.1 the game's own font is shaded the same way wherever it is drawn smaller than its
+  texture, and a new version's setup copies the previous version's `textures` folder.
 - **Lighting fix**: the COP2 instruction fix from PCSX2's game database, which corrects
   lighting that came out wrong when the vector unit was read too early.
 
@@ -359,6 +381,8 @@ resolution), from the port's own performance log (CPU time of every thread of th
   there; lower resolutions help the GPU but not these threads.
 - **The software (CPU) renderer's text looks rough**: it samples textures without filtering, so
   thin strokes of the small HUD font can drop out. The Vulkan renderer filters them.
+- **At 480p in 16:9, thin strokes of the narrowed text can still fade**: 480p has one sample per
+  pixel, so the V9.1 per-sample fix has nothing to work with. 720p and above draw it complete.
 - **120 fps and Monitor use in-between frames.** The game's logic, physics and animations still
   run at the PS2's 60 Hz; the extra frames are made from the two newest game frames, so fast
   edges can show slight warping and the picture is about one frame later.

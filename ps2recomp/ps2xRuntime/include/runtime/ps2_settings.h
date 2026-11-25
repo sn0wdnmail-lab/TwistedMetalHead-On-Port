@@ -15,7 +15,7 @@ struct Rectangle;
 namespace ps2settings
 {
     // This port's version, shown on the setup screen and in the window title.
-    inline constexpr const char *kPortVersion = "V9";
+    inline constexpr const char *kPortVersion = "V9.1";
 
     struct Settings
     {
