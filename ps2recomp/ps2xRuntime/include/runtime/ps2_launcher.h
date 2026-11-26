@@ -40,6 +40,22 @@ namespace ps2launcher
     // Memory cards folder used by the setup screen ("saves" next to the executable).
     std::filesystem::path savesFolder();
 
+    // --game <disc image> (RecompLauncher's Play, a shortcut, a script): straight into the game
+    // without the setup screen. The image is checked as the setup screen checks it; then only its
+    // game program is copied out, into cache/game in RecompLauncher's data folder
+    // (RECOMPLAUNCHER_DATA) or else next to the executable. Everything else is read from the image,
+    // as on Android. The memory cards are the setup screen's ("saves"). Needs no window. When play
+    // is false, error says why in a line for the player and exitCode is one of these:
+    inline constexpr int kExitDiscUnreadable = 21; // missing, moved, damaged, or not a disc image
+    inline constexpr int kExitWrongGame = 22;      // another game's disc
+    inline constexpr int kExitCantWrite = 23;      // the game program couldn't be copied out
+    Result playFromDisc(const GameInfo &game, const std::filesystem::path &disc, std::string &error, int &exitCode);
+
+    // The path after option on the command line ("option <path>" or "option=<path>"), or an empty
+    // path. On Windows it is read from the command line as Windows keeps it, so every letter of a
+    // file name comes through (main's argv holds only what the ANSI code page can).
+    std::filesystem::path commandLinePath(int argc, char *argv[], const char *option);
+
     // The folder the game keeps its files in (settings.ini, saves, Logs, Screenshots, the shader
     // cache), as UTF-8 with a trailing separator: the executable's folder, or on Android the app's
     // own folder on the phone's storage.

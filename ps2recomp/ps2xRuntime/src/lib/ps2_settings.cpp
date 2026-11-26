@@ -339,6 +339,15 @@ namespace ps2settings
             out << "iop_thread=" << (s.iopThread ? 1 : 0) << "\n";
         }
 
+        std::string trimmed(const std::string &text)
+        {
+            const size_t first = text.find_first_not_of(" \t\r");
+            if (first == std::string::npos)
+                return {};
+            const size_t last = text.find_last_not_of(" \t\r");
+            return text.substr(first, last - first + 1);
+        }
+
         void load()
         {
             std::ifstream in(g_iniPath);
@@ -353,8 +362,9 @@ namespace ps2settings
                 const size_t eq = line.find('=');
                 if (eq == std::string::npos)
                     continue;
-                const std::string key = line.substr(0, eq);
-                const std::string value = line.substr(eq + 1);
+                // "key = value" too: RecompLauncher writes a settings file it makes that way.
+                const std::string key = trimmed(line.substr(0, eq));
+                const std::string value = trimmed(line.substr(eq + 1));
                 const int number = std::atoi(value.c_str());
                 if (key == "window_mode") s.windowMode = std::clamp(number, 0, 2);
                 else if (key == "window_size")

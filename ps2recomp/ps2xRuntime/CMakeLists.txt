@@ -463,7 +463,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(ps2_runtime PRIVATE $<$<CONFIG:Release>:-O3>)
 endif()
 if(WIN32)
-    target_link_libraries(ps2_runtime PRIVATE comdlg32) # the setup screen's open-file dialog
+    target_link_libraries(ps2_runtime PRIVATE comdlg32 shell32) # the setup screen's open-file dialog; --game's command line
 endif()
 
 if(PS2X_ENABLE_RUNTIME_LOGS)

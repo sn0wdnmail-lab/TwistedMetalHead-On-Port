@@ -13,6 +13,7 @@
 #endif
 
 #include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <string>
 #include <filesystem>
@@ -200,11 +201,14 @@ namespace
     // sectors (their own ISO9660 reader, or LBN tables) need the disc image; without --iso, a single
     // .iso beside the ELF's folder or in its parent is used. --saves puts the memory cards
     // (mc0, mc1) in that folder instead of beside the ELF.
+    // Or --game <disc image> (also --game=<disc image>): straight into the game from the player's
+    // disc image, without the setup screen (see ps2launcher::playFromDisc).
     struct LaunchArgs
     {
         std::filesystem::path elf;
         std::filesystem::path iso;
         std::filesystem::path saves;
+        std::filesystem::path game;
     };
 
     LaunchArgs parseLaunchArgs(int argc, char *argv[])
@@ -221,11 +225,18 @@ namespace
             {
                 args.saves = std::filesystem::path(argv[++i]);
             }
+            else if (arg == "--game" || arg.rfind("--game=", 0) == 0)
+            {
+                // The disc image: read below, with every letter of its name.
+                if (arg == "--game")
+                    ++i;
+            }
             else if (!arg.empty() && args.elf.empty())
             {
                 args.elf = std::filesystem::path(arg);
             }
         }
+        args.game = ps2launcher::commandLinePath(argc, argv, "--game");
         if (args.iso.empty())
         {
             if (const char *env = std::getenv("PS2X_CD_IMAGE"); env && *env)
@@ -296,6 +307,30 @@ int main(int argc, char *argv[])
     try
     {
         LaunchArgs launchArgs = parseLaunchArgs(argc, argv);
+        if (!launchArgs.game.empty())
+        {
+            // RecompLauncher keeps what the game prints for its crash report: unbuffered, so the
+            // last lines before a crash are in it.
+            std::setvbuf(stdout, nullptr, _IONBF, 0);
+            std::string error;
+            int exitCode = 0;
+            const ps2launcher::Result start = ps2launcher::playFromDisc(kGame, launchArgs.game, error, exitCode);
+            if (!start.play)
+            {
+                // RecompLauncher tells the player what the exit code means (recomplauncher.json),
+                // so no message box there: in Big Picture mode a controller can't close one.
+                if (std::getenv("RECOMPLAUNCHER") != nullptr)
+                    std::cerr << "[main] " << error << std::endl;
+                else
+                    fatal(error);
+                endProcess(exitCode);
+            }
+            // Then as if the program and the disc image were given on the command line.
+            launchArgs.elf = start.program;
+            launchArgs.iso = start.disc;
+            if (launchArgs.saves.empty())
+                launchArgs.saves = start.saves;
+        }
         // Started without a game program (double-clicking TMHO.exe): the game setup screen asks for
         // the player's own disc image and builds the game from it.
         const bool setupScreen = launchArgs.elf.empty();

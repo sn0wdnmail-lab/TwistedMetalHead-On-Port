@@ -20,6 +20,7 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -193,6 +194,49 @@ namespace ps2launcher
         }
     }
 #endif
+
+    std::filesystem::path commandLinePath(int argc, char *argv[], const char *option)
+    {
+#if defined(_WIN32)
+        (void)argc;
+        (void)argv;
+        int count = 0;
+        wchar_t **args = CommandLineToArgvW(GetCommandLineW(), &count);
+        if (!args)
+            return {};
+        const std::wstring flag = widenUtf8(option);
+        const std::wstring joined = flag + L"=";
+        std::filesystem::path found;
+        for (int i = 1; i < count; ++i)
+        {
+            const std::wstring arg = args[i];
+            if (arg == flag && i + 1 < count)
+            {
+                found = std::filesystem::path(args[i + 1]);
+                break;
+            }
+            if (arg.rfind(joined, 0) == 0)
+            {
+                found = std::filesystem::path(arg.substr(joined.size()));
+                break;
+            }
+        }
+        LocalFree(args);
+        return found;
+#else
+        const std::string flag(option);
+        const std::string joined = flag + "=";
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string arg = argv[i] ? argv[i] : "";
+            if (arg == flag && i + 1 < argc)
+                return std::filesystem::path(argv[i + 1]);
+            if (arg.rfind(joined, 0) == 0)
+                return std::filesystem::path(arg.substr(joined.size()));
+        }
+        return {};
+#endif
+    }
 
     std::filesystem::path setupConsoleOutput(const std::string &logFolder)
     {

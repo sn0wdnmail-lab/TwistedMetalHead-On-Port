@@ -2,6 +2,7 @@
 
 #include "runtime/ps2_launcher.h"
 #include "runtime/ps2_android.h"
+#include "runtime/ps2_disc_image.h"
 #include "runtime/ps2_exit.h"
 #include "runtime/ps2_settings.h"
 #include "runtime/ps2_texture_replace.h"
@@ -688,6 +689,20 @@ namespace ps2launcher
         fs::path gameDir() { return g_appDir / "game"; }
         fs::path savesDir() { return g_appDir / "saves"; }
 
+        // Where --game puts the game program: RecompLauncher's cache folder when the launcher
+        // started the game ({data}/cache, which its backups and cloud saves leave out), else next
+        // to the executable.
+        fs::path discCacheDir()
+        {
+#if defined(_WIN32)
+            const wchar_t *data = _wgetenv(L"RECOMPLAUNCHER_DATA");
+#else
+            const char *data = std::getenv("RECOMPLAUNCHER_DATA");
+#endif
+            const fs::path base = data && *data ? fs::path(data) : g_appDir;
+            return base / "cache" / "game";
+        }
+
         void startCheck(Screen &screen, const fs::path &disc)
         {
             if (screen.checker && screen.checker->joinable())
@@ -1039,6 +1054,46 @@ namespace ps2launcher
         if (g_appDir.empty())
             g_appDir = appDirectory();
         return savesDir();
+    }
+
+    Result playFromDisc(const GameInfo &game, const fs::path &disc, std::string &error, int &exitCode)
+    {
+        Result result;
+        g_appDir = appDirectory();
+        const DiscResult check = checkDisc(disc, game);
+        if (check.state == Disc::Unreadable)
+        {
+            error = check.message + "\n" + pathText(disc);
+            exitCode = kExitDiscUnreadable;
+            return result;
+        }
+        if (check.state != Disc::Good && check.state != Disc::Different)
+        {
+            error = check.message + "\n" + pathText(disc);
+            exitCode = kExitWrongGame;
+            return result;
+        }
+        if (check.state == Disc::Different)
+            std::fprintf(stderr, "[setup] %s\n", check.message.c_str()); // played as picked, like "Build anyway"
+
+        // Only the game program has to be a file of its own (it is loaded from one). The I/O
+        // processor's modules are copied out of the image next to it the first time they are
+        // opened, and everything else is read from the image.
+        const fs::path program = discCacheDir() / utf8Path(game.bootFile);
+        uint64_t size = 0;
+        const bool there = hashFile(program, size) == check.programHash && size > 0;
+        if (!there && !ps2disc::extract(disc, game.bootFile, program))
+        {
+            error = "The game program couldn't be copied from your disc image into " + pathText(program.parent_path()) +
+                    " (is the drive full, or the folder read-only?).";
+            exitCode = kExitCantWrite;
+            return result;
+        }
+        result.play = true;
+        result.program = program;
+        result.disc = disc;
+        result.saves = savesDir();
+        return result;
     }
 
     void requestSetupAtNextStart()
