@@ -1,12 +1,17 @@
 #!/bin/bash
 # Packages a Windows build for players:
 #   <out>/TMHO.zip     TMHO.exe (stripped) + TMHO.sym (symbol map for the built-in profiler) + README.txt
+#                      + recomplauncher.json (RecompLauncher's setup and settings for the game)
 #   <out>/Install.bat  unpacks TMHO.zip with Windows' own tar, then deletes the zip and itself
+# With a version (V9.2, say), also the file for the GitHub release, named with the system and the
+# processor so RecompLauncher picks it for Windows PCs:
+#   <out>/TMHO-Port-<version>-Windows-x64.zip   the same four files in a "TMHO Port <version>" folder
 #
-# usage: package.sh <ps2EntryRunner.exe> <output folder>
+# usage: package.sh <ps2EntryRunner.exe> <output folder> [version]
 set -euo pipefail
 EXE=$(realpath "$1")
 OUT=$(realpath -m "$2")
+VERSION=${3:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(mktemp -d)
 trap 'rm -rf "$PKG"' EXIT
@@ -31,8 +36,17 @@ for line in sys.stdin:
 sys.stdout.write('\n'.join(out) + '\n')
 " > "$PKG/TMHO.sym"
 sed 's/$/\r/' "$HERE/README.txt" > "$PKG/README.txt"
-(cd "$PKG" && zip -q -9 TMHO.zip TMHO.exe TMHO.sym README.txt)
+# RecompLauncher reads it from next to the program in every release.
+cp "$HERE/../../recomplauncher.json" "$PKG/recomplauncher.json"
+(cd "$PKG" && zip -q -9 TMHO.zip TMHO.exe TMHO.sym README.txt recomplauncher.json)
 cp "$PKG/TMHO.zip" "$OUT/TMHO.zip"
+if [ -n "$VERSION" ]; then
+    RELEASE="TMHO-Port-$VERSION-Windows-x64.zip"
+    mkdir -p "$PKG/release/TMHO Port $VERSION"
+    cp "$PKG/TMHO.exe" "$PKG/TMHO.sym" "$PKG/README.txt" "$PKG/recomplauncher.json" "$PKG/release/TMHO Port $VERSION/"
+    rm -f "$OUT/$RELEASE"
+    (cd "$PKG/release" && zip -q -9 -r "$OUT/$RELEASE" "TMHO Port $VERSION")
+fi
 cat > "$OUT/Install.bat" <<'BAT'
 @echo off
 rem Unpacks the TMHO PC port into this folder with Windows' own tar,

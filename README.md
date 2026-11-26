@@ -1,5 +1,7 @@
 # Twisted Metal: Head-On – Extra Twisted Edition — PC Port
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 A native Windows port of **Twisted Metal: Head-On – Extra Twisted Edition** (PlayStation 2,
 SCUS-97621, NTSC-U) — since V9 also for **Android** (with on-screen controls) and **Linux**.
 
@@ -31,6 +33,16 @@ memory cards.
 
 Needs Windows 10/11 (64-bit) and a graphics card with Vulkan. Keep the `.iso` where it is: the
 game still streams music and movies from it. Saves go in the `saves` folder next to `TMHO.exe`.
+
+**With [RecompLauncher](https://recomplauncher.com)**: install the port there, pick your disc
+image (SCUS-97621) and press Play. The launcher checks the disc and the game starts straight
+from it, with no Build step and no 4 GB copy; the main settings are on the game's page. Saves and
+`settings.ini` stay in the game's folder, as when you start `TMHO.exe` yourself.
+
+**From a shortcut or a script**: `TMHO.exe --game "D:\Games\Twisted Metal Head-On.iso"` does the
+same without the launcher: it checks the disc image and starts the game without the setup screen.
+Only the 2 MB game program is copied out of the `.iso` (into `cache\game`); everything else is
+read from it.
 
 ### Controls
 
@@ -463,6 +475,7 @@ FFMPEG_ROOT=/path/to/ffmpeg-mingw port/build.sh /path/to/your/SCUS_976.21 window
 | `port/tmho_functions_named.csv` | Function boundaries and names used by the recompiler |
 | `port/build.sh` | Recompiles your executable and builds `TMHO.exe` (or a Linux binary) |
 | `port/package/` | Packaging script and the player README that goes with a release |
+| `recomplauncher.json` | How [RecompLauncher](https://recomplauncher.com) sets the game up and which settings it shows; the packaging scripts put it in every release |
 | `port/testing/` | Scripts that drive the game unattended for tests |
 | `port/tools/` | Analysis helpers (IRX and VU disassemblers, disc map, config generator) |
 

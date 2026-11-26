@@ -118,6 +118,22 @@ interpreter core (same results, slower in big battles). To make it:
    runs on the interpreter and on the compiled code, checks registers, memory, PATH1 output and
    cycle counts against the recording, and times both.
 
+## 6. Release files
+
+Give the packaging scripts the version as a third argument and they also write the files for
+the GitHub release, named with the system and the processor (what RecompLauncher picks a file
+by), each with `recomplauncher.json` next to the program:
+
+```sh
+port/package/package.sh <build>/ps2xRuntime/ps2EntryRunner.exe <out> V9.2        # TMHO-Port-V9.2-Windows-x64.zip
+port/package/package_linux.sh <build>/ps2xRuntime/ps2EntryRunner <out> V9.2      # TMHO-Port-V9.2-Linux-x64.tar.gz
+```
+
+`recomplauncher.json` (at the top of this repository) is how RecompLauncher sets the game up:
+it checks the player's disc image, starts `TMHO.exe --game <disc image>`, and shows the
+settings from `settings.ini` on the game's page. When a setting is added or renamed, change it
+there too. It is only read from a release, so every release needs it.
+
 ## Useful environment variables
 
 | Variable | Effect |

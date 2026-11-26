@@ -1,0 +1,225 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "repo": "sn0wdnmail-lab/TwistedMetalHead-On-Port",
+  "name": "Twisted Metal: Head-On - Extra Twisted Edition PC Port",
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your disc image (.iso) of Twisted Metal: Head-On - Extra Twisted Edition, the USA PlayStation 2 release, serial SCUS-97621.",
+      "formats": [{ "type": "file", "extensions": ["iso"] }],
+      "check": { "iso9660": "SCUS_976.21", "ids": ["SCUS-97621"] }
+    }
+  ],
+  "start": {
+    "program": ["TMHO.exe", "TMHO"],
+    "args": ["--game", "{input:game}"]
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [{ "path": "{install}/settings.ini" }]
+    }
+  ],
+  "saves": ["{install}/saves"],
+  "folders": {
+    "saves": [{ "path": "{install}/saves" }],
+    "logs": [{ "path": "{install}/Logs" }],
+    "screenshots": [{ "path": "{install}/Screenshots" }]
+  },
+  "actions": [
+    { "id": "saves", "label": "Saves", "help": "The memory cards (mc0 and mc1) your saves are on.", "open": "saves" },
+    { "id": "screenshots", "label": "Screenshots", "help": "The pictures F12 takes in the game.", "open": "screenshots" },
+    { "id": "logs", "label": "Logs", "help": "The performance and graphics logs, for bug reports.", "open": "logs" }
+  ],
+  "exit_codes": {
+    "21": "Your disc image couldn't be opened or read: it may have been moved, deleted or damaged. Pick it again on the game's page.",
+    "22": "That disc image isn't Twisted Metal: Head-On - Extra Twisted Edition (USA, SCUS-97621). Pick that game's disc image on the game's page.",
+    "23": "The game couldn't copy its program from your disc image into its folder. Check that the drive has free space and the folder isn't read-only."
+  },
+  "system": {
+    "windows": { "version": "10", "graphics": { "vulkan": "1.2", "opengl": "3.3" } },
+    "linux": { "glibc": "2.38", "graphics": { "vulkan": "1.2", "opengl": "3.3" } }
+  },
+  "looks": { "graphics": "opengl" },
+  "groups": [{ "id": "Advanced", "advanced": true }],
+  "settings": [
+    {
+      "id": "display_mode", "label": "Display mode", "group": "Video",
+      "help": "Windowed, borderless full screen, or exclusive full screen. F11 or Alt+Enter switches in the game too.",
+      "choices": [
+        { "label": "Windowed", "set": { "window_mode": "0" } },
+        { "label": "Borderless", "set": { "window_mode": "1" } },
+        { "label": "Fullscreen", "set": { "window_mode": "2" } }
+      ],
+      "defaults": { "window_mode": "0" }
+    },
+    {
+      "id": "resolution", "label": "Resolution", "group": "Video",
+      "help": "The game picture's resolution, whatever your screen is. 480p is the PS2's own; higher is sharper and harder on the graphics card.",
+      "choices": [
+        { "label": "480p (1x)", "set": { "resolution": "0" } },
+        { "label": "720p", "set": { "resolution": "1" } },
+        { "label": "1080p", "set": { "resolution": "2" } },
+        { "label": "1440p", "set": { "resolution": "3" } },
+        { "label": "2160p (4K)", "set": { "resolution": "4" } }
+      ],
+      "defaults": { "resolution": "0" }
+    },
+    {
+      "id": "aspect", "label": "Aspect ratio", "group": "Video",
+      "help": "4:3 is the original picture. 16:9 is true widescreen: the cameras see more to each side, and the HUD and text keep their shape.",
+      "choices": [
+        { "label": "4:3", "set": { "aspect": "0" } },
+        { "label": "16:9", "set": { "aspect": "1" } },
+        { "label": "Stretch", "set": { "aspect": "2" } }
+      ],
+      "defaults": { "aspect": "0" }
+    },
+    {
+      "id": "scaling", "label": "Scaling", "group": "Video",
+      "help": "How the picture is enlarged to your screen: Sharp keeps square pixels, Smooth uses a sharp Lanczos filter.",
+      "choices": [
+        { "label": "Sharp", "set": { "filter": "0" } },
+        { "label": "Smooth", "set": { "filter": "1" } }
+      ],
+      "defaults": { "filter": "1" }
+    },
+    {
+      "id": "frame_rate", "label": "Frame rate", "group": "Video",
+      "help": "60 fps (recommended) shows the game's own frames, and on Windows Lossless Scaling's frame generation makes it smoothest; 120 fps and Monitor add the port's own in-between frames instead.",
+      "choices": [
+        { "label": "60 fps", "set": { "frame_rate": "0" } },
+        { "label": "120 fps", "set": { "frame_rate": "1" } },
+        { "label": "Monitor's rate", "set": { "frame_rate": "2" } }
+      ],
+      "defaults": { "frame_rate": "0" }
+    },
+    {
+      "id": "vsync", "label": "V-Sync", "group": "Video",
+      "help": "Waits for the monitor's refresh to avoid tearing.",
+      "choices": [
+        { "label": "On", "set": { "vsync": "1" } },
+        { "label": "Off", "set": { "vsync": "0" } }
+      ],
+      "defaults": { "vsync": "1" }
+    },
+    {
+      "id": "brightness", "label": "Brightness", "group": "Video",
+      "help": "100 is the game's own picture. Dark parts change most, so night arenas get easier to see.",
+      "slider": { "key": "brightness", "min": 70, "max": 150, "step": 5, "format": "%d" },
+      "defaults": { "brightness": "100" }
+    },
+    {
+      "id": "sharpening", "label": "Sharpening", "group": "Video",
+      "help": "Makes fine detail and text crisper after the picture is scaled. 0 leaves the picture as it is.",
+      "slider": { "key": "sharpening", "min": 0, "max": 100, "step": 10, "format": "%d" },
+      "defaults": { "sharpening": "0" }
+    },
+    {
+      "id": "intro", "label": "Intro movies", "group": "Game",
+      "help": "The logo and intro movies when the game starts. The intro can still be watched from the game's own menus.",
+      "choices": [
+        { "label": "Play them", "set": { "skip_intro": "0" } },
+        { "label": "Skip them", "set": { "skip_intro": "1" } }
+      ],
+      "defaults": { "skip_intro": "0" }
+    },
+    {
+      "id": "vibration", "label": "Controller vibration", "group": "Game",
+      "help": "Lets the game rumble your controller when you hit or get hit, as on the PS2.",
+      "choices": [
+        { "label": "On", "set": { "vibration": "1" } },
+        { "label": "Off", "set": { "vibration": "0" } }
+      ],
+      "defaults": { "vibration": "1" }
+    },
+    {
+      "id": "pad_loss", "label": "Pause on controller loss", "group": "Game",
+      "help": "Pauses the game and opens its menu when the controller you play with disconnects.",
+      "choices": [
+        { "label": "On", "set": { "pause_on_controller_loss": "1" } },
+        { "label": "Off", "set": { "pause_on_controller_loss": "0" } }
+      ],
+      "defaults": { "pause_on_controller_loss": "1" }
+    },
+    {
+      "id": "fps", "label": "FPS counter", "group": "Game",
+      "help": "Shows the frames per second in a corner of the game.",
+      "choices": [
+        { "label": "Off", "set": { "show_fps": "0" } },
+        { "label": "On", "set": { "show_fps": "1" } }
+      ],
+      "defaults": { "show_fps": "0" }
+    },
+    {
+      "id": "camera_distance", "label": "Camera distance", "group": "Camera",
+      "help": "How far the chase camera sits behind your car, in percent: 100 is the game's own.",
+      "slider": { "key": "camera_distance", "min": 50, "max": 200, "step": 5, "format": "%d" },
+      "defaults": { "camera_distance": "100" }
+    },
+    {
+      "id": "camera_angle", "label": "Camera angle", "group": "Camera",
+      "help": "How high the chase camera looks down at your car, in degrees: 0 is the game's own.",
+      "slider": { "key": "camera_angle", "min": -30, "max": 40, "step": 1, "format": "%d" },
+      "defaults": { "camera_angle": "0" }
+    },
+    {
+      "id": "fov", "label": "Field of view", "group": "Camera",
+      "help": "How wide the battle camera sees. The game's own is 65° at 4:3 and 81° at 16:9.",
+      "choices": [
+        { "label": "Game's own", "set": { "fov": "0" } },
+        { "label": "70°", "set": { "fov": "70" } },
+        { "label": "80°", "set": { "fov": "80" } },
+        { "label": "90°", "set": { "fov": "90" } },
+        { "label": "100°", "set": { "fov": "100" } },
+        { "label": "110°", "set": { "fov": "110" } },
+        { "label": "120°", "set": { "fov": "120" } }
+      ],
+      "defaults": { "fov": "0" }
+    },
+    {
+      "id": "master_volume", "label": "Master volume", "group": "Audio",
+      "help": "Volume of everything the game plays.",
+      "slider": { "key": "master_volume", "min": 0, "max": 100, "step": 5, "format": "%d" },
+      "defaults": { "master_volume": "100" }
+    },
+    {
+      "id": "music_volume", "label": "Music volume", "group": "Audio",
+      "help": "The music in menus and battles.",
+      "slider": { "key": "music_volume", "min": 0, "max": 100, "step": 5, "format": "%d" },
+      "defaults": { "music_volume": "100" }
+    },
+    {
+      "id": "effects_volume", "label": "Effects volume", "group": "Audio",
+      "help": "Engines, weapons, explosions, pickups, menu sounds and the announcer.",
+      "slider": { "key": "effects_volume", "min": 0, "max": 100, "step": 5, "format": "%d" },
+      "defaults": { "effects_volume": "100" }
+    },
+    {
+      "id": "movie_volume", "label": "Movie volume", "group": "Audio",
+      "help": "The sound of the intro and ending movies.",
+      "slider": { "key": "movie_volume", "min": 0, "max": 100, "step": 5, "format": "%d" },
+      "defaults": { "movie_volume": "100" }
+    },
+    {
+      "id": "mute_unfocused", "label": "Mute in background", "group": "Audio",
+      "help": "Silences the game while its window isn't in front.",
+      "choices": [
+        { "label": "On", "set": { "mute_unfocused": "1" } },
+        { "label": "Off", "set": { "mute_unfocused": "0" } }
+      ],
+      "defaults": { "mute_unfocused": "1" }
+    },
+    {
+      "id": "renderer", "label": "Renderer", "group": "Advanced",
+      "help": "Vulkan draws the game on your graphics card; Software uses the CPU and is much slower.",
+      "choices": [
+        { "label": "Vulkan (GPU)", "set": { "renderer": "0" } },
+        { "label": "Software (CPU)", "set": { "renderer": "1" } }
+      ],
+      "defaults": { "renderer": "0" }
+    }
+  ]
+}

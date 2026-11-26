@@ -30,6 +30,16 @@ disc later: F2 > Game > Game disc > Setup.
 Keep the .iso where it is - the game still streams its music and movies
 from it. Saves go in the "saves" folder next to TMHO.exe.
 
+Straight from your disc image (RecompLauncher, a shortcut, a script)
+  TMHO.exe --game "<your .iso>"
+  checks the disc image and starts the game from it without the setup
+  screen: only the game program (2 MB) is copied out of the .iso, into a
+  "cache" folder; everything else is read from the .iso. Saves and
+  settings.ini are the ones in this folder, as always.
+  RecompLauncher (recomplauncher.com) does this for you: pick your disc
+  image on the game's page and press Play. recomplauncher.json in this
+  folder tells it how.
+
 Keys (or plug in a controller)
   Arrows / WASD     D-pad          Enter        Start
   X or Space        Cross          Tab          Select
